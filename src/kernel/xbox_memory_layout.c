@@ -2193,13 +2193,28 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                                     ? data_end - data_start : 0;
                 uint32_t total      = ((init_size + zero_fill + 0xF) & ~0xFu) + 4;
 
+                /* The block is [pointer][the thread's TLS data], and the
+                 * pointer points at the data right behind it: `total` is the
+                 * aligned template size plus that one dword, and the title's
+                 * index lands on it. Compiled code reads a thread-local as
+                 * [[fs:[4] + index*4] + offset], with offsets anywhere in the
+                 * template.
+                 *
+                 * It used to point at a separate 64-byte area instead, with
+                 * the template copied over the pointer slot. That holds only
+                 * for thread-locals in the first 64 bytes. Amped 2's template
+                 * is 272 bytes and its allocator reads offset 0xA8: on the
+                 * main thread that read past the 64 bytes into zeroed memory
+                 * and worked by luck, and on a spawned thread, whose area came
+                 * from the heap, it read the next heap block and faulted on
+                 * the pointer it found there. */
                 memset(XBOX_VA(FAKE_TLS_BLOCK_VA), 0, total);
                 memset(XBOX_VA(FAKE_TLS_THREAD_VA), 0, 64);
                 if (init_size)
-                    memcpy(XBOX_VA(FAKE_TLS_BLOCK_VA),
+                    memcpy(XBOX_VA(FAKE_TLS_BLOCK_VA + 4),
                            XBOX_VA(data_start), init_size);
 
-                MEM32_INIT(FAKE_TLS_BLOCK_VA, FAKE_TLS_THREAD_VA);
+                MEM32_INIT(FAKE_TLS_BLOCK_VA, FAKE_TLS_BLOCK_VA + 4);
                 MEM32_INIT(XBOX_FS_BASE + 0x04, FAKE_TLS_BLOCK_VA + total);
 
                 g_tls_template_va = FAKE_TLS_BLOCK_VA;
@@ -2858,8 +2873,13 @@ uint32_t xbox_AllocThreadTib(void)
     memcpy(TIB_VA(block), TIB_VA(g_tls_template_va), total);
     memset(TIB_VA(thread_data), 0, g_tls_thread_size);
 
+    /* Slot 0 points at this thread's own copy of the TLS data, which is the
+     * rest of the block just copied (see the loader: [pointer][data]). Not at
+     * thread_data, which is only g_tls_thread_size bytes: a thread-local past
+     * that read the neighbouring heap block. thread_data is still allocated
+     * so the block keeps its size, and is simply unused. */
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
-    *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
+    *(uint32_t *)TIB_VA(block)      = block + 4;     /* slot 0 -> data   */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
 
     return tib;
