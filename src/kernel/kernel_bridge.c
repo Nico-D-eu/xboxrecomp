@@ -1397,6 +1397,11 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va);
 static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
 
+static HANDLE ke_dispatcher_handle(uint32_t va);   /* defined after bridge_resolve_handle */
+static int  ke_is_event_header(uint32_t va);
+static void ke_event_before_wait(uint32_t va, HANDLE h);
+static void ke_event_after_wait(uint32_t va);
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
 {
@@ -1408,12 +1413,17 @@ static void bridge_KeSetEvent(void)
     (void)increment;
     (void)wait;
 
-    h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = bridge_resolve_handle(guest_va);
+    h = ke_dispatcher_handle(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
-    if (h)
+    if (ke_is_event_header(guest_va)) {
+        /* KeSetEvent returns the previous state. */
+        uint32_t prev = BRIDGE_MEM32(guest_va + 4);
+        BRIDGE_MEM32(guest_va + 4) = 1;
+        if (h)
+            SetEvent(h);
+        g_eax = prev;
+    } else if (h)
         g_eax = (uint32_t)SetEvent(h);
     else
         g_eax = 0;
@@ -1429,15 +1439,16 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
 
-    h = ke_shadow_lookup(object);
-    if (!h)
-        h = bridge_resolve_handle(object);
+    h = ke_dispatcher_handle(object);
     if (!h)
         h = XBOX_TO_NATIVE(object);
 
+    ke_event_before_wait(object, h);
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    if (g_eax == 0)                               /* STATUS_WAIT_0 */
+        ke_event_after_wait(object);
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -2650,6 +2661,79 @@ static HANDLE bridge_resolve_handle(uint32_t token)
     }
     /* Untagged: synthetic/dummy handle -- pass through unchanged. */
     return (HANDLE)(uintptr_t)token;
+}
+
+/* The host object behind a Ke* dispatcher-object pointer.
+ *
+ * Ke* calls take object *pointers* (PKEVENT, PKTIMER, ...), not handles.
+ * Objects the title built through KeInitializeEvent/-Timer have a shadow host
+ * handle; a tagged value is a handle from the Nt* layer. Anything else used
+ * to fall through bridge_resolve_handle, which passes an untagged value back
+ * as a HANDLE unchanged, so a wait on a raw guest KEVENT waited on the
+ * address itself: WAIT_FAILED at once, forever.
+ *
+ * XDK code often initialises an event inline rather than through
+ * KeInitializeEvent (which Amped 2 does not even import): it writes the
+ * DISPATCHER_HEADER itself -- Type (0 notification, 1 synchronization), Size 4
+ * (sizeof(KEVENT)/4), SignalState, a self-linked wait list. Such an event gets
+ * a shadow created on first use here, of the header's own type and current
+ * state. Amped 2's movie worker (sub_00263837) waits on one on its stack with
+ * no timeout, and spun through 61 million failed waits a minute. */
+static HANDLE ke_dispatcher_handle(uint32_t va)
+{
+    HANDLE h = ke_shadow_lookup(va);
+
+    if (h)
+        return h;
+    if ((va & 0xFF000000u) != BRIDGE_HANDLE_TAG && va >= 0x00010000u
+            && va < 0x04000000u) {
+        uint8_t type = BRIDGE_MEM8(va);
+        uint8_t size = BRIDGE_MEM8(va + 2);
+
+        if ((type == 0 || type == 1) && size == 4) {
+            h = CreateEventA(NULL, type == 0 /* notification: manual reset */,
+                             BRIDGE_MEM32(va + 4) != 0, NULL);
+            if (h) {
+                ke_shadow_insert(va, h);
+                return h;
+            }
+        }
+    }
+    return bridge_resolve_handle(va);
+}
+
+/* Keep an event's host shadow and its guest DISPATCHER_HEADER in step.
+ *
+ * On the console the header *is* the state, and code relies on that: D3D's
+ * vertical-blank wait (Amped 2 sub_0031AE90) clears the event by storing 0 to
+ * SignalState inline -- no KeClearEvent -- then waits for the vblank DPC's
+ * KeSetEvent. With only a host shadow, the inline clear never reached it: the
+ * first KeSetEvent left the notification event signalled for good, and the
+ * main loop spun through 38 million immediately-satisfied waits a minute.
+ *
+ * Before a wait: a guest SignalState of 0 resets the shadow. After KeSetEvent:
+ * SignalState = 1. After a satisfied wait on a synchronization (auto-reset)
+ * event: SignalState = 0, as the kernel's wait does. Non-event objects are
+ * left alone. */
+static int ke_is_event_header(uint32_t va)
+{
+    if ((va & 0xFF000000u) == BRIDGE_HANDLE_TAG || va < 0x00010000u
+            || va >= 0x04000000u)
+        return 0;
+    return (BRIDGE_MEM8(va) == 0 || BRIDGE_MEM8(va) == 1)
+        && BRIDGE_MEM8(va + 2) == 4;
+}
+
+static void ke_event_before_wait(uint32_t va, HANDLE h)
+{
+    if (h && ke_is_event_header(va) && BRIDGE_MEM32(va + 4) == 0)
+        ResetEvent(h);
+}
+
+static void ke_event_after_wait(uint32_t va)
+{
+    if (ke_is_event_header(va) && BRIDGE_MEM8(va) == 1)
+        BRIDGE_MEM32(va + 4) = 0;
 }
 
 static HANDLE bridge_take_handle(uint32_t token)
@@ -4248,15 +4332,28 @@ static void bridge_KeWaitForMultipleObjects(void)
     }
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
         count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
-    for (i = 0; i < count; i++)
-        handles[i] = bridge_resolve_handle(
-            objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
+    /* Object pointers, not handles -- see ke_dispatcher_handle. */
+    for (i = 0; i < count; i++) {
+        uint32_t obj = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+        handles[i] = ke_dispatcher_handle(obj);
+        ke_event_before_wait(obj, handles[i]);
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
         count, (PVOID *)handles, wait_type,
         STACK_ARG(3), (KPROCESSOR_MODE)STACK_ARG(4),
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
         XBOX_TO_NATIVE(STACK_ARG(7)));
+    /* WaitAny: STATUS_WAIT_0 + index names the satisfied object. WaitAll
+     * (wait_type 0) satisfies them all. */
+    if (objects_va && g_eax < count) {
+        if (wait_type == 0) {
+            for (i = 0; i < count; i++)
+                ke_event_after_wait(BRIDGE_MEM32(objects_va + i * 4));
+        } else {
+            ke_event_after_wait(BRIDGE_MEM32(objects_va + g_eax * 4));
+        }
+    }
 }
 
 #undef BRIDGE_MAXIMUM_WAIT_OBJECTS
