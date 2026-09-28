@@ -2934,21 +2934,99 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  *
  * Grows up from the base; XBOX_GPU_INSTANCE_DEFAULT is carved off the top by
  * the GPU-instance bridge, so the two do not meet until the window is full.
- * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
- * title allocates once. */
+ *
+ * Frees are honoured. This used to be bump-only on the reasoning that
+ * contiguous blocks are framebuffers and pushbuffers a title allocates once,
+ * and MmFreeContiguousMemory handed the address to xbox_HeapFree, which does
+ * not own it and ignores it. That breaks the standard XDK sizing idiom: ask
+ * for more than there is, step down until an allocation succeeds, *free it*,
+ * then carve the real pools out of what was found. Amped 2 does exactly that
+ * -- 1,567 failed requests from 60 MB down to ~50 MB, a success, a free -- and
+ * with the free ignored the whole 50 MB stayed gone, every later contiguous
+ * request (4 KB and up) failed, and the title went on to fault on a pointer it
+ * never got. So blocks are tracked: a free marks the block, neighbours
+ * coalesce, a free block at the top rewinds the bump pointer, and allocation
+ * takes the first free block that fits (splitting it) before bumping. */
 static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+/* Highest address ever handed out. xbox_ContiguousAllocatedBytes reports this
+ * rather than g_contig_next: its caller asks whether a physical address can be
+ * contiguous memory at all, and a rewind must not make that answer shrink
+ * under a surface the GPU state still names. */
+static uint32_t g_contig_high = XBOX_CONTIG_BASE;
+
+#define XBOX_MAX_CONTIG_BLOCKS 4096
+/* Every block below g_contig_next, in address order, allocated or free. An
+ * alignment gap is recorded as a free block, so the table tiles
+ * [XBOX_CONTIG_BASE, g_contig_next) exactly and adjacency is index order. */
+static struct {
+    uint32_t base;
+    uint32_t size;
+    int      free;
+} g_contig_blocks[XBOX_MAX_CONTIG_BLOCKS];
+static int g_contig_block_count = 0;
+
+static int contig_insert(int at, uint32_t base, uint32_t size, int is_free)
+{
+    if (g_contig_block_count >= XBOX_MAX_CONTIG_BLOCKS)
+        return 0;
+    memmove(&g_contig_blocks[at + 1], &g_contig_blocks[at],
+            (size_t)(g_contig_block_count - at) * sizeof(g_contig_blocks[0]));
+    g_contig_blocks[at].base = base;
+    g_contig_blocks[at].size = size;
+    g_contig_blocks[at].free = is_free;
+    g_contig_block_count++;
+    return 1;
+}
+
+static void contig_remove(int at)
+{
+    memmove(&g_contig_blocks[at], &g_contig_blocks[at + 1],
+            (size_t)(g_contig_block_count - at - 1) * sizeof(g_contig_blocks[0]));
+    g_contig_block_count--;
+}
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
+    int i;
 
     if (alignment < 4096) alignment = 4096;
+    if (size == 0) size = 1;
+    size = (size + 4095u) & ~4095u;  /* page granular, like the console */
+
+    /* First fit among freed blocks. */
+    for (i = 0; i < g_contig_block_count; i++) {
+        uint32_t b = g_contig_blocks[i].base, bs = g_contig_blocks[i].size;
+        uint32_t a = (b + alignment - 1) & ~(alignment - 1);
+
+        if (!g_contig_blocks[i].free || (uint64_t)a + size > (uint64_t)b + bs)
+            continue;
+        /* Room in the table for the up-to-two splits, checked first so a
+         * full table leaves the block as it was rather than half-split. */
+        if (g_contig_block_count + 2 > XBOX_MAX_CONTIG_BLOCKS)
+            break;
+        if (a > b) {                       /* leading gap stays free */
+            g_contig_blocks[i].size = a - b;
+            contig_insert(++i, a, bs - (a - b), 1);
+            b = a;
+            bs = g_contig_blocks[i].size;
+        }
+        if (bs > size)                     /* tail stays free */
+            contig_insert(i + 1, a + size, bs - size, 1);
+        g_contig_blocks[i].base = a;
+        g_contig_blocks[i].size = size;
+        g_contig_blocks[i].free = 0;
+        memset((void *)((uintptr_t)a + g_memory_offset), 0, size);
+        return a;
+    }
+
     result = (g_contig_next + alignment - 1) & ~(alignment - 1);
 
     /* Leave the top of the window for GPU instance memory. */
     if ((uint64_t)result + size >
             (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
-                - XBOX_GPU_INSTANCE_DEFAULT) {
+                - XBOX_GPU_INSTANCE_DEFAULT
+            || g_contig_block_count + 2 > XBOX_MAX_CONTIG_BLOCKS) {
         fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
                 size, g_contig_next - XBOX_CONTIG_BASE,
                 (unsigned)XBOX_CONTIG_SIZE);
@@ -2956,19 +3034,65 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
         return 0;
     }
 
+    if (result > g_contig_next) {
+        /* The alignment gap: free, so a later small request can use it, and
+         * merged into a free block below it if there is one. */
+        if (g_contig_block_count && g_contig_blocks[g_contig_block_count - 1].free)
+            g_contig_blocks[g_contig_block_count - 1].size += result - g_contig_next;
+        else
+            contig_insert(g_contig_block_count, g_contig_next,
+                          result - g_contig_next, 1);
+    }
+    contig_insert(g_contig_block_count, result, size, 0);
+
     g_contig_next = result + size;
+    if (g_contig_next > g_contig_high)
+        g_contig_high = g_contig_next;
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
 }
 
-/* How much of the window has been handed out.
+/* Give a block from xbox_ContiguousAlloc back. Returns 1 if the address was
+ * one of its blocks, 0 otherwise (a pinned physical allocation, GPU instance
+ * memory, or not contiguous memory at all) -- the caller decides what else it
+ * might be. */
+int xbox_ContiguousFree(uint32_t va)
+{
+    int i;
+
+    for (i = 0; i < g_contig_block_count; i++) {
+        if (g_contig_blocks[i].base == va && !g_contig_blocks[i].free)
+            break;
+    }
+    if (i == g_contig_block_count)
+        return 0;
+
+    g_contig_blocks[i].free = 1;
+    if (i + 1 < g_contig_block_count && g_contig_blocks[i + 1].free) {
+        g_contig_blocks[i].size += g_contig_blocks[i + 1].size;
+        contig_remove(i + 1);
+    }
+    if (i > 0 && g_contig_blocks[i - 1].free) {
+        g_contig_blocks[i - 1].size += g_contig_blocks[i].size;
+        contig_remove(i);
+        i--;
+    }
+    /* A free block on top is just unallocated space again. */
+    if (i == g_contig_block_count - 1) {
+        g_contig_next = g_contig_blocks[i].base;
+        contig_remove(i);
+    }
+    return 1;
+}
+
+/* How much of the window has been handed out, at most.
  *
  * Lets a caller holding a physical address decide whether it names contiguous
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
  * a surface offset is physical, and only the window makes it addressable. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
-    return g_contig_next - XBOX_CONTIG_BASE;
+    return g_contig_high - XBOX_CONTIG_BASE;
 }
 
 

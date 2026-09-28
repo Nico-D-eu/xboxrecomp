@@ -804,7 +804,14 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+
+    /* Contiguous blocks come from their own arena, not the heap. Handing them
+     * to xbox_HeapFree was silently a no-op, so a title that sizes its pools
+     * by allocate-then-free lost everything it probed. Anything the arena does
+     * not own (and older callers that did get heap memory) still goes to the
+     * heap, which ignores addresses it did not hand out. */
+    if (!xbox_ContiguousFree(addr))
+        xbox_HeapFree(addr);
     g_eax = 0;
 }
 
