@@ -980,6 +980,38 @@ static int surface_begin_batch(const uint8_t *mem)
     return 1;
 }
 
+/* A blend factor, per colour channel, from the source and destination
+ * (R, G, B, A in [0,1]). NV097 uses the GL enum values. Returns 0 for a
+ * factor not modelled (the constant-colour ones), and the caller then writes
+ * the source unblended, as it always did. */
+static int blend_factors(uint32_t f, const float s[4], const float d[4],
+                         float out[3])
+{
+    int k;
+    for (k = 0; k < 3; k++) {
+        switch (f) {
+        case 0x0000: out[k] = 0.0f; break;                  /* ZERO */
+        case 0x0001: out[k] = 1.0f; break;                  /* ONE */
+        case 0x0300: out[k] = s[k]; break;                  /* SRC_COLOR */
+        case 0x0301: out[k] = 1.0f - s[k]; break;           /* ONE_MINUS_SRC_COLOR */
+        case 0x0302: out[k] = s[3]; break;                  /* SRC_ALPHA */
+        case 0x0303: out[k] = 1.0f - s[3]; break;           /* ONE_MINUS_SRC_ALPHA */
+        case 0x0304: out[k] = d[3]; break;                  /* DST_ALPHA */
+        case 0x0305: out[k] = 1.0f - d[3]; break;           /* ONE_MINUS_DST_ALPHA */
+        case 0x0306: out[k] = d[k]; break;                  /* DST_COLOR */
+        case 0x0307: out[k] = 1.0f - d[k]; break;           /* ONE_MINUS_DST_COLOR */
+        case 0x0308: {                                      /* SRC_ALPHA_SATURATE */
+            float m = 1.0f - d[3];
+            out[k] = s[3] < m ? s[3] : m;
+            break;
+        }
+        default:
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
     uint8_t *row;
@@ -1004,7 +1036,39 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
      * but skipping it keeps the full-screen quads -- which are drawn with
      * blending enabled and alpha 255 -- on exactly the path they were on
      * before, so this cannot change what they produce. */
+    /* Every other factor pair, generically: out = src*sf + dst*df, clamped.
+     * The fast path below keeps SRC_ALPHA/INV_SRC_ALPHA exactly as it was;
+     * this is for the rest, which used to be written opaque -- additive
+     * glows (ONE/ONE, SRC_ALPHA/ONE) then came out as solid bands. */
     if (s_gpu.blend_enable
+        && !(s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
+             && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA)) {
+        uint32_t dst = 0xFF000000u;
+        float s[4], d[4], sf[3], df[3];
+        int k;
+        if (bpp == 4) {
+            dst = ((const uint32_t *)row)[x];
+        } else if (bpp == 2) {
+            uint32_t t = ((const uint16_t *)row)[x];
+            dst = 0xFF000000u | (((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
+                                 | ((t & 0x001Fu) << 3));
+        }
+        for (k = 0; k < 4; k++) {
+            s[k] = (float)((argb >> (16 - 8 * (k < 3 ? k : -1))) & 0xFF) / 255.0f;
+            d[k] = (float)((dst  >> (16 - 8 * (k < 3 ? k : -1))) & 0xFF) / 255.0f;
+        }
+        /* k = 0..2 is R,G,B (shifts 16, 8, 0); index 3 is alpha (shift 24). */
+        if (blend_factors(s_gpu.blend_sfactor, s, d, sf)
+                && blend_factors(s_gpu.blend_dfactor, s, d, df)) {
+            uint32_t ch[3];
+            for (k = 0; k < 3; k++) {
+                float v = s[k] * sf[k] + d[k] * df[k];
+                v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+                ch[k] = (uint32_t)(v * 255.0f + 0.5f);
+            }
+            argb = 0xFF000000u | (ch[0] << 16) | (ch[1] << 8) | ch[2];
+        }
+    } else if (s_gpu.blend_enable
         && s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
         && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA
         && (argb >> 24) != 0xFF) {
@@ -1051,6 +1115,10 @@ static void raster_triangle(const float a[2], const float b[2],
     float area;
     int minx, maxx, miny, maxy, x, y;
     int textured = uv && s_gpu.tex.valid;
+    static int modulate = -1;
+
+    if (modulate < 0)
+        modulate = getenv("RECOMP_TEX_REPLACE") == NULL;
 
     if (bpp != 4 && bpp != 2)
         return;
@@ -1102,6 +1170,20 @@ static void raster_triangle(const float a[2], const float b[2],
                 if (su < 0.0f) su = 0.0f;
                 if (sv < 0.0f) sv = 0.0f;
                 if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
+                    /* Texture times vertex colour, D3D's default stage-0
+                     * op, rather than the texel alone: a translucent or
+                     * tinted layer carries its fade in the vertex colour,
+                     * and replacing it drew every such layer opaque.
+                     * RECOMP_TEX_REPLACE=1 keeps the old behaviour. */
+                    if (modulate) {
+                        uint32_t sh, m = 0;
+                        for (sh = 0; sh < 32; sh += 8) {
+                            uint32_t t = (texel >> sh) & 0xFFu;
+                            uint32_t v = (argb  >> sh) & 0xFFu;
+                            m |= ((t * v + 127u) / 255u) << sh;
+                        }
+                        texel = m;
+                    }
                     put_pixel(mem, bpp, x, y, texel);
                     continue;
                 }
