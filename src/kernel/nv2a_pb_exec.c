@@ -34,6 +34,15 @@
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
+/* Vertex programs, run on the CPU: a title that transforms its vertices
+ * hands over positions that only become screen space after the program. */
+#include "nv2a_vp.h"
+
+static Nv2aVpState s_vp;
+/* Set per batch: vertices go through s_vp instead of being read as screen
+ * space. */
+static int s_batch_vp;
+static uint32_t s_vp_batches, s_vp_vertices, s_vp_failed;
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -1286,10 +1295,130 @@ static void dump_surface_bmp(void);
  * a batch whose texcoords cannot be read is drawn untextured rather than not
  * at all, so a missing coordinate stream costs the colour and not the shape.
  */
+/* One vertex through the title's vertex program: v0..v15 from the attribute
+ * arrays (fetch_attr leaves an absent one at 0,0,0,1), then oPos, oT0 and oD0.
+ *
+ * Xbox D3D appends the viewport transform and the divide by w to every
+ * program, so oPos.xy comes out in surface pixels -- the space the rasteriser
+ * already works in. oT0 follows the same convention as a raw texcoord
+ * attribute: normalised for swizzled and block-compressed textures, texels
+ * for linear ones. */
+static int vp_vertex(uint32_t index, float pos[2], float uv[2], uint32_t *argb)
+{
+    float in[NV2A_VP_INPUTS][4], out[NV2A_VP_OUTPUTS][4];
+    uint32_t a;
+    int k;
+
+    for (a = 0; a < NV2A_VP_INPUTS; a++)
+        fetch_attr(&s_gpu.attr[a], index, in[a]);
+    s_vp_vertices++;
+    if (!nv2a_vp_run(&s_vp, (const float (*)[4])in, out)) {
+        s_vp_failed++;
+        return 0;
+    }
+    /* RECOMP_VP_TRACE=<n>: the first n vertices in and out, which is the only
+     * way to tell a decode error from a transform the rasteriser misreads. */
+    {
+        static int trace = -1, shown;
+        static unsigned from, seen;
+        static uint32_t dumped_hash[8];
+        static int dumped;
+        uint32_t hash = 2166136261u;
+        if (trace < 0) {
+            const char *e = getenv("RECOMP_VP_TRACE");
+            const char *f = getenv("RECOMP_VP_TRACE_FROM");
+            trace = e ? atoi(e) : 0;
+            from = f ? (unsigned)atoi(f) : 0;
+        }
+        if (trace > 0 && seen++ >= from && shown < trace) {
+            /* A program not dumped before gets its listing and constants,
+             * wherever in the run it first appears. */
+            uint32_t pc;
+            int d, fresh = 1;
+            for (pc = s_vp.program_start; pc < NV2A_VP_SLOTS; pc++) {
+                uint32_t k;
+                for (k = 1; k < 4; k++)
+                    hash = (hash ^ s_vp.program[pc][k]) * 16777619u;
+                if (s_vp.program[pc][3] & 1u)
+                    break;
+            }
+            for (d = 0; d < dumped; d++)
+                if (dumped_hash[d] == hash)
+                    fresh = 0;
+            if (fresh && dumped < 8)
+                dumped_hash[dumped++] = hash;
+            else
+                fresh = 0;
+            shown++;
+            fprintf(stderr, "  [VP] #%d start %u v0=(%g %g %g %g) v3=(%g %g %g %g)"
+                    " v9=(%g %g)\n       oPos=(%g %g %g %g) oD0=(%g %g %g %g)"
+                    " oT0=(%g %g %g %g)\n", shown, s_vp.program_start,
+                    in[0][0], in[0][1], in[0][2], in[0][3],
+                    in[3][0], in[3][1], in[3][2], in[3][3], in[9][0], in[9][1],
+                    out[NV2A_VP_OPOS][0], out[NV2A_VP_OPOS][1],
+                    out[NV2A_VP_OPOS][2], out[NV2A_VP_OPOS][3],
+                    out[NV2A_VP_OD0][0], out[NV2A_VP_OD0][1],
+                    out[NV2A_VP_OD0][2], out[NV2A_VP_OD0][3],
+                    out[NV2A_VP_OT0][0], out[NV2A_VP_OT0][1],
+                    out[NV2A_VP_OT0][2], out[NV2A_VP_OT0][3]);
+            if (fresh) {
+                uint32_t k;
+                fprintf(stderr, "       program %08X:\n", hash);
+                for (pc = s_vp.program_start; pc < NV2A_VP_SLOTS; pc++) {
+                    fprintf(stderr, "       slot %3u: %08X %08X %08X %08X\n", pc,
+                            s_vp.program[pc][0], s_vp.program[pc][1],
+                            s_vp.program[pc][2], s_vp.program[pc][3]);
+                    if (s_vp.program[pc][3] & 1u)
+                        break;
+                }
+                for (k = 0; k < NV2A_VP_CONSTANTS; k++)
+                    if (s_vp.constants[k][0] != 0.0f || s_vp.constants[k][1] != 0.0f
+                     || s_vp.constants[k][2] != 0.0f || s_vp.constants[k][3] != 0.0f)
+                        fprintf(stderr, "       c[%3u] = (%g %g %g %g)\n", k,
+                                s_vp.constants[k][0], s_vp.constants[k][1],
+                                s_vp.constants[k][2], s_vp.constants[k][3]);
+            }
+            fflush(stderr);
+        }
+    }
+    pos[0] = out[NV2A_VP_OPOS][0];
+    pos[1] = out[NV2A_VP_OPOS][1];
+    if (!isfinite(pos[0]) || !isfinite(pos[1])
+            || fabsf(pos[0]) > 1e6f || fabsf(pos[1]) > 1e6f)
+        return 0;
+    uv[0] = out[NV2A_VP_OT0][0];
+    uv[1] = out[NV2A_VP_OT0][1];
+    if (tex_size_from_format(s_gpu.tex.color)) {
+        uv[0] *= (float)s_gpu.tex.width;
+        uv[1] *= (float)s_gpu.tex.height;
+    }
+    if (argb) {
+        uint32_t ch[4];
+        for (k = 0; k < 4; k++) {
+            float v = out[NV2A_VP_OD0][k];
+            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            ch[k] = (uint32_t)(v * 255.0f + 0.5f);
+        }
+        *argb = (ch[3] << 24) | (ch[0] << 16) | (ch[1] << 8) | ch[2];
+    }
+    return 1;
+}
+
 static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 {
     float p[3][4], uv[3][2];
     int textured;
+
+    if (s_batch_vp) {
+        /* Flat colour from the first vertex, as the attribute path does. */
+        if (!vp_vertex(i0, p[0], uv[0], &argb)
+         || !vp_vertex(i1, p[1], uv[1], NULL)
+         || !vp_vertex(i2, p[2], uv[2], NULL))
+            return;
+        raster_triangle(p[0], p[1], p[2], argb,
+                        s_gpu.tex.valid ? (const float (*)[2])uv : NULL);
+        return;
+    }
 
     if (!fetch_attr(&s_gpu.attr[0], i0, p[0])
      || !fetch_attr(&s_gpu.attr[0], i1, p[1])
@@ -1311,13 +1440,24 @@ static void raster_batch(void)
 
     if (s_gpu.idx_count < 3)
         return;
-    if (!batch_is_screen_space()) {
+    /* A running vertex program decides where the vertices land, so the
+     * screen-space guess below does not apply: run the program instead. */
+    s_batch_vp = nv2a_vp_active(&s_vp) && !getenv("RECOMP_VP_OFF");
+    if (s_batch_vp) {
+        s_vp_batches++;
+        if (s_gpu.tex.valid) {
+            s_gpu.batches_textured++;
+            note_texture_use();
+        } else {
+            s_gpu.batches_no_tex++;
+        }
+    } else if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         return;
     }
 
     /* Count why, once per batch: the texture stage cannot change inside one. */
-    {
+    if (!s_batch_vp) {
         const VertexAttr *tc = texcoord_attr();
 
         if (!(tc->offset && tc->stride))
@@ -1927,6 +2067,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             a->type   =  param        & 0x0F;
             a->size   = (param >> 4)  & 0x0F;
             a->stride = (param >> 8)  & 0xFF;
+        } else if (nv2a_vp_method(&s_vp, method, param)) {
+            /* vertex program / constant upload, or its control registers */
         } else if (!imm_vertex_method(method, param)) {
             note_unhandled(method, param);
         }
@@ -2128,6 +2270,10 @@ void nv2a_pb_exec_report(void)
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
+    fprintf(stderr, "[GPU] vertex programs: mode 0x%X, start %u, %u program"
+                    " writes; %u batches, %u vertices run, %u ran off the end\n",
+            s_vp.execution_mode, s_vp.program_start, s_vp.program_writes,
+            s_vp_batches, s_vp_vertices, s_vp_failed);
 
     /* And of the batches that did rasterise, how many sampled anything. A menu
      * that draws its background from one texture and its text from another
