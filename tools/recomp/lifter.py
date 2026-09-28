@@ -491,6 +491,34 @@ def _has_xmm_operand(ops):
                for op in (ops or ()))
 
 
+def _lahf_from_flags(flag_setter, flag_ops):
+    """Lift `lahf` (AH <- SF:ZF:0:AF:0:PF:1:CF) from the tracked flag setter.
+
+    It used to lift to a comment, leaving AH as whatever eax held. MSVC's
+    P6 isnan idiom is `fucomip st, st(1); lahf; test ah, 44h; jnp ok`, so AH
+    must carry ZF (bit 6) and PF (bit 2): with the stale AH of 0 the parity of
+    `0 & 0x44` is even, jnp is never taken, and every number reads as NaN.
+    Amped 2's Lua raised "table index is NaN" on the first numeric table key
+    and gave up booting.
+
+    Each bit comes from the same condition a jcc on it would use, so lahf is
+    exactly as right as the branches are. AF is not tracked and reads as 0.
+    Returns the statement, or None when a flag is not answerable (the caller
+    then keeps the old comment).
+    """
+    if not flag_setter:
+        return None
+    bits = []
+    for jcc, mask in (("js", 0x80), ("je", 0x40), ("jp", 0x04), ("jb", 0x01)):
+        cond = _make_condition(jcc, flag_setter, flag_ops)
+        if cond is None:
+            return None
+        bits.append(f"(({cond[0]}) ? 0x{mask:02X}u : 0u)")
+    ah = " | ".join(["0x02u"] + bits)
+    return (f"eax = (eax & 0xFFFF00FFu) | ((uint32_t)({ah}) << 8);"
+            f" /* lahf <- {flag_setter} */")
+
+
 def _make_condition(jcc, flag_setter, flag_ops):
     """
     Generate a C condition expression for a jcc based on what set the flags.
@@ -554,21 +582,31 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
                         "fucomip", "fcomi", "sahf"):
-        fpu_cmp_map = {
-            "ja": ">", "jnbe": ">",
-            "jae": ">=", "jnb": ">=", "jnc": ">=",
-            "jb": "<", "jnae": "<", "jc": "<",
-            "jbe": "<=", "jna": "<=",
-            "je": "==", "jz": "==",
-            "jne": "!=", "jnz": "!=",
+        # g_fp_cmp is RECOMP_FCMP: -1 less, 0 equal, 1 greater, 2 unordered.
+        # The hardware reports unordered as ZF = PF = CF = 1, so every flag
+        # a NaN compare sets has to be read as set here too. These used to be
+        # `g_fp_cmp == 0` / `< 0` and a constant-false `jp`, which is right
+        # for ordered operands and wrong for NaN in the direction that hides
+        # it: je not taken, jb not taken, jp never taken.
+        zf = "(g_fp_cmp == 0 || g_fp_cmp == 2)"
+        cf = "(g_fp_cmp == -1 || g_fp_cmp == 2)"
+        pf = "(g_fp_cmp == 2)"
+        fpu_cond = {
+            "ja": f"(!{cf} && !{zf})", "jnbe": f"(!{cf} && !{zf})",
+            "jae": f"(!{cf})", "jnb": f"(!{cf})", "jnc": f"(!{cf})",
+            "jb": cf, "jnae": cf, "jc": cf,
+            "jbe": f"({cf} || {zf})", "jna": f"({cf} || {zf})",
+            "je": zf, "jz": zf,
+            "jne": f"(!{zf})", "jnz": f"(!{zf})",
+            "jp": pf, "jpe": pf,
+            "jnp": f"(!{pf})", "jpo": f"(!{pf})",
+            # FCOMI clears SF (and OF); sahf would load it from AH bit 7,
+            # which fnstsw leaves clear after a compare.
+            "js": "0", "jns": "1",
         }
-        op = fpu_cmp_map.get(jcc)
-        if op:
-            return f"(g_fp_cmp {op} 0) /* {flag_setter} */", desc
-        if jcc == "jp":
-            return "0 /* fpu: unordered/NaN */", desc
-        if jcc == "jnp":
-            return "1 /* fpu: ordered */", desc
+        cond = fpu_cond.get(jcc)
+        if cond:
+            return f"{cond} /* {flag_setter} */", desc
         return None
 
     # If no operands available for other flag-setters, can't generate condition
@@ -3832,6 +3870,9 @@ def lift_basic_block(lifter, bb, flag_state=None):
                         and insns[j].mnemonic in ("sbb", "adc"))
             results = lifter._lift_neg(
                 curr, curr.operands, preserve_carry=preserve)
+        elif curr.mnemonic == "lahf" and _lahf_from_flags(
+                last_flag_setter, last_flag_ops) is not None:
+            results = [_lahf_from_flags(last_flag_setter, last_flag_ops)]
         else:
             results = lifter.lift_instruction(insns[i])
             # A REPE/REPNE compare whose count is zero leaves EFLAGS alone,
