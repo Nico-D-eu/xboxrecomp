@@ -423,10 +423,49 @@ static int     g_ctrl_sent;
 #define OHCI_CONTIG_BASE 0x80000000u
 #define OHCI_CONTIG_SIZE (64u * 1024u * 1024u)
 
+/* A bus address, as the driver hands one to the controller, to the guest
+ * address the same bytes are visible at.
+ *
+ * The controller is a bus master: HcHCCA, the ED and TD pointers and the data
+ * buffers are all physical. Titles differ in what they pass, because
+ * MmGetPhysicalAddress differs in what it answers -- DDS9's first control
+ * transfer arrived as 0x80408940, already in the window, while Amped 2's
+ * arrives as physical 0x010160C0. Read as a virtual address, that is low
+ * main RAM, which held zeros: every ED walked empty, no SETUP was ever sent,
+ * and the pad never enumerated.
+ *
+ * Same rule the pushbuffer executor applies to DMA offsets (dma_resolve):
+ * below the contiguous arena's high-water mark, the address is contiguous
+ * memory this runtime handed out, visible at the window. */
+static uint32_t bus_va(uint32_t a)
+{
+    extern uint32_t xbox_ContiguousAllocatedBytes(void);
+    extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
+
+    if (a >= OHCI_CONTIG_BASE)
+        return a;
+    /* The loaded image first. It sits at physical == virtual, and a driver
+     * can hand the controller a buffer in its own .data: Amped 2's
+     * GET_DESCRIPTOR data stage is at 0x0038C0F4. The contiguous arena's
+     * physical numbers overlap that range here, so the image has to win or
+     * the IN data lands in the window and the driver retries forever.
+     *
+     * ponytail: ambiguous by construction -- the arena hands out physical
+     * addresses from 0, which on the console would be where the image is.
+     * Starting the arena above the image would make every bus address
+     * unambiguous; until then, image beats arena. */
+    if (g_xbox_image_hi && a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return a;
+    if (a && a < xbox_ContiguousAllocatedBytes())
+        return OHCI_CONTIG_BASE + a;
+    return a;
+}
+
 static int guest_ok(uint32_t va, uint32_t bytes)
 {
     size_t mapped = xbox_GetMappedSize();
 
+    va = bus_va(va);
     if (va == 0 || mapped == 0)
         return 0;
     /* Descriptors live where a driver puts DMA memory, and on Xbox that is
@@ -448,18 +487,18 @@ static uint32_t rd32(uint32_t va)
 {
     if (!guest_ok(va, 4))
         return 0;
-    return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
+    return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + bus_va(va));
 }
 static void wr32(uint32_t va, uint32_t v)
 {
     if (!guest_ok(va, 4))
         return;
-    *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
+    *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + bus_va(va)) = v;
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
     return guest_ok(va, bytes)
-         ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
+         ? (uint8_t *)xbox_GetMemoryOffset() + bus_va(va) : NULL;
 }
 
 /* Move one transfer descriptor. Returns the condition code to report. */
