@@ -1214,7 +1214,11 @@ static void bridge_HalReturnToFirmware(void)
         uint32_t i;
 
         fprintf(stderr, "  [KERNEL] exit requested, guest esp=0x%08X:\n", g_esp);
-        for (i = 0; i < 200; i++) {
+        /* 1024 dwords, not 200: XLaunchNewImage builds its launch-data page
+         * on the stack, and on Amped 2 that alone put the title's own launch
+         * call at dword 197 -- everything that decided to leave was below the
+         * cut. */
+        for (i = 0; i < 1024; i++) {
             uint32_t a = g_esp + i * 4;
             if (a < 0x00010000u || a >= 0x04000000u) break;
             fprintf(stderr, "    GS %08X %08X\n", a,
