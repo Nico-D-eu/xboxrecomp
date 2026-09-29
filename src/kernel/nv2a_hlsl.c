@@ -584,6 +584,12 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
         sb(&s, ";\n    float G = "); comb_input(&s, (cw1 >> 8) & 0x3Fu, 0);
         sb(&s, ";\n    outc = float4(saturate(A * B + (1.0 - A) * C + D), saturate(G)); }\n");
     }
+    /* RECOMP_GPU_PS_DEBUG (atest.w): 1 diffuse, 2 texture 0, 3 magenta --
+     * opaque and past the alpha test, to tell missing geometry from a pixel
+     * that is computed transparent. */
+    sb(&s, "  if (atest.w == 1u) return float4(v0.rgb, 1.0);\n"
+           "  if (atest.w == 2u) return float4(t0.rgb, 1.0);\n"
+           "  if (atest.w == 3u) return float4(1.0, 0.0, 1.0, 1.0);\n");
     sb(&s, "  if (kill) discard;\n"
            "  if (atest.x != 0u) {\n"
            "    float a = floor(saturate(outc.a) * 255.0 + 0.5);\n"

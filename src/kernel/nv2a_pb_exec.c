@@ -503,6 +503,9 @@ static void note_unhandled(uint32_t method, uint32_t param)
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
+static float s_cur_attr[NV_VERTEX_ATTRS][4];
+static uint32_t s_cur_attr_set;
+
 static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -511,8 +514,12 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
-    if (!a->size || !a->stride)
+    if (!a->size || !a->stride) {
+        /* No array: the attribute's current value (see cur_attr_method). */
+        if (a >= s_gpu.attr && a < s_gpu.attr + NV_VERTEX_ATTRS)
+            memcpy(out, s_cur_attr[a - s_gpu.attr], 4 * sizeof(float));
         return 0;
+    }
     if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
          * the buffered payload rather than a guest address -- and 0 is a legal
@@ -2278,6 +2285,8 @@ static void hw_draw(void)
         d.inline_bytes = s_gpu.inline_count * 4;
     }
     d.use_vp = s_batch_vp;
+    d.cur_attr = (const float (*)[4])s_cur_attr;
+    d.cur_attr_set = s_cur_attr_set;
     d.diffuse_attr = (uint32_t)(color_attr() - s_gpu.attr);
     d.tex0_attr = (uint32_t)(texcoord_attr() - s_gpu.attr);
     for (i = 0; i < 4; i++) {
@@ -2397,6 +2406,78 @@ static void raster_batch(void)
         else {
             s_gpu.batches_textured++;
             note_texture_use();
+        }
+    }
+
+    /* RECOMP_VP_BAD=<n>: the first n program batches whose first vertices
+     * come out of the interpreter non-finite or far off the surface, with
+     * their attribute layout -- geometry that is drawn every frame and never
+     * seen. */
+    {
+        static int want = -1, shown;
+        if (want < 0) {
+            const char *e = getenv("RECOMP_VP_BAD");
+            want = e ? atoi(e) : 0;
+        }
+        if (want > 0 && shown < want && s_batch_vp && s_gpu.idx_count >= 9) {
+            /* Collapsed: the first nine vertices all within a pixel of each
+             * other -- a mesh whose transform put every vertex in one place.
+             * Logged once per program and layout. */
+            static uint32_t seen[64];
+            static int nseen;
+            RVert v, v0;
+            uint32_t k, bad = 0, sig = s_vp.program_start * 2654435761u;
+            float spread = 0.0f;
+            for (k = 0; k < NV_VERTEX_ATTRS; k++)
+                sig = (sig ^ (s_gpu.attr[k].type | s_gpu.attr[k].size << 4
+                              | s_gpu.attr[k].stride << 8)) * 16777619u;
+            memset(&v0, 0, sizeof v0);
+            vp_vertex(s_gpu.idx[0], &v0);
+            for (k = 1; k < 9; k++) {
+                memset(&v, 0, sizeof v);
+                vp_vertex(s_gpu.idx[k], &v);
+                spread = fmaxf(spread, fabsf(v.x - v0.x) + fabsf(v.y - v0.y));
+            }
+            bad = spread < 1.0f;
+            for (k = 0; k < (uint32_t)nseen; k++)
+                if (seen[k] == sig)
+                    bad = 0;
+            if (bad && nseen < 64)
+                seen[nseen++] = sig;
+            if (bad) {
+                uint32_t a;
+                shown++;
+                float in0[NV2A_VP_INPUTS][4];
+                for (k = 0; k < NV2A_VP_INPUTS; k++)
+                    fetch_attr(&s_gpu.attr[k], s_gpu.idx[0], in0[k]);
+                fprintf(stderr, "  [VPBAD] batch %u prim %u n %u start %u: collapsed at (%g %g %g %g)\n",
+                        s_batch_no, s_gpu.prim, s_gpu.idx_count, s_vp.program_start,
+                        v0.x, v0.y, v0.z, v0.w);
+                for (k = 0; k < NV2A_VP_INPUTS; k++)
+                    if (s_gpu.attr[k].size || in0[k][0] != 0.0f || in0[k][1] != 0.0f
+                            || in0[k][2] != 0.0f || in0[k][3] != 1.0f)
+                        fprintf(stderr, "  [VPBAD]   in v%u = (%g %g %g %g)\n", k,
+                                in0[k][0], in0[k][1], in0[k][2], in0[k][3]);
+                if (s_gpu.idx_count > 600) {
+                    uint32_t pc;
+                    for (pc = s_vp.program_start; pc < NV2A_VP_SLOTS; pc++) {
+                        fprintf(stderr, "  [VPBAD]   slot %3u: %08X %08X %08X\n", pc,
+                                s_vp.program[pc][1], s_vp.program[pc][2], s_vp.program[pc][3]);
+                        if (s_vp.program[pc][3] & 1u)
+                            break;
+                    }
+                    for (k = 0; k < NV2A_VP_CONSTANTS; k++)
+                        fprintf(stderr, "  [VPBAD]   c[%3u] = (%g %g %g %g)\n", k,
+                                s_vp.constants[k][0], s_vp.constants[k][1],
+                                s_vp.constants[k][2], s_vp.constants[k][3]);
+                }
+                for (a = 0; a < NV_VERTEX_ATTRS; a++)
+                    if (s_gpu.attr[a].size)
+                        fprintf(stderr, "  [VPBAD]   v%u type %u size %u stride %u @%08X\n", a,
+                                s_gpu.attr[a].type, s_gpu.attr[a].size, s_gpu.attr[a].stride,
+                                s_gpu.attr[a].offset);
+                fflush(stderr);
+            }
         }
     }
 
@@ -2715,10 +2796,72 @@ static void imm_emit_vertex(void)
  * Split out because it is a range test against five separate bases, and that
  * reads better than five more cases in an already long switch.
  */
+/* The current value of every vertex attribute, as SET_VERTEX_DATA* leaves it.
+ *
+ * An attribute with no array is not zero on NV2A: it is whatever the title
+ * last set it to, and a title leans on that -- a rigid piece of a skinned
+ * character can carry its bone index as a per-batch constant rather than a
+ * per-vertex stream. Both draw paths read absent attributes from here. */
+static float s_cur_attr[NV_VERTEX_ATTRS][4] = {
+    {0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},
+    {0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1}
+};
+/* s_cur_attr_set: attributes a method has written (declared above). */
+
+#define NV097_SET_VERTEX_DATA2S           0x1900   /* + attr*4,  2 shorts  */
+#define NV097_SET_VERTEX_DATA4S_M         0x1980   /* + attr*8,  4 shorts  */
+
+static int cur_attr_method(uint32_t method, uint32_t param)
+{
+    union { uint32_t u; float f; } v;
+    uint32_t a, c;
+
+    v.u = param;
+    if (method >= NV097_SET_VERTEX_DATA2F_M
+            && method < NV097_SET_VERTEX_DATA2F_M + NV_VERTEX_ATTRS * 8) {
+        a = (method - NV097_SET_VERTEX_DATA2F_M) / 8;
+        c = ((method - NV097_SET_VERTEX_DATA2F_M) % 8) / 4;
+        s_cur_attr[a][c] = v.f;
+        if (c == 1) { s_cur_attr[a][2] = 0.0f; s_cur_attr[a][3] = 1.0f; }
+    } else if (method >= NV097_SET_VERTEX_DATA4F_M
+            && method < NV097_SET_VERTEX_DATA4F_M + NV_VERTEX_ATTRS * 16) {
+        a = (method - NV097_SET_VERTEX_DATA4F_M) / 16;
+        s_cur_attr[a][((method - NV097_SET_VERTEX_DATA4F_M) % 16) / 4] = v.f;
+    } else if (method >= NV097_SET_VERTEX_DATA2S
+            && method < NV097_SET_VERTEX_DATA2S + NV_VERTEX_ATTRS * 4) {
+        a = (method - NV097_SET_VERTEX_DATA2S) / 4;
+        s_cur_attr[a][0] = (float)(int16_t)(param & 0xFFFFu);
+        s_cur_attr[a][1] = (float)(int16_t)(param >> 16);
+        s_cur_attr[a][2] = 0.0f;
+        s_cur_attr[a][3] = 1.0f;
+    } else if (method >= NV097_SET_VERTEX_DATA4UB
+            && method < NV097_SET_VERTEX_DATA4UB + NV_VERTEX_ATTRS * 4) {
+        /* Bytes in order, normalised: x is the low byte (xemu's reading). */
+        a = (method - NV097_SET_VERTEX_DATA4UB) / 4;
+        for (c = 0; c < 4; c++)
+            s_cur_attr[a][c] = (float)((param >> (8 * c)) & 0xFFu) / 255.0f;
+    } else if (method >= NV097_SET_VERTEX_DATA4S_M
+            && method < NV097_SET_VERTEX_DATA4S_M + NV_VERTEX_ATTRS * 8) {
+        a = (method - NV097_SET_VERTEX_DATA4S_M) / 8;
+        c = ((method - NV097_SET_VERTEX_DATA4S_M) % 8) / 4 * 2;
+        s_cur_attr[a][c]     = (float)(int16_t)(param & 0xFFFFu);
+        s_cur_attr[a][c + 1] = (float)(int16_t)(param >> 16);
+    } else {
+        return 0;
+    }
+    s_cur_attr_set |= 1u << a;
+    return 1;
+}
+
 static int imm_vertex_method(uint32_t method, uint32_t param)
 {
     union { uint32_t u; float f; } v;
     v.u = param;
+
+    if (cur_attr_method(method, param)
+            && (method >= NV097_SET_VERTEX_DATA2S && method < NV097_SET_VERTEX_DATA2S + NV_VERTEX_ATTRS * 4
+                || method >= NV097_SET_VERTEX_DATA4S_M && method < NV097_SET_VERTEX_DATA4S_M + NV_VERTEX_ATTRS * 8))
+        return 1;                        /* no immediate-mode meaning of its own */
 
     if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
         uint32_t c = (method - NV097_SET_VERTEX4F) / 4;

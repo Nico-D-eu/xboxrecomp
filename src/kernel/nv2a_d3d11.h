@@ -56,6 +56,8 @@ typedef struct {
     uint32_t inline_bytes;
     int use_vp;                    /* else pre-transformed */
     uint32_t diffuse_attr, tex0_attr;   /* pre-transformed roles */
+    const float (*cur_attr)[4];    /* current values, for absent attributes */
+    uint32_t cur_attr_set;         /* which of them the title has set */
 
     const Nv2aVpState  *vp;
     const Nv2aCombiner *comb;

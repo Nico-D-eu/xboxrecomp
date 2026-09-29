@@ -409,8 +409,13 @@ static ID3D11DepthStencilState *depth_state(const Nv2aHwDraw *d)
     ID3D11DepthStencilState *ds = NULL;
 
     memset(&dd, 0, sizeof dd);
-    /* GL semantics, which NV2A has: with the test off nothing is written. */
-    dd.DepthEnable = d->depth_test != 0;
+    /* GL semantics, which NV2A has: with the test off nothing is written.
+     * RECOMP_GPU_NODEPTH=1 turns the test off everywhere, to find geometry
+     * that is drawn but hidden. */
+    static int nodepth = -1;
+    if (nodepth < 0)
+        nodepth = getenv("RECOMP_GPU_NODEPTH") != NULL;
+    dd.DepthEnable = d->depth_test != 0 && !nodepth;
     dd.DepthWriteMask = d->depth_mask ? D3D11_DEPTH_WRITE_MASK_ALL
                                       : D3D11_DEPTH_WRITE_MASK_ZERO;
     dd.DepthFunc = cmp_func(d->depth_func);
@@ -1276,7 +1281,10 @@ void nv2a_d3d11_draw(const Nv2aHwDraw *d)
         uint32_t bytes = 0, mode = 0, s;
         DXGI_FORMAT f;
 
-        vsd.adef[a][3] = 1.0f;
+        if (d->cur_attr)
+            memcpy(vsd.adef[a], d->cur_attr[a], sizeof vsd.adef[a]);
+        else
+            vsd.adef[a][3] = 1.0f;
         el[a].SemanticName = "ATTR";
         el[a].SemanticIndex = a;
         el[a].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
@@ -1362,7 +1370,8 @@ void nv2a_d3d11_draw(const Nv2aHwDraw *d)
     vsd.vp[2] = 1.0f / (((d->format >> 4) & 0xFu) == 1u ? 65535.0f : 16777215.0f);
     vsd.roles[0] = d->diffuse_attr;
     vsd.roles[1] = d->tex0_attr;
-    if (!d->use_vp && !vsd.afmt[d->diffuse_attr & 15][0]) {
+    if (!d->use_vp && !vsd.afmt[d->diffuse_attr & 15][0]
+            && !(d->cur_attr_set & (1u << (d->diffuse_attr & 15)))) {
         /* Pre-transformed with no colour stream: white, as the software
          * path draws it. */
         vsd.adef[d->diffuse_attr & 15][0] = vsd.adef[d->diffuse_attr & 15][1] =
@@ -1395,6 +1404,14 @@ void nv2a_d3d11_draw(const Nv2aHwDraw *d)
     psd.atest[0] = d->alpha_test;
     psd.atest[1] = d->alpha_func;
     psd.atest[2] = d->alpha_ref;
+    {
+        static int dbg = -1;
+        if (dbg < 0) {
+            const char *e = getenv("RECOMP_GPU_PS_DEBUG");
+            dbg = e ? atoi(e) : 0;
+        }
+        psd.atest[3] = (uint32_t)dbg;
+    }
     {
         ID3D11ShaderResourceView *srv[4] = { NULL, NULL, NULL, NULL };
         ID3D11SamplerState *smp[4] = { NULL, NULL, NULL, NULL };
