@@ -42,7 +42,7 @@ static Nv2aVpState s_vp;
 /* Set per batch: vertices go through s_vp instead of being read as screen
  * space. */
 static int s_batch_vp;
-static uint32_t s_vp_batches, s_vp_vertices, s_vp_failed;
+static uint32_t s_vp_batches, s_vp_vertices, s_vp_failed, s_vp_behind_eye;
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -1385,6 +1385,12 @@ static void dump_surface_bmp(void);
  * already works in. oT0 follows the same convention as a raw texcoord
  * attribute: normalised for swizzled and block-compressed textures, texels
  * for linear ones. */
+static int vp_vertex(uint32_t index, float pos[2], float uv[2], uint32_t *argb);
+
+/* The w of the last vertex vp_vertex produced. A vertex behind the eye has
+ * w <= 0; see raster_indexed. */
+static float s_vp_last_w;
+
 static int vp_vertex(uint32_t index, float pos[2], float uv[2], uint32_t *argb)
 {
     float in[NV2A_VP_INPUTS][4], out[NV2A_VP_OUTPUTS][4];
@@ -1465,6 +1471,7 @@ static int vp_vertex(uint32_t index, float pos[2], float uv[2], uint32_t *argb)
     }
     pos[0] = out[NV2A_VP_OPOS][0];
     pos[1] = out[NV2A_VP_OPOS][1];
+    s_vp_last_w = out[NV2A_VP_OPOS][3];
     if (!isfinite(pos[0]) || !isfinite(pos[1])
             || fabsf(pos[0]) > 1e6f || fabsf(pos[1]) > 1e6f)
         return 0;
@@ -1492,11 +1499,29 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
     int textured;
 
     if (s_batch_vp) {
+        float w[3];
         /* Flat colour from the first vertex, as the attribute path does. */
-        if (!vp_vertex(i0, p[0], uv[0], &argb)
-         || !vp_vertex(i1, p[1], uv[1], NULL)
-         || !vp_vertex(i2, p[2], uv[2], NULL))
+        if (!vp_vertex(i0, p[0], uv[0], &argb))
             return;
+        w[0] = s_vp_last_w;
+        if (!vp_vertex(i1, p[1], uv[1], NULL))
+            return;
+        w[1] = s_vp_last_w;
+        if (!vp_vertex(i2, p[2], uv[2], NULL))
+            return;
+        w[2] = s_vp_last_w;
+        /* A vertex behind the eye. The program has already divided by w, so
+         * such a vertex arrives mirrored through the centre of the screen,
+         * and the triangle it belongs to becomes a band across the whole
+         * surface -- the grey streaks over Amped 2's menus, from background
+         * layers rotating past the camera. Hardware clips these against the
+         * near plane; until that is modelled, the triangle is dropped, which
+         * loses the sliver in front of the eye rather than painting over
+         * everything. */
+        if (w[0] <= 0.0f || w[1] <= 0.0f || w[2] <= 0.0f) {
+            s_vp_behind_eye++;
+            return;
+        }
         raster_triangle(p[0], p[1], p[2], argb,
                         s_gpu.tex.valid ? (const float (*)[2])uv : NULL);
         return;
@@ -2353,9 +2378,10 @@ void nv2a_pb_exec_report(void)
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
     fprintf(stderr, "[GPU] vertex programs: mode 0x%X, start %u, %u program"
-                    " writes; %u batches, %u vertices run, %u ran off the end\n",
+                    " writes; %u batches, %u vertices run, %u ran off the end,"
+                    " %u triangles behind the eye\n",
             s_vp.execution_mode, s_vp.program_start, s_vp.program_writes,
-            s_vp_batches, s_vp_vertices, s_vp_failed);
+            s_vp_batches, s_vp_vertices, s_vp_failed, s_vp_behind_eye);
 
     /* And of the batches that did rasterise, how many sampled anything. A menu
      * that draws its background from one texture and its text from another
