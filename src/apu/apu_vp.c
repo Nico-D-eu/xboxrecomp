@@ -46,9 +46,15 @@ static const struct {
  * Notify status helper
  * ============================================================ */
 
+/* RECOMP_APU_STATS=1 counters, printed by mcpx_apu_monitor_frame: voices
+ * started and stopped (by PIO or by running out) and notifications written,
+ * to see whether DirectSound ever hears that a voice is done. */
+volatile uint32_t g_apu_stat_on, g_apu_stat_off, g_apu_stat_pio_off, g_apu_stat_notify;
+
 static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
                               int status)
 {
+    g_apu_stat_notify++;
     hwaddr notify_offset = d->regs[NV_PAPU_FENADDR];
     notify_offset += 16 * (MCPX_HW_NOTIFIER_BASE_OFFSET +
                            v * MCPX_HW_NOTIFIER_COUNT + notifier);
@@ -126,6 +132,7 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
 
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    g_apu_stat_off++;
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -197,6 +204,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        g_apu_stat_on++;
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -308,6 +316,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        g_apu_stat_pio_off++;
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 

@@ -296,6 +296,20 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
+    {
+        extern volatile uint32_t g_apu_stat_on, g_apu_stat_off,
+                                 g_apu_stat_pio_off, g_apu_stat_notify;
+        static int stats = -1;
+        static unsigned n;
+        if (stats < 0)
+            stats = getenv("RECOMP_APU_STATS") != NULL;
+        if (stats && ++n % 938 == 0)            /* ~5 s of 256-sample frames */
+            fprintf(stderr, "  [APU] voices on %u, off %u (%u by PIO), notifications %u; "
+                    "ISTS %08X IEN %08X FENADDR %08X\n",
+                    g_apu_stat_on, g_apu_stat_off, g_apu_stat_pio_off, g_apu_stat_notify,
+                    d->regs[NV_PAPU_ISTS], d->regs[NV_PAPU_IEN], d->regs[NV_PAPU_FENADDR]);
+    }
+
     /* XAudio2 path: the guest's audio, then the host mixer on top.
      *
      * monitor.frame_buf holds what the VP and the DSP stage accumulated over
