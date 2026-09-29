@@ -40,6 +40,17 @@
 /* The register combiners, which decide every pixel's colour. */
 #include "nv2a_combiner.h"
 
+/* getenv once per name. Several switches are tested per method or per
+ * batch, and getenv walks the whole environment with strchr each time -- it
+ * was a fifth of the executor thread's samples in game. */
+static int env_cached(int *slot, const char *name)
+{
+    if (*slot < 0)
+        *slot = getenv(name) != NULL;
+    return *slot;
+}
+static int s_env_verbose = -1, s_env_vp_off = -1, s_env_batch_trace = -1;
+
 static Nv2aVpState s_vp;
 static Nv2aCombiner s_comb;
 /* Batches seen, for probes that name one. */
@@ -644,7 +655,7 @@ static void clear_surface(uint32_t param)
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
 
-    if (getenv("RECOMP_BATCH_TRACE"))
+    if (env_cached(&s_env_batch_trace, "RECOMP_BATCH_TRACE"))
         fprintf(stderr, "  [BATCH] clear %02X surf %08X zeta %08X\n",
                 param, s_gpu.color_offset, s_gpu.zeta_offset);
     if (param & 0x01u)                     /* Z: the host-side depth buffer */
@@ -1947,6 +1958,13 @@ static int vp_vertex(uint32_t index, RVert *v)
  * result is re-projected and drawn as a fan. */
 #define VP_NEAR_W 1e-3f
 
+/* Per-batch cache of vertex-program results, keyed by vertex index. */
+#define VCACHE_SIZE 1024
+static RVert    s_vcache[VCACHE_SIZE];
+static uint32_t s_vcache_idx[VCACHE_SIZE], s_vcache_gen[VCACHE_SIZE];
+static uint8_t  s_vcache_ok[VCACHE_SIZE];
+static uint32_t s_vcache_cur = 1;
+
 static void clip_near_and_raster(const RVert in[3], int textured)
 {
     const float *scl = s_vp.constants[0x3A], *off = s_vp.constants[0x3B];
@@ -2014,9 +2032,24 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
         smooth = getenv("RECOMP_FLAT_SHADE") == NULL;
 
     if (s_batch_vp) {
-        for (i = 0; i < 3; i++)
-            if (!vp_vertex(idx[i], &v[i]))
+        for (i = 0; i < 3; i++) {
+            /* A strip or an indexed list names most vertices three times,
+             * and the program's inputs cannot change inside a batch, so its
+             * output for an index is computed once per batch. */
+            uint32_t slot = idx[i] & (VCACHE_SIZE - 1);
+            if (s_vcache_gen[slot] == s_vcache_cur && s_vcache_idx[slot] == idx[i]) {
+                if (!s_vcache_ok[slot])
+                    return;
+                v[i] = s_vcache[slot];
+                continue;
+            }
+            s_vcache_gen[slot] = s_vcache_cur;
+            s_vcache_idx[slot] = idx[i];
+            s_vcache_ok[slot] = (uint8_t)vp_vertex(idx[i], &s_vcache[slot]);
+            if (!s_vcache_ok[slot])
                 return;
+            v[i] = s_vcache[slot];
+        }
         if (!smooth)
             for (i = 1; i < 3; i++)
                 memcpy(v[i].c, v[0].c, sizeof v[0].c);
@@ -2069,6 +2102,7 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 static void raster_batch(void)
 {
     s_batch_no++;
+    s_vcache_cur++;                        /* a new batch: forget the vertices */
     uint32_t i;
     uint32_t before = s_gpu.tris_drawn;
 
@@ -2076,7 +2110,7 @@ static void raster_batch(void)
         return;
     /* A running vertex program decides where the vertices land, so the
      * screen-space guess below does not apply: run the program instead. */
-    s_batch_vp = nv2a_vp_active(&s_vp) && !getenv("RECOMP_VP_OFF");
+    s_batch_vp = nv2a_vp_active(&s_vp) && !env_cached(&s_env_vp_off, "RECOMP_VP_OFF");
 
     /* RECOMP_FIND_FLOAT: scan once the menu's composite matrix has had the
      * x-row-is-(0,0,s,0) shape for a few hundred batches, i.e. in steady
@@ -2258,7 +2292,7 @@ static void draw_primitive(void)
 
     raster_batch();
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (env_cached(&s_env_verbose, "RECOMP_PB_EXEC_VERBOSE")) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -2534,7 +2568,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. */
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (env_cached(&s_env_verbose, "RECOMP_PB_EXEC_VERBOSE")) {
         static int shown[8];
         int slot = -1;
         switch (method) {
@@ -2736,7 +2770,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
             }
         }
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (env_cached(&s_env_verbose, "RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {
                 fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
@@ -3083,7 +3117,7 @@ void nv2a_pb_exec_report(void)
     /* The table is large enough for a whole level; the report shows its
      * start, and RECOMP_TEXUSE_ALL=1 the rest. */
     for (i = 0; i < s_tex_use_count
-                && (i < 48 || getenv("RECOMP_TEXUSE_ALL")); i++)
+                && (i < 12 || getenv("RECOMP_TEXUSE_ALL")); i++)
         fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,
                 s_tex_use[i].color,

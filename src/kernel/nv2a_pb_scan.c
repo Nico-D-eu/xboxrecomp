@@ -152,8 +152,13 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va <= start_va)
-        return;
+    {
+        static int scan_on = -1;
+        if (scan_on < 0)
+            scan_on = getenv("RECOMP_PB_SCAN") != NULL;
+        if (!(scan_on || s_exec_enabled) || end_va <= start_va)
+            return;
+    }
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 

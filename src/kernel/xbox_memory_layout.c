@@ -813,6 +813,7 @@ static void fence_mirrors_tick(void)
 }
 
 static int s_nv2a_trace = 0;
+static int s_nv2a_put_trace = 0;   /* RECOMP_NV2A_TRACE alone */
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -870,6 +871,79 @@ static void framebuffer_probe_tick(void)
             sum != last_sum ? "CHANGED" : "same");
     last_sum = sum;
     fflush(stderr);
+}
+
+/* The busy and idle bits, on their own thread.
+ *
+ * nv2a_ack_thread clears them too, but it also drives the pushbuffer
+ * executor, and a software rasteriser can spend most of a second on one
+ * submission. Every handshake the title makes with the GPU then waits that
+ * long: Amped 2's main thread spent all its time in D3D's write-back-cache
+ * flush (0x100410 bit 16) and the vblank ISR in its acknowledge loop, and the
+ * game ran below one frame per second with the CPU idle. On the console those
+ * bits clear in microseconds whatever the GPU is doing, so they get a thread
+ * that does nothing else.
+ *
+ * Interrupt status is the exception to "immediately": a device thread sets
+ * PMC/PCRTC pending bits and then calls the ISR, which reads them to decide
+ * whether the interrupt is its own. Clearing them first would make it decline.
+ * So a pending interrupt bit is cleared once it has been seen set for 1 ms --
+ * long after the ISR has looked, and short enough that its acknowledge spin
+ * costs a millisecond instead of an executor pass. */
+/* Whether the fast thread also retires interrupt status
+ * (RECOMP_NV2A_FAST_INTR). Separate so the two can be tried apart. */
+static int s_fast_ack_intr;
+
+static DWORD WINAPI nv2a_fast_ack_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    LARGE_INTEGER freq, since[sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0])];
+    unsigned idle = 0;
+
+    QueryPerformanceFrequency(&freq);
+    memset(since, 0, sizeof since);
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        int hit = 0;
+        size_t i;
+        for (i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            if (!(*r & NV2A_ACK[i].busy_mask)) {
+                since[i].QuadPart = 0;
+                continue;
+            }
+            if (NV2A_ACK[i].busy_mask != 0xFFFFFFFFu) {
+                hit = 1;
+                *r &= ~NV2A_ACK[i].busy_mask;           /* a busy bit */
+            } else if (s_fast_ack_intr) {
+                hit = 1;
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                if (!since[i].QuadPart)
+                    since[i] = now;
+                else if ((now.QuadPart - since[i].QuadPart) * 1000
+                             >= freq.QuadPart) {
+                    *r = 0;                             /* interrupt status */
+                    since[i].QuadPart = 0;
+                }
+            }
+        }
+        for (i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
+            if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask)
+                *r |= NV2A_IDLE[i].idle_mask;
+        }
+        /* Spin while the title is handshaking, back off when it is not. */
+        idle = hit ? 0 : idle + 1;
+        if (idle > 20000)
+            Sleep(1);
+        else if (idle > 200)
+            SwitchToThread();
+        else
+            YieldProcessor();
+    }
+    return 0;
 }
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
@@ -1008,8 +1082,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * Dashboard reads them: its D3D holds a register-block pointer
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
-                 * never moves. */
-                if (s_nv2a_trace) {
+                 * never moves.
+                 *
+                 * Its own switch, RECOMP_NV2A_TRACE: s_nv2a_trace is also armed by
+                 * RECOMP_PB_EXEC, which is on for every run, and one line per PUT
+                 * through a piped stderr was a third of the executor thread.
+                 */
+                if (s_nv2a_put_trace) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
@@ -1058,6 +1137,17 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    /* Opt-in: RECOMP_NV2A_FAST_ACK=1. On by default it stalled Amped 2 before
+     * its title screen, in D3D (sub_0031E780) waiting on PGRAPH 0x400B10 --
+     * whether or not interrupt status was included. The likely reading is
+     * that D3D treats the flush bit clearing as "the GPU has consumed what
+     * came before", and clearing it ahead of the executor lets the title run
+     * past work that has not been done. The next step is clearing it only
+     * when the executor has caught up (GET == PUT). */
+    s_fast_ack_intr = getenv("RECOMP_NV2A_FAST_INTR") != NULL;
+    if (getenv("RECOMP_NV2A_FAST_ACK"))
+        CloseHandle(CreateThread(NULL, 0, nv2a_fast_ack_thread,
+                                 g_nv2a_memory, 0, NULL));
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
@@ -2323,6 +2413,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         );
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
+        s_nv2a_put_trace = getenv("RECOMP_NV2A_TRACE") != NULL;
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
                     || getenv("RECOMP_PB_SCAN") != NULL
                     || getenv("RECOMP_PB_EXEC") != NULL;
