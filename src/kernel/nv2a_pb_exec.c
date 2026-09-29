@@ -276,7 +276,12 @@ static struct {
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
     Texture  tex;
-} s_gpu;
+    /* Depth and alpha test, as the title programs them. The depth buffer
+     * itself is host-side (see zbuf_current), keyed by the zeta offset. */
+    uint32_t zeta_offset, depth_test, depth_func, depth_mask, zclear;
+    uint32_t alpha_test, alpha_func, alpha_ref;
+    uint32_t zbuf_rejects, alpha_rejects;
+} s_gpu = { .depth_func = 0x0201, .depth_mask = 1, .alpha_func = 0x0207 };
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -554,6 +559,7 @@ static void dump_surface_bmp(void)
 static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2]);
+static void clear_depth(void);
 
 static void clear_surface(uint32_t param)
 {
@@ -561,6 +567,11 @@ static void clear_surface(uint32_t param)
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
 
+    if (getenv("RECOMP_BATCH_TRACE"))
+        fprintf(stderr, "  [BATCH] clear %02X surf %08X zeta %08X\n",
+                param, s_gpu.color_offset, s_gpu.zeta_offset);
+    if (param & 0x01u)                     /* Z: the host-side depth buffer */
+        clear_depth();
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
@@ -1103,27 +1114,144 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     }
 }
 
+/* One rasteriser vertex. x, y are surface pixels; z is window depth in the
+ * zeta surface's units (0..2^24-1 for Z24S8, 0..65535 for Z16 -- the same
+ * units Xbox D3D scales oPos.z into); w is clip-space w, used only to make
+ * the other attributes perspective-correct (1 for pre-transformed vertices);
+ * u, v are texel coordinates; c is R, G, B, A in [0,1]. */
+typedef struct {
+    float x, y, z, w;
+    float u, v;
+    float c[4];
+} RVert;
+
+/* The depth buffer, host-side.
+ *
+ * The zeta surface lives in guest memory as well, but nothing on the host
+ * reads it and titles do not read it back in practice, so a float buffer per
+ * zeta offset is kept here instead of packing Z24S8. Keyed by offset because a
+ * title renders to more than one target (the menus draw the boarder previews
+ * off screen), and each target has its own depth. */
+#define ZBUF_SLOTS 6
+static struct { uint32_t zeta, w, h; float *z; } s_zbuf[ZBUF_SLOTS];
+
+static float zeta_max(void)
+{
+    return ((s_gpu.format >> 4) & 0xFu) == 1u ? 65535.0f : 16777215.0f;
+}
+
+static float *zbuf_current(uint32_t *out_w)
+{
+    uint32_t w = s_gpu.clip_x + s_gpu.clip_w, h = s_gpu.clip_y + s_gpu.clip_h;
+    int i, victim = 0;
+
+    if (!s_gpu.zeta_offset || !w || !h || w > 4096 || h > 4096)
+        return NULL;
+    for (i = 0; i < ZBUF_SLOTS; i++) {
+        if (s_zbuf[i].z && s_zbuf[i].zeta == s_gpu.zeta_offset) {
+            if (s_zbuf[i].w < w || s_zbuf[i].h < h) {
+                float *n = (float *)realloc(s_zbuf[i].z, sizeof(float) * w * h);
+                uint32_t k;
+                if (!n)
+                    return NULL;
+                s_zbuf[i].z = n;
+                s_zbuf[i].w = w;
+                s_zbuf[i].h = h;
+                for (k = 0; k < w * h; k++)
+                    n[k] = zeta_max();
+            }
+            *out_w = s_zbuf[i].w;
+            return s_zbuf[i].z;
+        }
+        if (!s_zbuf[i].z)
+            victim = i;
+    }
+    if (s_zbuf[victim].z)
+        free(s_zbuf[victim].z);
+    s_zbuf[victim].z = (float *)malloc(sizeof(float) * w * h);
+    if (!s_zbuf[victim].z)
+        return NULL;
+    s_zbuf[victim].zeta = s_gpu.zeta_offset;
+    s_zbuf[victim].w = w;
+    s_zbuf[victim].h = h;
+    {
+        uint32_t k;
+        for (k = 0; k < w * h; k++)
+            s_zbuf[victim].z[k] = zeta_max();
+    }
+    *out_w = w;
+    return s_zbuf[victim].z;
+}
+
+/* CLEAR_SURFACE with the Z bit: the clear value's depth field, in the same
+ * units as z above (Z24S8 keeps depth in the top 24 bits). */
+static void clear_depth(void)
+{
+    uint32_t bw, x, y;
+    float *zb = zbuf_current(&bw), v;
+
+    if (!zb)
+        return;
+    v = ((s_gpu.format >> 4) & 0xFu) == 1u ? (float)(s_gpu.zclear & 0xFFFFu)
+                                           : (float)(s_gpu.zclear >> 8);
+    for (y = s_gpu.clip_y; y < s_gpu.clip_y + s_gpu.clip_h; y++)
+        for (x = s_gpu.clip_x; x < s_gpu.clip_x + s_gpu.clip_w; x++)
+            zb[(size_t)y * bw + x] = v;
+}
+
+/* GL comparison enums, as NV097 uses them for depth and alpha. */
+static int nv_compare(uint32_t func, float a, float b)
+{
+    switch (func) {
+    case 0x0200: return 0;             /* NEVER */
+    case 0x0201: return a <  b;        /* LESS */
+    case 0x0202: return a == b;        /* EQUAL */
+    case 0x0203: return a <= b;        /* LEQUAL */
+    case 0x0204: return a >  b;        /* GREATER */
+    case 0x0205: return a != b;        /* NOTEQUAL */
+    case 0x0206: return a >= b;        /* GEQUAL */
+    default:     return 1;             /* ALWAYS, and anything unknown */
+    }
+}
+
+static uint32_t pack_argb(const float c[4])
+{
+    uint32_t ch[4];
+    int k;
+    for (k = 0; k < 4; k++) {
+        float v = c[k] < 0.0f ? 0.0f : (c[k] > 1.0f ? 1.0f : c[k]);
+        ch[k] = (uint32_t)(v * 255.0f + 0.5f);
+    }
+    return (ch[3] << 24) | (ch[0] << 16) | (ch[1] << 8) | ch[2];
+}
+
 /* Half-space fill. Barycentric edge functions rather than scanline slopes:
  * the same test decides both windings, so a title that emits clockwise
- * triangles does not silently render nothing. */
-static void raster_triangle(const float a[2], const float b[2],
-                            const float c[2], uint32_t argb,
-                            const float uv[3][2])
+ * triangles does not silently render nothing.
+ *
+ * Per pixel: depth (linear in screen space, which window z is), colour and
+ * texture coordinates perspective-correct (interpolated as value/w with 1/w),
+ * then the alpha test, the depth test, texture x colour, blending. `smooth`
+ * selects Gouraud colour; flat uses vertex a's. */
+static void raster_tri(const RVert *a, const RVert *b, const RVert *c,
+                       int textured, int smooth)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp();
-    float area;
+    uint32_t bpp = surface_bpp(), zb_w = 0;
+    float area, iwa, iwb, iwc;
+    float *zb = NULL;
     int minx, maxx, miny, maxy, x, y;
-    int textured = uv && s_gpu.tex.valid;
+    int depth = 0;
     static int modulate = -1;
 
     if (modulate < 0)
         modulate = getenv("RECOMP_TEX_REPLACE") == NULL;
+    textured = textured && s_gpu.tex.valid;
 
     if (bpp != 4 && bpp != 2)
         return;
 
-    area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
     if (area == 0.0f)
         return;                            /* degenerate */
 
@@ -1133,10 +1261,10 @@ static void raster_triangle(const float a[2], const float b[2],
     if (!surface_begin_batch(mem))
         return;
 
-    minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
-    maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
-    miny = (int)floorf(fminf(a[1], fminf(b[1], c[1])));
-    maxy = (int)ceilf (fmaxf(a[1], fmaxf(b[1], c[1])));
+    minx = (int)floorf(fminf(a->x, fminf(b->x, c->x)));
+    maxx = (int)ceilf (fmaxf(a->x, fmaxf(b->x, c->x)));
+    miny = (int)floorf(fminf(a->y, fminf(b->y, c->y)));
+    maxy = (int)ceilf (fmaxf(a->y, fmaxf(b->y, c->y)));
 
     if (minx < (int)s_gpu.clip_x) minx = (int)s_gpu.clip_x;
     if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
@@ -1147,26 +1275,60 @@ static void raster_triangle(const float a[2], const float b[2],
         return;
     }
 
+    if (s_gpu.depth_test || s_gpu.depth_mask) {
+        zb = zbuf_current(&zb_w);
+        depth = zb != NULL;
+    }
+    iwa = a->w > 0.0f ? 1.0f / a->w : 1.0f;
+    iwb = b->w > 0.0f ? 1.0f / b->w : 1.0f;
+    iwc = c->w > 0.0f ? 1.0f / c->w : 1.0f;
+
     for (y = miny; y < maxy; y++) {
         for (x = minx; x < maxx; x++) {
             float px = (float)x + 0.5f, py = (float)y + 0.5f;
-            float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
-            float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
-            float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
+            float w0 = (b->x - a->x) * (py - a->y) - (b->y - a->y) * (px - a->x);
+            float w1 = (c->x - b->x) * (py - b->y) - (c->y - b->y) * (px - b->x);
+            float w2 = (a->x - c->x) * (py - c->y) - (a->y - c->y) * (px - c->x);
+            float la, lb, lc, q, pa, pb, pc, col[4];
+            uint32_t out;
+            int k;
+
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
                || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
                 continue;
+            /* w1 is the area opposite a, w2 opposite b, w0 opposite c. */
+            la = w1 / area;
+            lb = w2 / area;
+            lc = w0 / area;
+
+            if (depth) {
+                float z = la * a->z + lb * b->z + lc * c->z;
+                float *zp = &zb[(size_t)y * zb_w + x];
+                if (s_gpu.depth_test && !nv_compare(s_gpu.depth_func, z, *zp)) {
+                    s_gpu.zbuf_rejects++;
+                    continue;
+                }
+                /* Written below, once the pixel survives the alpha test. */
+                (void)zp;
+            }
+
+            /* Perspective-correct weights. */
+            q  = la * iwa + lb * iwb + lc * iwc;
+            pa = la * iwa / q;
+            pb = lb * iwb / q;
+            pc = lc * iwc / q;
+
+            if (smooth)
+                for (k = 0; k < 4; k++)
+                    col[k] = pa * a->c[k] + pb * b->c[k] + pc * c->c[k];
+            else
+                memcpy(col, a->c, sizeof col);
+            out = pack_argb(col);
+
             if (textured) {
-                /* Barycentric, straight from the edge functions already
-                 * computed: w1 is the area opposite a, w2 opposite b, w0
-                 * opposite c, and the three sum to the whole triangle.
-                 *
-                 * No perspective divide. These are screen-space vertices with
-                 * no w to divide by -- which is exactly the case a full-screen
-                 * pass is, and the only case that reaches here. */
                 uint32_t texel;
-                float su = (w1 * uv[0][0] + w2 * uv[1][0] + w0 * uv[2][0]) / area;
-                float sv = (w1 * uv[0][1] + w2 * uv[1][1] + w0 * uv[2][1]) / area;
+                float su = pa * a->u + pb * b->u + pc * c->u;
+                float sv = pa * a->v + pb * b->v + pc * c->v;
                 if (su < 0.0f) su = 0.0f;
                 if (sv < 0.0f) sv = 0.0f;
                 if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
@@ -1179,20 +1341,52 @@ static void raster_triangle(const float a[2], const float b[2],
                         uint32_t sh, m = 0;
                         for (sh = 0; sh < 32; sh += 8) {
                             uint32_t t = (texel >> sh) & 0xFFu;
-                            uint32_t v = (argb  >> sh) & 0xFFu;
+                            uint32_t v = (out   >> sh) & 0xFFu;
                             m |= ((t * v + 127u) / 255u) << sh;
                         }
                         texel = m;
                     }
-                    put_pixel(mem, bpp, x, y, texel);
-                    continue;
+                    out = texel;
                 }
             }
-            put_pixel(mem, bpp, x, y, argb);
+
+            /* Alpha test: the cut-out of foliage, fences and glyph edges. */
+            if (s_gpu.alpha_test
+                    && !nv_compare(s_gpu.alpha_func, (float)(out >> 24),
+                                   (float)(s_gpu.alpha_ref & 0xFFu))) {
+                s_gpu.alpha_rejects++;
+                continue;
+            }
+            if (depth && s_gpu.depth_mask)
+                zb[(size_t)y * zb_w + x] = la * a->z + lb * b->z + lc * c->z;
+            put_pixel(mem, bpp, x, y, out);
         }
     }
     s_gpu.tris_drawn++;
     s_gpu.drawn_offset = s_gpu.color_offset;
+}
+
+/* The flat, affine entry point the older paths use: screen-space positions,
+ * one colour, optional texel coordinates. */
+static void raster_triangle(const float a[2], const float b[2],
+                            const float c[2], uint32_t argb,
+                            const float uv[3][2])
+{
+    RVert v[3];
+    const float *p[3] = { a, b, c };
+    int i, k;
+
+    for (i = 0; i < 3; i++) {
+        v[i].x = p[i][0];
+        v[i].y = p[i][1];
+        v[i].z = 0.0f;
+        v[i].w = 1.0f;
+        v[i].u = uv ? uv[i][0] : 0.0f;
+        v[i].v = uv ? uv[i][1] : 0.0f;
+        for (k = 0; k < 4; k++)
+            v[i].c[k] = (float)((argb >> (k < 3 ? 16 - 8 * k : 24)) & 0xFFu) / 255.0f;
+    }
+    raster_tri(&v[0], &v[1], &v[2], uv != NULL, 0);
 }
 
 /* Attribute 3 is diffuse colour in every NV2A layout that sets one. Absent it,
@@ -1371,6 +1565,7 @@ static int batch_is_screen_space(void)
 static int s_drawn_dumps;
 
 static void dump_surface_bmp(void);
+static void find_float_matrices(void);
 
 /* One triangle by vertex index: gather position and, if the batch has one,
  * texture coordinate 0. A vertex whose position cannot be read is not drawn;
@@ -1385,13 +1580,7 @@ static void dump_surface_bmp(void);
  * already works in. oT0 follows the same convention as a raw texcoord
  * attribute: normalised for swizzled and block-compressed textures, texels
  * for linear ones. */
-static int vp_vertex(uint32_t index, float pos[2], float uv[2], uint32_t *argb);
-
-/* The w of the last vertex vp_vertex produced. A vertex behind the eye has
- * w <= 0; see raster_indexed. */
-static float s_vp_last_w;
-
-static int vp_vertex(uint32_t index, float pos[2], float uv[2], uint32_t *argb)
+static int vp_vertex(uint32_t index, RVert *v)
 {
     float in[NV2A_VP_INPUTS][4], out[NV2A_VP_OUTPUTS][4];
     uint32_t a;
@@ -1469,27 +1658,25 @@ static int vp_vertex(uint32_t index, float pos[2], float uv[2], uint32_t *argb)
             fflush(stderr);
         }
     }
-    pos[0] = out[NV2A_VP_OPOS][0];
-    pos[1] = out[NV2A_VP_OPOS][1];
-    s_vp_last_w = out[NV2A_VP_OPOS][3];
-    if (!isfinite(pos[0]) || !isfinite(pos[1])
-            || fabsf(pos[0]) > 1e6f || fabsf(pos[1]) > 1e6f)
+    /* oPos.xyz is already in surface pixels and zeta units; oPos.w is clip
+     * w, which a vertex behind the eye has <= 0 (see raster_indexed). */
+    v->x = out[NV2A_VP_OPOS][0];
+    v->y = out[NV2A_VP_OPOS][1];
+    v->z = out[NV2A_VP_OPOS][2];
+    v->w = out[NV2A_VP_OPOS][3];
+    if (!isfinite(v->x) || !isfinite(v->y)
+            || fabsf(v->x) > 1e6f || fabsf(v->y) > 1e6f)
         return 0;
-    uv[0] = out[NV2A_VP_OT0][0];
-    uv[1] = out[NV2A_VP_OT0][1];
+    if (!isfinite(v->z))
+        v->z = 0.0f;
+    v->u = out[NV2A_VP_OT0][0];
+    v->v = out[NV2A_VP_OT0][1];
     if (tex_size_from_format(s_gpu.tex.color)) {
-        uv[0] *= (float)s_gpu.tex.width;
-        uv[1] *= (float)s_gpu.tex.height;
+        v->u *= (float)s_gpu.tex.width;
+        v->v *= (float)s_gpu.tex.height;
     }
-    if (argb) {
-        uint32_t ch[4];
-        for (k = 0; k < 4; k++) {
-            float v = out[NV2A_VP_OD0][k];
-            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-            ch[k] = (uint32_t)(v * 255.0f + 0.5f);
-        }
-        *argb = (ch[3] << 24) | (ch[0] << 16) | (ch[1] << 8) | ch[2];
-    }
+    for (k = 0; k < 4; k++)
+        v->c[k] = out[NV2A_VP_OD0][k];
     return 1;
 }
 
@@ -1504,78 +1691,79 @@ static int vp_vertex(uint32_t index, float pos[2], float uv[2], uint32_t *argb)
  * result is re-projected and drawn as a fan. */
 #define VP_NEAR_W 1e-3f
 
-static void clip_near_and_raster(float p[3][4], const float w[3],
-                                 float uv[3][2], uint32_t argb)
+static void clip_near_and_raster(const RVert in[3], int textured)
 {
     const float *scl = s_vp.constants[0x3A], *off = s_vp.constants[0x3B];
-    float cv[3][5], out[4][5];              /* clip x, y, w, u, v */
+    RVert cv[3], out[4];                   /* x, y, z in clip space */
     int i, n = 0;
 
     if (scl[0] == 0.0f || scl[1] == 0.0f)
         return;                            /* no viewport: cannot invert */
     for (i = 0; i < 3; i++) {
-        cv[i][0] = (p[i][0] - off[0]) / scl[0] * w[i];
-        cv[i][1] = (p[i][1] - off[1]) / scl[1] * w[i];
-        cv[i][2] = w[i];
-        cv[i][3] = uv[i][0];
-        cv[i][4] = uv[i][1];
+        cv[i] = in[i];
+        cv[i].x = (in[i].x - off[0]) / scl[0] * in[i].w;
+        cv[i].y = (in[i].y - off[1]) / scl[1] * in[i].w;
+        /* Without a z scale there is nothing to invert; carry window z
+         * through as it is, which only misplaces depth near the cut. */
+        if (scl[2] != 0.0f)
+            cv[i].z = (in[i].z - off[2]) / scl[2] * in[i].w;
     }
     for (i = 0; i < 3; i++) {
-        const float *a = cv[i], *b = cv[(i + 1) % 3];
-        int ain = a[2] > VP_NEAR_W, bin = b[2] > VP_NEAR_W;
+        const RVert *a = &cv[i], *b = &cv[(i + 1) % 3];
+        int ain = a->w > VP_NEAR_W, bin = b->w > VP_NEAR_W;
         if (ain)
-            memcpy(out[n++], a, sizeof out[0]);
+            out[n++] = *a;
         if (ain != bin && n < 4) {
-            float t = (a[2] - VP_NEAR_W) / (a[2] - b[2]);
+            const float *fa = &a->x, *fb = &b->x;
+            float *fo = &out[n].x;
+            float t = (a->w - VP_NEAR_W) / (a->w - b->w);
             int k;
-            for (k = 0; k < 5; k++)
-                out[n][k] = a[k] + t * (b[k] - a[k]);
+            /* Every RVert field is a float, in declaration order. */
+            for (k = 0; k < (int)(sizeof(RVert) / sizeof(float)); k++)
+                fo[k] = fa[k] + t * (fb[k] - fa[k]);
             n++;
         }
     }
     if (n < 3)
         return;                            /* entirely behind the eye */
-    {
-        float sp[4][4], suv[4][2];
-        for (i = 0; i < n; i++) {
-            sp[i][0] = out[i][0] / out[i][2] * scl[0] + off[0];
-            sp[i][1] = out[i][1] / out[i][2] * scl[1] + off[1];
-            sp[i][2] = 0.0f;
-            sp[i][3] = out[i][2];
-            suv[i][0] = out[i][3];
-            suv[i][1] = out[i][4];
-        }
-        for (i = 1; i + 1 < n; i++) {
-            float tp[3][4], tuv[3][2];
-            memcpy(tp[0], sp[0], sizeof tp[0]);
-            memcpy(tp[1], sp[i], sizeof tp[0]);
-            memcpy(tp[2], sp[i + 1], sizeof tp[0]);
-            memcpy(tuv[0], suv[0], sizeof tuv[0]);
-            memcpy(tuv[1], suv[i], sizeof tuv[0]);
-            memcpy(tuv[2], suv[i + 1], sizeof tuv[0]);
-            raster_triangle(tp[0], tp[1], tp[2], argb,
-                            s_gpu.tex.valid ? (const float (*)[2])tuv : NULL);
-        }
+    for (i = 0; i < n; i++) {
+        out[i].x = out[i].x / out[i].w * scl[0] + off[0];
+        out[i].y = out[i].y / out[i].w * scl[1] + off[1];
+        if (scl[2] != 0.0f)
+            out[i].z = out[i].z / out[i].w * scl[2] + off[2];
     }
+    for (i = 1; i + 1 < n; i++)
+        raster_tri(&out[0], &out[i], &out[i + 1], textured, 1);
 }
 
+static void unpack_argb(uint32_t argb, float c[4])
+{
+    c[0] = (float)((argb >> 16) & 0xFFu) / 255.0f;
+    c[1] = (float)((argb >>  8) & 0xFFu) / 255.0f;
+    c[2] = (float)( argb        & 0xFFu) / 255.0f;
+    c[3] = (float)( argb >> 24         ) / 255.0f;
+}
+
+/* One triangle of a batch. `argb` is the provoking vertex's colour, which
+ * RECOMP_FLAT_SHADE=1 uses for the whole triangle (the old behaviour);
+ * otherwise colour is Gouraud-interpolated from each vertex's own. */
 static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 {
-    float p[3][4], uv[3][2];
-    int textured;
+    const uint32_t idx[3] = { i0, i1, i2 };
+    static int smooth = -1;
+    RVert v[3];
+    int i, textured = 1;
+
+    if (smooth < 0)
+        smooth = getenv("RECOMP_FLAT_SHADE") == NULL;
 
     if (s_batch_vp) {
-        float w[3];
-        /* Flat colour from the first vertex, as the attribute path does. */
-        if (!vp_vertex(i0, p[0], uv[0], &argb))
-            return;
-        w[0] = s_vp_last_w;
-        if (!vp_vertex(i1, p[1], uv[1], NULL))
-            return;
-        w[1] = s_vp_last_w;
-        if (!vp_vertex(i2, p[2], uv[2], NULL))
-            return;
-        w[2] = s_vp_last_w;
+        for (i = 0; i < 3; i++)
+            if (!vp_vertex(idx[i], &v[i]))
+                return;
+        if (!smooth)
+            for (i = 1; i < 3; i++)
+                memcpy(v[i].c, v[0].c, sizeof v[0].c);
         /* A vertex behind the eye. The program has already divided by w, so
          * such a vertex arrives mirrored through the centre of the screen,
          * and the triangle it belongs to becomes a band across the whole
@@ -1584,27 +1772,35 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
          * left holes in a background the title relies on to cover the last
          * frame (it clears rarely), so old screens showed through. So clip,
          * as the hardware does: see clip_near_and_raster. */
-        if (w[0] <= VP_NEAR_W || w[1] <= VP_NEAR_W || w[2] <= VP_NEAR_W) {
+        if (v[0].w <= VP_NEAR_W || v[1].w <= VP_NEAR_W || v[2].w <= VP_NEAR_W) {
             s_vp_behind_eye++;
-            clip_near_and_raster(p, w, uv, argb);
+            clip_near_and_raster(v, s_gpu.tex.valid);
             return;
         }
-        raster_triangle(p[0], p[1], p[2], argb,
-                        s_gpu.tex.valid ? (const float (*)[2])uv : NULL);
+        raster_tri(&v[0], &v[1], &v[2], s_gpu.tex.valid, 1);
         return;
     }
 
-    if (!fetch_attr(&s_gpu.attr[0], i0, p[0])
-     || !fetch_attr(&s_gpu.attr[0], i1, p[1])
-     || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
-        return;
-
-    textured = fetch_texcoord(i0, uv[0])
-            && fetch_texcoord(i1, uv[1])
-            && fetch_texcoord(i2, uv[2]);
-
-    raster_triangle(p[0], p[1], p[2], argb,
-                    textured ? (const float (*)[2])uv : NULL);
+    /* Pre-transformed (XYZRHW) vertices: x, y in pixels, z as given, and
+     * 1/rhw as w so texture and colour stay perspective-correct. */
+    for (i = 0; i < 3; i++) {
+        float p[4], uv[2];
+        if (!fetch_attr(&s_gpu.attr[0], idx[i], p))
+            return;
+        v[i].x = p[0];
+        v[i].y = p[1];
+        v[i].z = p[2];
+        v[i].w = p[3] > 0.0f && isfinite(p[3]) ? 1.0f / p[3] : 1.0f;
+        if (textured && fetch_texcoord(idx[i], uv)) {
+            v[i].u = uv[0];
+            v[i].v = uv[1];
+        } else {
+            textured = 0;
+            v[i].u = v[i].v = 0.0f;
+        }
+        unpack_argb(smooth ? vertex_color(idx[i]) : argb, v[i].c);
+    }
+    raster_tri(&v[0], &v[1], &v[2], textured, 1);
 }
 
 static void raster_batch(void)
@@ -1617,6 +1813,67 @@ static void raster_batch(void)
     /* A running vertex program decides where the vertices land, so the
      * screen-space guess below does not apply: run the program instead. */
     s_batch_vp = nv2a_vp_active(&s_vp) && !getenv("RECOMP_VP_OFF");
+
+    /* RECOMP_FIND_FLOAT: scan once the menu's composite matrix has had the
+     * x-row-is-(0,0,s,0) shape for a few hundred batches, i.e. in steady
+     * state rather than on the first frame of a transition. */
+    if (s_batch_vp && s_vp.constants[96][0] == 0.0f
+            && s_vp.constants[96][1] == 0.0f && s_vp.constants[96][2] != 0.0f) {
+        static unsigned seen_shape;
+        if (++seen_shape == 400)
+            find_float_matrices();
+    }
+
+    /* RECOMP_BATCH_TRACE=<n>[,<from>]: one line per batch -- the state it
+     * draws with and where its first vertex lands. What a frame is made of
+     * has to be known before any of it can be fixed. */
+    {
+        static int trace = -1;
+        static unsigned from, stride = 1, seen, shown;
+        if (trace < 0) {
+            const char *e = getenv("RECOMP_BATCH_TRACE");
+            char *end = NULL;
+            trace = e ? (int)strtoul(e, &end, 0) : 0;
+            if (end && *end == ',')
+                from = (unsigned)strtoul(end + 1, &end, 0);
+            if (end && *end == ',')
+                stride = (unsigned)strtoul(end + 1, &end, 0);
+            if (!stride)
+                stride = 1;
+        }
+        if (trace > 0 && seen++ >= from && (seen - 1 - from) % stride == 0
+                && shown < (unsigned)trace) {
+            float p[4] = { 0, 0, 0, 0 };
+            RVert v;
+            shown++;
+            fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], p);
+            memset(&v, 0, sizeof v);
+            if (s_batch_vp)
+                vp_vertex(s_gpu.idx[0], &v);
+            fprintf(stderr, "  [BATCH] #%u mode 0x%X prim %u n %u surf %08X"
+                    " fmt %X zeta %08X | z %u/%X/%u a %u/%X/%u blend %u %X/%X"
+                    " tex %d %ux%u fmt %X | v0 (%g %g %g %g) -> (%g %g %g %g)"
+                    " c (%.2f %.2f %.2f %.2f)\n",
+                    seen - 1, s_vp.execution_mode, s_gpu.prim, s_gpu.idx_count,
+                    s_gpu.color_offset, s_gpu.format, s_gpu.zeta_offset,
+                    s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
+                    s_gpu.alpha_test, s_gpu.alpha_func, s_gpu.alpha_ref,
+                    s_gpu.blend_enable, s_gpu.blend_sfactor, s_gpu.blend_dfactor,
+                    s_gpu.tex.valid, s_gpu.tex.width, s_gpu.tex.height,
+                    s_gpu.tex.color, p[0], p[1], p[2], p[3],
+                    v.x, v.y, v.z, v.w, v.c[0], v.c[1], v.c[2], v.c[3]);
+            if (s_batch_vp) {
+                const float (*c)[4] = (const float (*)[4])&s_vp.constants[96];
+                fprintf(stderr, "          c96 (%g %g %g %g) (%g %g %g %g)"
+                        " (%g %g %g %g) (%g %g %g %g)\n",
+                        c[0][0], c[0][1], c[0][2], c[0][3],
+                        c[1][0], c[1][1], c[1][2], c[1][3],
+                        c[2][0], c[2][1], c[2][2], c[2][3],
+                        c[3][0], c[3][1], c[3][2], c[3][3]);
+            }
+        }
+    }
+
     if (s_batch_vp) {
         s_vp_batches++;
         if (s_gpu.tex.valid) {
@@ -2059,6 +2316,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_BLEND_ENABLE:
         s_gpu.blend_enable = param;
         break;
+    /* Depth and alpha test state; the tests themselves are in raster_tri. */
+    case 0x0214:                           /* SET_SURFACE_ZETA_OFFSET */
+        s_gpu.zeta_offset = param;
+        break;
+    case 0x030C:                           /* SET_DEPTH_TEST_ENABLE */
+        s_gpu.depth_test = param;
+        break;
+    case 0x0354:                           /* SET_DEPTH_FUNC */
+        s_gpu.depth_func = param;
+        break;
+    case 0x035C:                           /* SET_DEPTH_MASK */
+        s_gpu.depth_mask = param;
+        break;
+    case 0x1D8C:                           /* SET_ZSTENCIL_CLEAR_VALUE */
+        s_gpu.zclear = param;
+        break;
+    case 0x0300:                           /* SET_ALPHA_TEST_ENABLE */
+        s_gpu.alpha_test = param;
+        break;
+    case 0x033C:                           /* SET_ALPHA_FUNC */
+        s_gpu.alpha_func = param;
+        break;
+    case 0x0340:                           /* SET_ALPHA_REF */
+        s_gpu.alpha_ref = param;
+        break;
     case NV097_SET_BLEND_FUNC_SFACTOR:
         s_gpu.blend_sfactor = param;
         break;
@@ -2329,6 +2611,59 @@ static void find_nan_matrices(void)
     fflush(stderr);
 }
 
+/* RECOMP_FIND_FLOAT=<value>: guest RAM windows of 16 floats holding at least
+ * four of +/-value, printed as floats -- a matrix the title keeps in memory
+ * is found by the numbers it is made of, and its address leads back to the
+ * code that builds it. Called once, from the batch that first shows the
+ * shape being chased. */
+static void find_float_matrices(void)
+{
+    const char *spec = getenv("RECOMP_FIND_FLOAT");
+    const float *ram = (const float *)xbox_GetMemoryOffset();
+    float want;
+    uint32_t i, hits = 0;
+
+    if (!spec)
+        return;
+    want = (float)atof(spec);
+    fprintf(stderr, "[GPU] searching guest RAM for matrices of +/-%g...\n", want);
+    for (i = 0x1000 / 4; i + 16 < 0x04000000u / 4 && hits < 40; i += 4) {
+        int k, n = 0;
+        for (k = 0; k < 16; k++) {
+            float v = fabsf(ram[i + k]);
+            if (isfinite(v) && fabsf(v - want) < 2e-4f)
+                n++;
+        }
+        if (n < 4)
+            continue;
+        hits++;
+        fprintf(stderr, "  [GPU]   0x%08X:", i * 4);
+        for (k = 0; k < 16; k++)
+            fprintf(stderr, "%s%g", (k % 4) ? " " : " | ", ram[i + k]);
+        fprintf(stderr, "\n");
+        /* RECOMP_FIND_FLOAT_CTX=<rows>: the 16-byte rows either side too,
+         * because a hit window rarely starts where the matrix does. */
+        {
+            static int ctx = -1;
+            int r;
+            if (ctx < 0) {
+                const char *c = getenv("RECOMP_FIND_FLOAT_CTX");
+                ctx = c ? atoi(c) : 0;
+            }
+            for (r = -ctx; r < ctx + 4 && hits <= 8; r++) {
+                uint32_t row = i + (uint32_t)(r * 4);
+                if (row < 0x1000 / 4 || row + 4 >= 0x04000000u / 4)
+                    continue;
+                fprintf(stderr, "            %08X: %g %g %g %g\n", row * 4,
+                        ram[row], ram[row + 1], ram[row + 2], ram[row + 3]);
+            }
+        }
+        i += 12;
+    }
+    fprintf(stderr, "  [GPU]   %u windows\n", hits);
+    fflush(stderr);
+}
+
 /* Print guest dwords named by RECOMP_PEEK, as hex and as float.
  *
  * Chasing a value backwards means reading it, and a value that is only wrong
@@ -2449,6 +2784,11 @@ void nv2a_pb_exec_report(void)
                     " %u triangles behind the eye\n",
             s_vp.execution_mode, s_vp.program_start, s_vp.program_writes,
             s_vp_batches, s_vp_vertices, s_vp_failed, s_vp_behind_eye);
+    fprintf(stderr, "[GPU] depth: test %u func 0x%X mask %u zeta 0x%X;"
+                    " %u pixels failed depth, %u failed alpha (func 0x%X ref %u)\n",
+            s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
+            s_gpu.zeta_offset, s_gpu.zbuf_rejects, s_gpu.alpha_rejects,
+            s_gpu.alpha_func, s_gpu.alpha_ref);
 
     /* And of the batches that did rasterise, how many sampled anything. A menu
      * that draws its background from one texture and its text from another
