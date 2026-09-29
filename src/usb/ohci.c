@@ -925,9 +925,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
 
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
+        /* No deadline. This gave up after 30 s, and a title that brings its
+         * USB stack up late -- Amped 2 does it 28-31 s in under the recomp,
+         * after loading its front end -- lost its pad on some runs and not
+         * others. Waiting costs one read every tick. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
-                break;
+            waited++;
             continue;
         }
         if (!(enable & INTR_MIE))
