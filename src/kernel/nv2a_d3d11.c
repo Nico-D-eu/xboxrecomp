@@ -1612,6 +1612,8 @@ void nv2a_d3d11_report(void)
 {
     static uint32_t last_frame, last_draws;
     static uint64_t last_vb, last_ticks, last_hash;
+    static long long last_scan;
+    extern volatile long long g_nv2a_scan_ticks;
     uint32_t frames;
 
     if (s_state <= 0)
@@ -1626,9 +1628,12 @@ void nv2a_d3d11_report(void)
                 (double)(s_st.vb_bytes - last_vb) / frames / 1024.0,
                 (double)(s_st.tex_hash_bytes - last_hash) / frames / 1024.0,
                 (double)(s_st.draw_ticks - last_ticks) * 1000.0 / (double)s_qpf.QuadPart / frames);
+        fprintf(stderr, "  [D3D11]   executor busy %.2f ms a frame (walk + execute, flip waits included)\n",
+                (double)(g_nv2a_scan_ticks - last_scan) * 1000.0 / (double)s_qpf.QuadPart / frames);
     }
     last_frame = s_frame; last_draws = s_st.draws; last_vb = s_st.vb_bytes;
     last_ticks = s_st.draw_ticks; last_hash = s_st.tex_hash_bytes;
+    last_scan = g_nv2a_scan_ticks;
     fprintf(stderr, "  [D3D11] %u draws, %u triangles, %u skipped, %u points/lines;"
             " shaders %u VS + %u PS (%u failed); %u texture uploads (%u bad);"
             " %u colour + %u depth targets; %u frames read back;"

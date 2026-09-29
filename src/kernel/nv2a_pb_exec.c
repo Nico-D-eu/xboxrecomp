@@ -3186,10 +3186,38 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     interval = atoi(iv);
             }
             if (!nowait) {
-                ULONGLONG t0 = GetTickCount64();
-                while (g_xbox_vblank_count - last_vb < interval
-                       && GetTickCount64() - t0 < 100)
-                    Sleep(1);
+                /* At least `interval` sixtieths of a second since the last
+                 * flip, measured on the clock rather than waited out to the
+                 * next vblank. Nothing scans out here -- frames reach the
+                 * window by readback -- so aligning to vblank bought no
+                 * smoothness, and it cost a frame that ran 20 ms a wait to
+                 * 33, which averaged about 40 fps. The vblank interrupt keeps
+                 * its own 60 Hz for the title. RECOMP_FLIP_VBLANK=1 waits for
+                 * vblanks as before. */
+                static int by_vblank = -1;
+                static LARGE_INTEGER qf, last_t;
+                if (by_vblank < 0) {
+                    by_vblank = getenv("RECOMP_FLIP_VBLANK") != NULL;
+                    QueryPerformanceFrequency(&qf);
+                }
+                if (by_vblank) {
+                    ULONGLONG t0 = GetTickCount64();
+                    while (g_xbox_vblank_count - last_vb < interval
+                           && GetTickCount64() - t0 < 100)
+                        Sleep(1);
+                } else {
+                    LARGE_INTEGER now;
+                    LONGLONG due = last_t.QuadPart + qf.QuadPart * interval / 60;
+                    QueryPerformanceCounter(&now);
+                    while (last_t.QuadPart && now.QuadPart < due) {
+                        if (due - now.QuadPart > qf.QuadPart / 500)
+                            Sleep(1);             /* more than 2 ms to go */
+                        else
+                            YieldProcessor();
+                        QueryPerformanceCounter(&now);
+                    }
+                    last_t = now;
+                }
                 last_vb = g_xbox_vblank_count;
             }
         }

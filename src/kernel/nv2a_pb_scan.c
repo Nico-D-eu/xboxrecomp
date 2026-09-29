@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE */
+#include <windows.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -163,7 +164,21 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
+/* Time spent walking and executing, for the per-frame report. */
+volatile long long g_nv2a_scan_ticks;
+
+static void pb_scan_body(uint32_t start_va, uint32_t end_va);
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+{
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    pb_scan_body(start_va, end_va);
+    QueryPerformanceCounter(&b);
+    g_nv2a_scan_ticks += b.QuadPart - a.QuadPart;
+}
+
+static void pb_scan_body(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t va = start_va;
@@ -187,10 +202,10 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
      * never reached the vertex program. Calls (one level, as on NV2A) the
      * same. */
     int outside = 0, in_call = 0;
-    uint32_t call_ret = 0;
+    uint32_t call_ret = 0, followed = 0;
 
     for (;;) {
-        uint32_t limit = (outside || in_call) ? 0xFFFFFFFFu : end_va;
+        uint32_t limit = (outside || in_call) ? XBOX_CONTIG_BASE + 0x04000000u : end_va;
         uint32_t w;
 
         if (va >= limit || words >= 0x100000u)
@@ -203,11 +218,18 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             uint32_t target = ((w & 3u) == 1u) ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
             int in_ring;
             target = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
-            in_ring = s_ring_hi && target >= s_ring_lo && target <= s_ring_hi + 0x1000u;
+            /* The ring's bounds are learned from PUT, and its wrap lands on
+             * the ring's true start, which can sit below the lowest PUT
+             * seen -- so the ring is taken generously. Treating a wrap as a
+             * jump out of it re-executed stale commands up to garbage. */
+            in_ring = s_ring_hi && target + 0x10000u >= s_ring_lo
+                   && target <= s_ring_hi + 0x10000u;
             jumps++;
             if (!outside) {
                 if (in_ring || !s_ring_hi)
                     break;                    /* the ring's own wrap */
+                if (target >= XBOX_CONTIG_BASE + 0x04000000u || ++followed > 256)
+                    break;                    /* not memory, or runaway */
                 outside = 1;
                 s_tot_followed++;
                 va = target;
@@ -215,15 +237,18 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             }
             if (in_ring)
                 outside = 0;                  /* back into the ring */
+            else if (target >= XBOX_CONTIG_BASE + 0x04000000u || ++followed > 256)
+                break;
             va = target;
             continue;
         }
         if ((w & 3u) == 2u) {                 /* call */
-            if (!in_call) {
+            uint32_t target = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+            if (!in_call && target < XBOX_CONTIG_BASE + 0x04000000u && ++followed <= 256) {
                 in_call = 1;
                 call_ret = va;
                 s_tot_followed++;
-                va = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+                va = target;
             }
             continue;
         }
