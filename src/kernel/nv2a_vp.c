@@ -24,6 +24,8 @@
 #include "nv2a_vp.h"
 
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum { MUX_R = 1, MUX_V = 2, MUX_C = 3 };
@@ -165,13 +167,22 @@ static void write_masked(float dst[4], const float v[4], uint32_t mask)
     if (mask & 1u) dst[3] = v[3];
 }
 
+/* A product the way the vertex engine forms it: 0 times anything, infinity
+ * and NaN included, is 0 (NV_vertex_program). Lighting programs lean on it --
+ * normalising a zero vector gives rsq(0) = inf, which the next multiply by
+ * 0 has to turn back into 0, not into a NaN that blackens the vertex. */
+static float vmul(float x, float y)
+{
+    return (x == 0.0f || y == 0.0f) ? 0.0f : x * y;
+}
+
 static void bcast(float d[4], float v)
 {
     d[0] = d[1] = d[2] = d[3] = v;
 }
 
-int nv2a_vp_run(Nv2aVpState *vp, const float in[NV2A_VP_INPUTS][4],
-                float out[NV2A_VP_OUTPUTS][4])
+static int vp_run(Nv2aVpState *vp, const float in[NV2A_VP_INPUTS][4],
+                  float out[NV2A_VP_OUTPUTS][4], int trace)
 {
     Regs g;
     uint32_t pc;
@@ -205,12 +216,12 @@ int nv2a_vp_run(Nv2aVpState *vp, const float in[NV2A_VP_INPUTS][4],
 
         switch (mac) {
         case MAC_MOV: memcpy(mres, a, sizeof mres); break;
-        case MAC_MUL: for (i = 0; i < 4; i++) mres[i] = a[i] * b[i]; break;
+        case MAC_MUL: for (i = 0; i < 4; i++) mres[i] = vmul(a[i], b[i]); break;
         case MAC_ADD: for (i = 0; i < 4; i++) mres[i] = a[i] + c[i]; break;
-        case MAC_MAD: for (i = 0; i < 4; i++) mres[i] = a[i] * b[i] + c[i]; break;
-        case MAC_DP3: bcast(mres, a[0]*b[0] + a[1]*b[1] + a[2]*b[2]); break;
-        case MAC_DPH: bcast(mres, a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + b[3]); break;
-        case MAC_DP4: bcast(mres, a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]); break;
+        case MAC_MAD: for (i = 0; i < 4; i++) mres[i] = vmul(a[i], b[i]) + c[i]; break;
+        case MAC_DP3: bcast(mres, vmul(a[0], b[0]) + vmul(a[1], b[1]) + vmul(a[2], b[2])); break;
+        case MAC_DPH: bcast(mres, vmul(a[0], b[0]) + vmul(a[1], b[1]) + vmul(a[2], b[2]) + b[3]); break;
+        case MAC_DP4: bcast(mres, vmul(a[0], b[0]) + vmul(a[1], b[1]) + vmul(a[2], b[2]) + vmul(a[3], b[3])); break;
         case MAC_DST:
             mres[0] = 1.0f; mres[1] = a[1] * b[1]; mres[2] = a[2]; mres[3] = b[3];
             break;
@@ -262,6 +273,14 @@ int nv2a_vp_run(Nv2aVpState *vp, const float in[NV2A_VP_INPUTS][4],
         default: break;
         }
 
+        if (trace)
+            fprintf(stderr, "  [VPNAN] pc %u mac %u ilu %u | a (%g %g %g %g) b (%g %g %g %g)"
+                    " c (%g %g %g %g) -> mac (%g %g %g %g) ilu (%g %g %g %g)"
+                    " r%u mask %X/%X o%s%u mask %X\n", pc, mac, ilu,
+                    a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3],
+                    c[0], c[1], c[2], c[3], mres[0], mres[1], mres[2], mres[3],
+                    ires[0], ires[1], ires[2], ires[3], out_r, mac_mask, ilu_mask,
+                    fld(w, 3, 11, 1) ? "" : "c", fld(w, 3, 3, 8), o_mask);
         /* Writes, after both units have read. */
         if (mac != MAC_NOP && mac != MAC_ARL && mac_mask) {
             if (out_r == 12)
@@ -293,4 +312,32 @@ int nv2a_vp_run(Nv2aVpState *vp, const float in[NV2A_VP_INPUTS][4],
             return n;
     }
     return 0;
+}
+
+/* RECOMP_VP_NAN=1: a vertex whose diffuse output came out NaN is run again
+ * with every slot printed -- the operands, both units' results and where they
+ * went -- for the first few such vertices. A lit model drawn black is a NaN
+ * in oD0 that the combiners multiply the texture by, and the instruction that
+ * made it is several slots before the output. */
+int nv2a_vp_run(Nv2aVpState *vp, const float in[NV2A_VP_INPUTS][4],
+                float out[NV2A_VP_OUTPUTS][4])
+{
+    static int want = -1, shown;
+    int n = vp_run(vp, in, out, 0);
+
+    if (want < 0)
+        want = getenv("RECOMP_VP_NAN") != NULL;
+    if (want && shown < 3 && n
+            && (isnan(out[NV2A_VP_OD0][0]) || isnan(out[NV2A_VP_OD0][3]))) {
+        int k;
+        shown++;
+        fprintf(stderr, "  [VPNAN] vertex #%d, start %u, inputs:\n", shown,
+                vp->program_start);
+        for (k = 0; k < NV2A_VP_INPUTS; k++)
+            fprintf(stderr, "    v%-2d (%g %g %g %g)\n", k, in[k][0], in[k][1],
+                    in[k][2], in[k][3]);
+        vp_run(vp, in, out, 1);
+        fflush(stderr);
+    }
+    return n;
 }

@@ -511,6 +511,28 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         for (i = 0; i < a->size && i < 4; i++)
             out[i] = (float)p[i] / 255.0f;
         return 1;
+    case 1:                                  /* S1: signed short, normalised */
+        for (i = 0; i < a->size && i < 4; i++) {
+            float v = (float)((const int16_t *)p)[i] / 32767.0f;
+            out[i] = v < -1.0f ? -1.0f : v;
+        }
+        return 1;
+    case 5:                                  /* S32K: signed short, as is */
+        for (i = 0; i < a->size && i < 4; i++)
+            out[i] = (float)((const int16_t *)p)[i];
+        return 1;
+    case 6: {                                /* CMP: packed 11:11:10 normal */
+        /* Xbox D3D's NORMPACKED3, the usual way a title stores normals. It
+         * read as absent -- 0,0,0 -- so every lit vertex program normalised
+         * a zero vector, took rsq(0) = inf, and multiplied it by zero: NaN
+         * diffuse, and the combiners drew every lit model black. */
+        uint32_t v;
+        memcpy(&v, p, 4);
+        out[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f;
+        out[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
+        out[2] = (float)((int32_t)v >> 22) / 511.0f;
+        return 1;
+    }
     default:
         return 0;
     }
