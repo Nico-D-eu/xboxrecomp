@@ -1383,7 +1383,19 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
         return EXCEPTION_CONTINUE_SEARCH;
 
     if (code == EXCEPTION_SINGLE_STEP && s_watch_stepping) {
+        const uint32_t *wp = (const uint32_t *)((const uint8_t *)g_memory_offset
+                                                + g_watch_va);
         s_watch_stepping = 0;
+        /* A writer with no guest stack is the runtime itself -- a device
+         * model, the pushbuffer executor, file I/O -- and the guest call
+         * chain says nothing about it. Its host address does: offset into
+         * the exe, for the PDB. */
+        if (g_esp == 0 && *wp != g_watch_last) {
+            fprintf(stderr, "[WATCH] host writer: tid %lu rip exe+0x%llX\n",
+                    GetCurrentThreadId(),
+                    (unsigned long long)(ep->ContextRecord->Rip
+                        - (uintptr_t)GetModuleHandleW(NULL)));
+        }
         watch_report();
         VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old);
         ep->ContextRecord->EFlags &= ~0x100u;
@@ -2967,12 +2979,27 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * never got. So blocks are tracked: a free marks the block, neighbours
  * coalesce, a free block at the top rewinds the bump pointer, and allocation
  * takes the first free block that fits (splitting it) before bumping. */
-static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+/* The bottom of physical memory is not the allocator's to give away.
+ *
+ * On the console the kernel owns the low pages -- its image loads at physical
+ * 0x10000 -- and MmAllocateContiguousMemory never returns them. Titles know
+ * that and use it: XAPI's USB stack has a small private pool that carves its
+ * device extensions top-down out of physical page 0 (0x80001000 minus what it
+ * has used, sub_0033195B in Amped 2), with no allocation at all. This arena
+ * started at physical 0, so a title's first big pool began on top of that
+ * page. Amped 2's first contiguous request is a 14 MB pool; the first render
+ * target it carves from it, drawn during the level load, overwrote the USB
+ * driver's DPC, URBs and device record -- and the controller's DPC then
+ * called a routine pointer that was two UTF-16 spaces. */
+#define XBOX_CONTIG_RESERVED_LOW 0x10000u
+
+static uint32_t g_contig_next = XBOX_CONTIG_BASE + XBOX_CONTIG_RESERVED_LOW;
 /* Highest address ever handed out. xbox_ContiguousAllocatedBytes reports this
  * rather than g_contig_next: its caller asks whether a physical address can be
  * contiguous memory at all, and a rewind must not make that answer shrink
- * under a surface the GPU state still names. */
-static uint32_t g_contig_high = XBOX_CONTIG_BASE;
+ * under a surface the GPU state still names. It starts above the reserved
+ * pages, which are physical memory too. */
+static uint32_t g_contig_high = XBOX_CONTIG_BASE + XBOX_CONTIG_RESERVED_LOW;
 
 #define XBOX_MAX_CONTIG_BLOCKS 4096
 /* Every block below g_contig_next, in address order, allocated or free. An
@@ -3005,7 +3032,45 @@ static void contig_remove(int at)
     g_contig_block_count--;
 }
 
+/* One lock around the table.
+ *
+ * Titles allocate and free contiguous memory from several threads at once:
+ * Amped 2's level load runs six loader threads that create and release
+ * textures and vertex buffers while the main thread does the same. With a
+ * bump pointer that was a narrow race; with a table edited by memmove it is a
+ * wide one. Two threads splitting or coalescing at the same time leave
+ * entries that overlap, a later allocation is handed memory another block
+ * still owns, and the damage surfaces far away. Here it was the USB host
+ * controller's endpoints and the gamepad's device record, overwritten by
+ * level data: the controller's DPC called a completion pointer into the
+ * middle of the title, and XInputGetState read through garbage. A spinlock,
+ * because the holder never blocks and the critical sections are short. */
+static volatile LONG g_contig_lock;
+
+static void contig_lock(void)
+{
+    while (InterlockedCompareExchange(&g_contig_lock, 1, 0) != 0)
+        Sleep(0);
+}
+
+static void contig_unlock(void)
+{
+    InterlockedExchange(&g_contig_lock, 0);
+}
+
+static uint32_t contig_alloc_locked(uint32_t size, uint32_t alignment);
+
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+
+    contig_lock();
+    r = contig_alloc_locked(size, alignment);
+    contig_unlock();
+    return r;
+}
+
+static uint32_t contig_alloc_locked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
     int i;
@@ -3037,6 +3102,19 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
         g_contig_blocks[i].size = size;
         g_contig_blocks[i].free = 0;
         memset((void *)((uintptr_t)a + g_memory_offset), 0, size);
+        /* Reuse at the very bottom of the window is where a driver's DMA
+         * blocks and a title's render targets can meet; name the first few,
+         * with the guest return address of whoever asked. */
+        if (a < XBOX_CONTIG_BASE + 0x10000u) {
+            static int said;
+            if (said++ < 16) {
+                uint32_t ret = g_esp ? *(const uint32_t *)((const uint8_t *)
+                                        g_memory_offset + g_esp) : 0;
+                fprintf(stderr, "  [CONTIG] reused 0x%08X (%u bytes) for a"
+                        " request from guest 0x%08X\n", a, size, ret);
+                fflush(stderr);
+            }
+        }
         return a;
     }
 
@@ -3076,7 +3154,19 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  * one of its blocks, 0 otherwise (a pinned physical allocation, GPU instance
  * memory, or not contiguous memory at all) -- the caller decides what else it
  * might be. */
+static int contig_free_locked(uint32_t va);
+
 int xbox_ContiguousFree(uint32_t va)
+{
+    int r;
+
+    contig_lock();
+    r = contig_free_locked(va);
+    contig_unlock();
+    return r;
+}
+
+static int contig_free_locked(uint32_t va)
 {
     int i;
 
@@ -3116,7 +3206,32 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
 }
 
 
+/* Locked for the same reason as the contiguous allocator below: the reuse
+ * scan checks a block is free and then claims it, and two threads doing that
+ * at once are both handed the same block. */
+static volatile LONG g_heap_lock;
+static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
+static void heap_free_locked(uint32_t xbox_va);
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+    while (InterlockedCompareExchange(&g_heap_lock, 1, 0) != 0)
+        Sleep(0);
+    r = heap_alloc_locked(size, alignment);
+    InterlockedExchange(&g_heap_lock, 0);
+    return r;
+}
+
+void xbox_HeapFree(uint32_t xbox_va)
+{
+    while (InterlockedCompareExchange(&g_heap_lock, 1, 0) != 0)
+        Sleep(0);
+    heap_free_locked(xbox_va);
+    InterlockedExchange(&g_heap_lock, 0);
+}
+
+static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -3241,7 +3356,7 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
     return 0;
 }
 
-void xbox_HeapFree(uint32_t xbox_va)
+static void heap_free_locked(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0;
 
