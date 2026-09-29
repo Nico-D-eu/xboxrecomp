@@ -238,11 +238,15 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
  *
  * Bit values are the Xbox digital button mask: 0x01/02/04/08 dpad
  * up/down/left/right, 0x10 Start, 0x20 Back, 0x40/0x80 thumb clicks.
+ * Bits 8..15 press the analog buttons fully, in report order: 0x100 A,
+ * 0x200 B, 0x400 X, 0x800 Y, 0x1000 Black, 0x2000 White, 0x4000/0x8000 the
+ * left/right triggers. A menu that confirms with A rather than Start could
+ * not be walked through before.
  *
  * This is a bring-up probe and nothing else. It is off unless the variable
  * is set, and a real pad on the host is always the better input.
  */
-static uint8_t synthetic_buttons(void)
+static unsigned synthetic_buttons(void)
 {
     static int      configured = -1;
     static unsigned mask, period_ms, hold_ms;
@@ -254,7 +258,7 @@ static uint8_t synthetic_buttons(void)
         configured = 0;
         if (spec && *spec) {
             char *end;
-            mask = (unsigned)strtoul(spec, &end, 0) & 0xFFu;
+            mask = (unsigned)strtoul(spec, &end, 0) & 0xFFFFu;
             period_ms = (*end == ',') ? (unsigned)strtoul(end + 1, &end, 0)
                                       : 2000u;
             hold_ms   = (*end == ',') ? (unsigned)strtoul(end + 1, &end, 0)
@@ -264,7 +268,7 @@ static uint8_t synthetic_buttons(void)
             if (mask) {
                 configured = 1;
                 t0 = (unsigned long)GetTickCount();
-                fprintf(stderr, "  PAD: synthesising button mask 0x%02X for "
+                fprintf(stderr, "  PAD: synthesising button mask 0x%04X for "
                         "%u ms every %u ms\n", mask, hold_ms, period_ms);
                 fflush(stderr);
             }
@@ -274,14 +278,15 @@ static uint8_t synthetic_buttons(void)
         return 0;
     now = (unsigned long)GetTickCount();
     phase = (now - t0) % period_ms;
-    return (uint8_t)((phase < hold_ms) ? mask : 0u);
+    return (phase < hold_ms) ? mask : 0u;
 }
 
 int usb_gamepad_report(uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;
-    uint8_t synth = synthetic_buttons();
+    unsigned synth_all = synthetic_buttons();
+    uint8_t synth = (uint8_t)(synth_all & 0xFFu);
     int i;
 
     if (max < 20)
@@ -328,6 +333,9 @@ int usb_gamepad_report(uint8_t *out, int max)
 
     if (xbox_InputGetState(0, &state) != 0) {
         out[2] = synth;
+        for (i = 0; i < 8; i++)
+            if (synth_all & (0x100u << i))
+                out[4 + i] = 0xFF;
         return 20;
     }
 
@@ -335,7 +343,7 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[2] = (uint8_t)((g->wButtons & 0xFF) | synth);
     out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
     for (i = 0; i < 8; i++)
-        out[4 + i] = g->bAnalogButtons[i];
+        out[4 + i] = (synth_all & (0x100u << i)) ? 0xFF : g->bAnalogButtons[i];
     out[12] = (uint8_t)(g->sThumbLX & 0xFF);
     out[13] = (uint8_t)((g->sThumbLX >> 8) & 0xFF);
     out[14] = (uint8_t)(g->sThumbLY & 0xFF);
