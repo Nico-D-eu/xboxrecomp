@@ -39,6 +39,9 @@ typedef struct {
     uint32_t program_start;    /* first slot to execute */
     uint32_t execution_mode;   /* SET_TRANSFORM_EXECUTION_MODE; bits 1:0 = 2 is program */
     uint32_t program_writes;   /* diagnostics */
+    /* Bumped whenever the program or the constants change, so a consumer
+     * that caches either (the D3D11 backend) knows when to look again. */
+    uint32_t program_gen, constants_gen;
 } Nv2aVpState;
 
 /* Method handlers. Each returns 1 if `method` was a vertex-program method. */

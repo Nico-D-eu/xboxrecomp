@@ -27,7 +27,7 @@ enum {
     R_T0 = 8, R_R0 = 12, R_R1 = 13, R_SUM = 14, R_EF = 15
 };
 
-int nv2a_comb_method(Nv2aCombiner *c, uint32_t method, uint32_t param)
+static int comb_method(Nv2aCombiner *c, uint32_t method, uint32_t param)
 {
     if (method >= 0x0260 && method < 0x0280) {             /* ALPHA_ICW */
         c->alpha_icw[(method - 0x0260) / 4] = param;
@@ -64,6 +64,14 @@ int nv2a_comb_method(Nv2aCombiner *c, uint32_t method, uint32_t param)
     case 0x1E78: c->other_stage_input = param; return 1;
     default: return 0;
     }
+}
+
+int nv2a_comb_method(Nv2aCombiner *c, uint32_t method, uint32_t param)
+{
+    if (!comb_method(c, method, param))
+        return 0;
+    c->gen++;
+    return 1;
 }
 
 uint32_t nv2a_comb_stage_mode(const Nv2aCombiner *c, int stage)

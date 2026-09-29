@@ -29,6 +29,7 @@ typedef struct {
     uint32_t other_stage_input;
     uint32_t fog_color;           /* ARGB */
     int      programmed;          /* COMBINER_CONTROL has been written */
+    uint32_t gen;                 /* bumped by every combiner method */
 } Nv2aCombiner;
 
 /* Shader stage modes (SET_SHADER_STAGE_PROGRAM, five bits per stage). */

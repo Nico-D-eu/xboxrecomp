@@ -44,6 +44,7 @@ static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
+static int s_scan_on = -1;
 
 static void note(uint32_t subch, uint32_t method)
 {
@@ -152,13 +153,10 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    {
-        static int scan_on = -1;
-        if (scan_on < 0)
-            scan_on = getenv("RECOMP_PB_SCAN") != NULL;
-        if (!(scan_on || s_exec_enabled) || end_va <= start_va)
-            return;
-    }
+    if (s_scan_on < 0)
+        s_scan_on = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!(s_scan_on || s_exec_enabled) || end_va <= start_va)
+        return;
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
@@ -181,7 +179,12 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
+                /* The survey's table is a linear search per method word --
+                 * half the executor thread's time once the GPU backend made
+                 * everything else cheap -- so only when a survey was asked
+                 * for. */
+                if (s_scan_on)
+                    note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */

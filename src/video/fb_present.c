@@ -98,6 +98,31 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     InterlockedExchange(&s_present_idx, next);
 }
 
+/* A finished frame from the D3D11 backend: 32-bit A8R8G8B8 rows, already
+ * out of the GPU, so the window, its dumps and everything downstream see the
+ * GPU's picture through the same buffers the software path fills. */
+void xbox_FramebufferWindowPresentArgb(const void *px, uint32_t w, uint32_t h,
+                                       uint32_t row_pitch)
+{
+    LONG next;
+    uint32_t y, cw, ch;
+
+    if (!s_fb_running || !px)
+        return;
+    next = (s_present_idx == 0) ? 1 : 0;
+    if (!s_present[next]) {
+        s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+        if (!s_present[next])
+            return;
+    }
+    cw = w < s_fb_width ? w : s_fb_width;
+    ch = h < s_fb_height ? h : s_fb_height;
+    for (y = 0; y < ch; y++)
+        memcpy(s_present[next] + (size_t)y * s_fb_width,
+               (const uint8_t *)px + (size_t)y * row_pitch, (size_t)cw * 4);
+    InterlockedExchange(&s_present_idx, next);
+}
+
 /* Which keys are down, for the pad stand-in in src/input.
  *
  * GetAsyncKeyState looked like the cheaper way to ask and does not work
@@ -242,6 +267,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     RECT r;
 
     (void)unused;
+    {
+        extern void xbox_PinHostThread(void);
+        xbox_PinHostThread();           /* not the guest's CPU */
+    }
 
     {
         WNDCLASSA wc;
@@ -357,5 +386,8 @@ void xbox_FramebufferWindowStart(void)
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
+void xbox_FramebufferWindowPresentArgb(const void *px, uint32_t w, uint32_t h,
+                                       uint32_t row_pitch)
+{ (void)px; (void)w; (void)h; (void)row_pitch; }
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 #endif

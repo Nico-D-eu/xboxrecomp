@@ -74,6 +74,7 @@ int nv2a_vp_method(Nv2aVpState *vp, uint32_t method, uint32_t param)
         if (word == 3)
             vp->program_load++;
         vp->program_writes++;
+        vp->program_gen++;
         return 1;
     }
     if (method >= NV097_SET_TRANSFORM_CONSTANT
@@ -83,14 +84,17 @@ int nv2a_vp_method(Nv2aVpState *vp, uint32_t method, uint32_t param)
             vp->constants[vp->constant_load][comp] = u2f(param);
         if (comp == 3)
             vp->constant_load++;
+        vp->constants_gen++;
         return 1;
     }
     if (method >= NV097_SET_VIEWPORT_OFFSET && method < NV097_SET_VIEWPORT_OFFSET + 16) {
         vp->constants[XFCTX_VPOFF][(method - NV097_SET_VIEWPORT_OFFSET) / 4] = u2f(param);
+        vp->constants_gen++;
         return 0;   /* also leave it visible as a method to the executor's report */
     }
     if (method >= NV097_SET_VIEWPORT_SCALE && method < NV097_SET_VIEWPORT_SCALE + 16) {
         vp->constants[XFCTX_VPSCL][(method - NV097_SET_VIEWPORT_SCALE) / 4] = u2f(param);
+        vp->constants_gen++;
         return 0;
     }
     switch (method) {
@@ -104,6 +108,7 @@ int nv2a_vp_method(Nv2aVpState *vp, uint32_t method, uint32_t param)
         return 1;
     case NV097_SET_TRANSFORM_PROGRAM_START:
         vp->program_start = param;
+        vp->program_gen++;
         return 1;
     case NV097_SET_TRANSFORM_CONSTANT_LOAD:
         vp->constant_load = param;
