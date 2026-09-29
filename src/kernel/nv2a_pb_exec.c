@@ -2490,6 +2490,30 @@ static void raster_batch(void)
                         fprintf(stderr, "  [VPBAD]   c[%3u] = (%g %g %g %g)\n", k,
                                 s_vp.constants[k][0], s_vp.constants[k][1],
                                 s_vp.constants[k][2], s_vp.constants[k][3]);
+                    /* Where the palette came from: guest RAM holding the
+                     * bits of the bone row this vertex reads, a0+1 (the
+                     * pushbuffer's copy included). */
+                    {
+                        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+                        float probe[4][4];
+                        uint32_t a0 = (uint32_t)floorf(in0[3][0] * s_vp.constants[168][0]);
+                        static const uint32_t ranges[2][2] = {
+                            { 0x00010000u, 0x04000000u },
+                            { XBOX_CONTIG_BASE, XBOX_CONTIG_BASE + 0x04000000u } };
+                        int r, hits = 0;
+                        if (a0 + 1 < NV2A_VP_CONSTANTS) {
+                            memcpy(probe[0], s_vp.constants[a0 + 1], 16);
+                            fprintf(stderr, "  [VPBAD]   searching for c[%u] bits\n", a0 + 1);
+                            for (r = 0; r < 2 && hits < 16; r++) {
+                                uint32_t va;
+                                for (va = ranges[r][0]; va + 16 <= ranges[r][1] && hits < 16; va += 4)
+                                    if (!memcmp(mem + va, probe[0], 16)) {
+                                        hits++;
+                                        fprintf(stderr, "  [VPBAD]   row found at 0x%08X\n", va);
+                                    }
+                            }
+                        }
+                    }
                 }
                 for (a = 0; a < NV_VERTEX_ATTRS; a++)
                     if (s_gpu.attr[a].size)

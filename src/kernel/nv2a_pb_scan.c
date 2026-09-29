@@ -25,6 +25,7 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include "kernel.h"   /* XBOX_CONTIG_BASE */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -45,6 +46,15 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 static int s_scan_on = -1;
+/* The pushbuffer ring's bounds, as the caller has learned them from PUT, and
+ * how many jumps and calls out of it were followed. */
+static uint32_t s_ring_lo, s_ring_hi, s_tot_followed;
+
+void nv2a_pb_scan_set_ring(uint32_t lo_va, uint32_t hi_va)
+{
+    s_ring_lo = lo_va;
+    s_ring_hi = hi_va;
+}
 
 static void note(uint32_t subch, uint32_t method)
 {
@@ -132,6 +142,14 @@ void nv2a_pb_scan_report(void)
 
     if (s_exec_enabled > 0)
         nv2a_pb_exec_report();
+    if (s_tot_followed) {
+        static uint32_t said;
+        if (s_tot_followed != said) {
+            said = s_tot_followed;
+            fprintf(stderr, "[PB] %u jumps/calls out of the ring followed\n",
+                    s_tot_followed);
+        }
+    }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
     fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised"
@@ -160,24 +178,69 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
-    while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+    /* Jumps and calls. A jump inside the ring is its wrap, which the caller
+     * handles from PUT, so it ends the segment as it always did. A jump out
+     * of the ring is D3D running another pushbuffer (RunPushBuffer, a
+     * recorded buffer); that has to be followed until it jumps back, or
+     * everything in it -- draws, constant uploads -- is never executed. It
+     * was not: a rider's skinning palette, uploaded correctly by the CPU,
+     * never reached the vertex program. Calls (one level, as on NV2A) the
+     * same. */
+    int outside = 0, in_call = 0;
+    uint32_t call_ret = 0;
+
+    for (;;) {
+        uint32_t limit = (outside || in_call) ? 0xFFFFFFFFu : end_va;
+        uint32_t w;
+
+        if (va >= limit || words >= 0x100000u)
+            break;
+        w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
 
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+            uint32_t target = ((w & 3u) == 1u) ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
+            int in_ring;
+            target = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+            in_ring = s_ring_hi && target >= s_ring_lo && target <= s_ring_hi + 0x1000u;
             jumps++;
-            break;                            /* a jump ends this segment */
-        }
-        if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
+            if (!outside) {
+                if (in_ring || !s_ring_hi)
+                    break;                    /* the ring's own wrap */
+                outside = 1;
+                s_tot_followed++;
+                va = target;
+                continue;
+            }
+            if (in_ring)
+                outside = 0;                  /* back into the ring */
+            va = target;
             continue;
+        }
+        if ((w & 3u) == 2u) {                 /* call */
+            if (!in_call) {
+                in_call = 1;
+                call_ret = va;
+                s_tot_followed++;
+                va = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+            }
+            continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u) {   /* return */
+            if (in_call) {
+                in_call = 0;
+                va = call_ret;
+            }
+            continue;
+        }
         if ((w & 0x00030003u) == 0u) {
             uint32_t count  = (w >> 18) & 0x7FFu;
             uint32_t subch  = (w >> 13) & 7u;
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            for (uint32_t i = 0; i < count && va < limit; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 /* The survey's table is a linear search per method word --
                  * half the executor thread's time once the GPU backend made
