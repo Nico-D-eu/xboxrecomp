@@ -3248,6 +3248,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              * the menus held at 44. Only a stall that follows a new
              * FLIP_INCREMENT_WRITE -- a frame actually queued -- waits. */
             static uint32_t paced_flips;
+            /* With a render thread, the display keeps the pace (it shows a
+             * frame a sixtieth); the executor only holds back once two
+             * presented frames are queued ahead of it, so the title and the
+             * executor overlap the display instead of stopping for it. */
+            if (!nowait && s_gpu.flips != paced_flips
+                    && nv2a_d3d11_active() && nv2a_d3d11_frames_in_flight() >= 0) {
+                static int ahead = -1;
+                ULONGLONG t0 = GetTickCount64();
+                if (ahead < 0) {
+                    const char *e = getenv("RECOMP_GPU_FRAMES_AHEAD");
+                    ahead = (e && atoi(e) > 0) ? atoi(e) : 2;
+                }
+                paced_flips = s_gpu.flips;
+                while (nv2a_d3d11_frames_in_flight() >= ahead && GetTickCount64() - t0 < 100)
+                    Sleep(1);
+            }
             if (!nowait && !s_present_paced && s_gpu.flips != paced_flips) {
                 paced_flips = s_gpu.flips;
                 /* At least `interval` sixtieths of a second since the last

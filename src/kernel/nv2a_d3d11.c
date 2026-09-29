@@ -40,6 +40,7 @@
 #include <dxgi1_6.h>
 
 #include "nv2a_hlsl.h"
+#include "xbox_memory_layout.h"   /* xbox_PinHostThread */
 #include "../d3d/d3d8_swizzle.h"
 
 #pragma comment(lib, "d3d11.lib")
@@ -1155,6 +1156,8 @@ static int init(void)
     return 1;
 }
 
+static void queue_start(void);
+
 int nv2a_d3d11_active(void)
 {
     if (s_state < 0) {
@@ -1162,6 +1165,8 @@ int nv2a_d3d11_active(void)
         s_state = 0;
         if (e && _stricmp(e, "d3d11") == 0)
             s_state = init();
+        if (s_state > 0)
+            queue_start();
         fflush(stderr);
     }
     return s_state > 0;
@@ -1223,7 +1228,7 @@ static int bind_targets(const Nv2aHwDraw *d, uint32_t *w, uint32_t *h, RtEntry *
     return 1;
 }
 
-void nv2a_d3d11_draw(const Nv2aHwDraw *d)
+static void do_draw(const Nv2aHwDraw *d)
 {
     const uint8_t *mem = d->inline_base ? d->inline_base : guest();
     D3D11_INPUT_ELEMENT_DESC el[16];
@@ -1519,7 +1524,7 @@ void nv2a_d3d11_draw(const Nv2aHwDraw *d)
     s_st.draw_ticks += (uint64_t)(t_out.QuadPart - t_in.QuadPart);
 }
 
-void nv2a_d3d11_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color,
+static void do_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color,
                       uint32_t zclear)
 {
     uint32_t w = 0, h = 0;
@@ -1571,7 +1576,7 @@ void nv2a_d3d11_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color,
     }
 }
 
-void nv2a_d3d11_flip(uint32_t color_va)
+static void do_flip(uint32_t color_va)
 {
     RtEntry *rt = rt_find(color_va);
     uint32_t i = s_stage_next % STAGES;
@@ -1606,6 +1611,427 @@ void nv2a_d3d11_flip(uint32_t color_va)
     s_stage_full[i] = 1;
     s_stage_next++;
     ID3D11DeviceContext_Flush(s_ctx);
+}
+
+/* ── The render thread ───────────────────────────────────────────────────
+ *
+ * D3D11 submission was on the executor thread, and D3D's flush waits make
+ * the title wait for the executor: every microsecond of driver overhead was
+ * the title's too. So the executor now only snapshots a draw -- the draw
+ * description, the indices rebased to zero, and the vertex bytes it reads
+ * out of guest memory -- into a packet on a ring, and this thread does the
+ * D3D11 work from the packets. Vertex-program and combiner state travel as
+ * packets of their own, sent only when their change counters move.
+ *
+ * Every draw arrives here as an inline draw over its packet's copy of the
+ * vertices, so do_draw is unchanged. Textures are still read from guest
+ * memory when the draw is submitted, up to a ring's worth after it was
+ * recorded; D3D's own fencing keeps a title from rewriting a texture the GPU
+ * may still read, and that holds here for the same reason.
+ *
+ * RECOMP_GPU_THREAD=0 submits on the executor thread, as before. */
+
+enum { PKT_WRAP = 1, PKT_DRAW, PKT_CLEAR, PKT_FLIP, PKT_VP_PROG, PKT_VP_CONST, PKT_COMB };
+
+typedef struct {
+    uint32_t type, bytes;               /* bytes includes this header */
+} PktHdr;
+
+typedef struct {
+    PktHdr   h;
+    Nv2aHwDraw d;
+    float    cur[16][4];
+    uint32_t nidx, blob_bytes;
+    /* uint32_t idx[nidx]; then the vertex blob, 16-aligned */
+} PktDraw;
+
+typedef struct {
+    PktHdr   h;
+    Nv2aHwDraw d;
+    uint32_t flags, color, zclear;
+} PktClear;
+
+typedef struct {
+    PktHdr   h;
+    uint32_t color_va;
+} PktFlip;
+
+typedef struct {
+    PktHdr   h;
+    uint32_t program_start, program_gen, execution_mode;
+    uint32_t program[NV2A_VP_SLOTS][4];
+} PktVpProg;
+
+typedef struct {
+    PktHdr   h;
+    uint32_t constants_gen;
+    float    constants[NV2A_VP_CONSTANTS][4];
+} PktVpConst;
+
+typedef struct {
+    PktHdr   h;
+    Nv2aCombiner comb;
+} PktComb;
+
+#define RING_BYTES (64u << 20)
+static uint8_t *s_ring;
+static volatile LONG64 s_ring_head, s_ring_tail;   /* bytes ever written / read */
+static volatile LONG s_consumer_idle;
+static HANDLE s_ring_wake;
+static int s_threaded;
+/* Frames queued by the executor and presented by the render thread. */
+static volatile LONG s_flips_queued, s_flips_done;
+
+/* At most one presented frame per sixtieth of a second, on this thread's
+ * clock: the display's pace, which the executor then follows through
+ * nv2a_d3d11_frames_in_flight instead of sleeping itself. */
+static void pace_display(void)
+{
+    static LARGE_INTEGER qf;
+    static LONGLONG due;
+    static int off = -1;
+    LARGE_INTEGER now;
+
+    if (off < 0) {
+        off = getenv("RECOMP_FLIP_NOWAIT") != NULL;
+        QueryPerformanceFrequency(&qf);
+    }
+    if (off)
+        return;
+    QueryPerformanceCounter(&now);
+    while (due && now.QuadPart < due) {
+        if (due - now.QuadPart > qf.QuadPart / 500)
+            Sleep(1);
+        else
+            YieldProcessor();
+        QueryPerformanceCounter(&now);
+    }
+    /* Keep the 60 Hz schedule through a late frame; resync after a stall. */
+    due = (due && now.QuadPart - due < qf.QuadPart / 30) ? due + qf.QuadPart / 60
+                                                       : now.QuadPart + qf.QuadPart / 60;
+}
+
+int nv2a_d3d11_frames_in_flight(void)
+{
+    if (!s_threaded)
+        return -1;
+    return (int)(s_flips_queued - s_flips_done);
+}
+
+/* Render-side copies of the state the packets carry. */
+static Nv2aVpState  s_rvp;
+static Nv2aCombiner s_rcomb;
+
+static uint8_t *ring_reserve(uint32_t bytes)
+{
+    for (;;) {
+        LONG64 head = s_ring_head, tail = s_ring_tail;
+        uint32_t pos = (uint32_t)(head % RING_BYTES);
+        uint32_t need = bytes;
+
+        if (pos + bytes > RING_BYTES)
+            need += RING_BYTES - pos;        /* the wrap, then the packet */
+        if ((LONG64)RING_BYTES - (head - tail) >= (LONG64)need) {
+            if (pos + bytes > RING_BYTES) {
+                if (RING_BYTES - pos >= sizeof(PktHdr)) {
+                    PktHdr *w = (PktHdr *)(s_ring + pos);
+                    w->type = PKT_WRAP;
+                    w->bytes = RING_BYTES - pos;
+                }
+                MemoryBarrier();
+                InterlockedExchange64(&s_ring_head, head + (RING_BYTES - pos));
+                continue;
+            }
+            return s_ring + pos;
+        }
+        SetEvent(s_ring_wake);                /* full: make sure it drains */
+        SwitchToThread();
+    }
+}
+
+static void ring_commit(uint32_t bytes)
+{
+    MemoryBarrier();
+    InterlockedExchange64(&s_ring_head, s_ring_head + bytes);
+    if (s_consumer_idle)
+        SetEvent(s_ring_wake);
+}
+
+static uint32_t align16(uint32_t n)
+{
+    return (n + 15u) & ~15u;
+}
+
+static void send_state(const Nv2aHwDraw *d)
+{
+    static const Nv2aVpState *vp_owner;
+    static uint32_t prog_gen = 0xFFFFFFFFu, prog_start = 0xFFFFFFFFu, const_gen = 0xFFFFFFFFu;
+    static const Nv2aCombiner *comb_owner;
+    static uint32_t comb_gen = 0xFFFFFFFFu;
+
+    if (d->vp && (d->vp != vp_owner || d->vp->program_gen != prog_gen
+                  || d->vp->program_start != prog_start)) {
+        PktVpProg *p = (PktVpProg *)ring_reserve(align16(sizeof *p));
+        p->h.type = PKT_VP_PROG;
+        p->h.bytes = align16(sizeof *p);
+        p->program_start = d->vp->program_start;
+        p->program_gen = d->vp->program_gen;
+        p->execution_mode = d->vp->execution_mode;
+        memcpy(p->program, d->vp->program, sizeof p->program);
+        ring_commit(p->h.bytes);
+        prog_gen = d->vp->program_gen;
+        prog_start = d->vp->program_start;
+    }
+    if (d->vp && (d->vp != vp_owner || d->vp->constants_gen != const_gen)) {
+        PktVpConst *p = (PktVpConst *)ring_reserve(align16(sizeof *p));
+        p->h.type = PKT_VP_CONST;
+        p->h.bytes = align16(sizeof *p);
+        p->constants_gen = d->vp->constants_gen;
+        memcpy(p->constants, d->vp->constants, sizeof p->constants);
+        ring_commit(p->h.bytes);
+        const_gen = d->vp->constants_gen;
+    }
+    vp_owner = d->vp;
+    if (d->comb && (d->comb != comb_owner || d->comb->gen != comb_gen)) {
+        PktComb *p = (PktComb *)ring_reserve(align16(sizeof *p));
+        p->h.type = PKT_COMB;
+        p->h.bytes = align16(sizeof *p);
+        p->comb = *d->comb;
+        ring_commit(p->h.bytes);
+        comb_owner = d->comb;
+        comb_gen = d->comb->gen;
+    }
+}
+
+/* Snapshot a draw: which bytes of which streams it reads, copied, with the
+ * indices rebased so the copy starts at index 0. */
+static void queue_draw(const Nv2aHwDraw *d)
+{
+    const uint8_t *mem = d->inline_base ? d->inline_base : guest();
+    Stream st[16];
+    uint32_t stream_of[16], nstreams = 0, lo = 0xFFFFFFFFu, hi = 0, i, a, count;
+    uint32_t blob = 0, blob_off[16], span[16], src[16], total;
+    PktDraw *p;
+    uint32_t *idx;
+    uint8_t *vb;
+
+    if (d->idx_count < 3 || !tri_indices(d->prim, d->idx_count)) {
+        if (d->prim >= 1 && d->prim <= 4)
+            s_st.points_lines++;
+        return;
+    }
+    for (i = 0; i < d->idx_count; i++) {
+        if (d->idx[i] < lo) lo = d->idx[i];
+        if (d->idx[i] > hi) hi = d->idx[i];
+    }
+    count = hi - lo + 1;
+    if (count > (1u << 20)) {
+        s_st.skipped++;
+        return;
+    }
+    for (a = 0; a < 16; a++) {
+        const Nv2aHwAttr *at = &d->attr[a];
+        uint32_t bytes = 0, mode = 0, s;
+
+        stream_of[a] = 0xFFFFFFFFu;
+        if (!at->size || !at->stride || (!d->inline_base && !at->offset))
+            continue;
+        if (attr_format(at, &bytes, &mode) == DXGI_FORMAT_UNKNOWN)
+            continue;
+        if ((at->stride % 4) || (at->offset % 4)) {
+            s_st.fallback_attrs++;
+            continue;
+        }
+        for (s = 0; s < nstreams; s++)
+            if (st[s].stride == at->stride && at->offset >= st[s].base
+                    && at->offset + bytes <= st[s].base + at->stride)
+                break;
+        if (s == nstreams) {
+            if (nstreams == 16)
+                continue;
+            st[s].base = at->offset;
+            st[s].stride = at->stride;
+            st[s].end = 0;
+            nstreams++;
+        }
+        if (at->offset - st[s].base + bytes > st[s].end)
+            st[s].end = at->offset - st[s].base + bytes;
+        stream_of[a] = s;
+    }
+    for (i = 0; i < nstreams; i++) {
+        span[i] = (count - 1) * st[i].stride + st[i].end;
+        src[i] = st[i].base + lo * st[i].stride;
+        if (d->inline_base && src[i] + span[i] > d->inline_bytes)
+            span[i] = src[i] >= d->inline_bytes ? 0 : d->inline_bytes - src[i];
+        blob_off[i] = blob;
+        blob += align16(span[i] + 16);       /* the draw path reads a little past */
+    }
+    total = align16(sizeof(PktDraw) + d->idx_count * 4) + blob;
+    if (total > RING_BYTES / 4) {
+        s_st.skipped++;
+        return;
+    }
+    send_state(d);
+
+    p = (PktDraw *)ring_reserve(total);
+    p->h.type = PKT_DRAW;
+    p->h.bytes = total;
+    p->d = *d;
+    p->nidx = d->idx_count;
+    p->blob_bytes = blob;
+    if (d->cur_attr)
+        memcpy(p->cur, d->cur_attr, sizeof p->cur);
+    idx = (uint32_t *)(p + 1);
+    for (i = 0; i < d->idx_count; i++)
+        idx[i] = d->idx[i] - lo;
+    vb = (uint8_t *)p + align16(sizeof(PktDraw) + d->idx_count * 4);
+    for (i = 0; i < nstreams; i++) {
+        memcpy(vb + blob_off[i], mem + src[i], span[i]);
+        memset(vb + blob_off[i] + span[i], 0, 16);
+    }
+    /* Every attribute now lives in the blob; the rest are absent. */
+    for (a = 0; a < 16; a++) {
+        if (stream_of[a] == 0xFFFFFFFFu) {
+            p->d.attr[a].size = 0;
+            continue;
+        }
+        p->d.attr[a].offset = blob_off[stream_of[a]]
+                            + (d->attr[a].offset - st[stream_of[a]].base);
+    }
+    p->d.inline_bytes = blob;
+    ring_commit(total);
+}
+
+static DWORD WINAPI render_thread(LPVOID unused)
+{
+    (void)unused;
+    xbox_PinHostThread();
+    for (;;) {
+        LONG64 tail = s_ring_tail;
+        PktHdr *h;
+
+        if (tail == s_ring_head) {
+            InterlockedExchange(&s_consumer_idle, 1);
+            if (tail == s_ring_head)
+                WaitForSingleObject(s_ring_wake, 2);
+            InterlockedExchange(&s_consumer_idle, 0);
+            continue;
+        }
+        MemoryBarrier();
+        h = (PktHdr *)(s_ring + (uint32_t)(tail % RING_BYTES));
+        switch (h->type) {
+        case PKT_WRAP:
+            break;
+        case PKT_VP_PROG: {
+            const PktVpProg *p = (const PktVpProg *)h;
+            s_rvp.program_start = p->program_start;
+            s_rvp.program_gen = p->program_gen;
+            s_rvp.execution_mode = p->execution_mode;
+            memcpy(s_rvp.program, p->program, sizeof s_rvp.program);
+            break;
+        }
+        case PKT_VP_CONST: {
+            const PktVpConst *p = (const PktVpConst *)h;
+            s_rvp.constants_gen = p->constants_gen;
+            memcpy(s_rvp.constants, p->constants, sizeof s_rvp.constants);
+            break;
+        }
+        case PKT_COMB:
+            s_rcomb = ((const PktComb *)h)->comb;
+            break;
+        case PKT_DRAW: {
+            PktDraw *p = (PktDraw *)h;
+            p->d.idx = (const uint32_t *)(p + 1);
+            p->d.idx_count = p->nidx;
+            p->d.inline_base = (const uint8_t *)p + align16(sizeof(PktDraw) + p->nidx * 4);
+            p->d.cur_attr = (const float (*)[4])p->cur;
+            p->d.vp = &s_rvp;
+            p->d.comb = &s_rcomb;
+            do_draw(&p->d);
+            break;
+        }
+        case PKT_CLEAR: {
+            const PktClear *p = (const PktClear *)h;
+            do_clear(&p->d, p->flags, p->color, p->zclear);
+            break;
+        }
+        case PKT_FLIP:
+            pace_display();
+            do_flip(((const PktFlip *)h)->color_va);
+            InterlockedIncrement(&s_flips_done);
+            break;
+        default:
+            break;
+        }
+        MemoryBarrier();
+        InterlockedExchange64(&s_ring_tail, tail + h->bytes);
+    }
+    return 0;
+}
+
+static void queue_start(void)
+{
+    const char *e = getenv("RECOMP_GPU_THREAD");
+    HANDLE th;
+
+    if (e && *e == '0')
+        return;
+    s_ring = (uint8_t *)VirtualAlloc(NULL, RING_BYTES, MEM_COMMIT | MEM_RESERVE,
+                                     PAGE_READWRITE);
+    s_ring_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!s_ring || !s_ring_wake)
+        return;
+    th = CreateThread(NULL, 0, render_thread, NULL, 0, NULL);
+    if (!th)
+        return;
+    CloseHandle(th);
+    s_threaded = 1;
+    fprintf(stderr, "  [D3D11] submitting on a render thread (%u MB command ring)\n",
+            RING_BYTES >> 20);
+}
+
+void nv2a_d3d11_draw(const Nv2aHwDraw *d)
+{
+    if (!s_threaded) {
+        do_draw(d);
+        return;
+    }
+    queue_draw(d);
+}
+
+void nv2a_d3d11_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color,
+                      uint32_t zclear)
+{
+    PktClear *p;
+
+    if (!s_threaded) {
+        do_clear(d, flags, color, zclear);
+        return;
+    }
+    p = (PktClear *)ring_reserve(align16(sizeof *p));
+    p->h.type = PKT_CLEAR;
+    p->h.bytes = align16(sizeof *p);
+    p->d = *d;
+    p->flags = flags;
+    p->color = color;
+    p->zclear = zclear;
+    ring_commit(p->h.bytes);
+}
+
+void nv2a_d3d11_flip(uint32_t color_va)
+{
+    PktFlip *p;
+
+    if (!s_threaded) {
+        do_flip(color_va);
+        return;
+    }
+    InterlockedIncrement(&s_flips_queued);
+    p = (PktFlip *)ring_reserve(align16(sizeof *p));
+    p->h.type = PKT_FLIP;
+    p->h.bytes = align16(sizeof *p);
+    p->color_va = color_va;
+    ring_commit(p->h.bytes);
 }
 
 void nv2a_d3d11_report(void)
@@ -1652,6 +2078,7 @@ void nv2a_d3d11_draw(const Nv2aHwDraw *d) { (void)d; }
 void nv2a_d3d11_clear(const Nv2aHwDraw *d, uint32_t f, uint32_t c, uint32_t z)
 { (void)d; (void)f; (void)c; (void)z; }
 void nv2a_d3d11_flip(uint32_t va) { (void)va; }
+int  nv2a_d3d11_frames_in_flight(void) { return -1; }
 void nv2a_d3d11_report(void) {}
 
 #endif
