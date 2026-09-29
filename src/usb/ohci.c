@@ -903,6 +903,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     int      held_off_warned = 0, held_off_forced = 0;
     unsigned last_ack = 0;
 
+    /* The controller's ISR and DPC are guest code: the guest CPU, above the
+     * guest threads (see xbox_PinGuestThread in xbox_memory_layout.c). */
+    {
+        extern void xbox_PinGuestThread(void);
+        xbox_PinGuestThread();
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+
     (void)unused;
     {
         uint32_t tib = xbox_AllocThreadTib();

@@ -29,6 +29,11 @@
 extern "C" {
 #endif
 
+/* Thread placement: guest code on one CPU, emulated hardware on the rest.
+ * See xbox_memory_layout.c. */
+void xbox_PinGuestThread(void);
+void xbox_PinHostThread(void);
+
 /* ================================================================
  * Xbox memory map constants
  * ================================================================ */

@@ -949,6 +949,8 @@ static DWORD WINAPI nv2a_fast_ack_thread(LPVOID param)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+
+    xbox_PinHostThread();   /* emulated hardware: off the guest CPU */
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
@@ -1130,6 +1132,92 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
+/* ---- One guest CPU ------------------------------------------------------
+ *
+ * The console has one core, and its kernel schedules strictly by priority:
+ * while a higher-priority thread can run, a lower one does not. Every guest
+ * thread here was an ordinary host thread, free to run on its own core at
+ * the same time as all the others -- a parallelism the title was never
+ * written for.
+ *
+ * Amped 2 shows it. Its level loader, on a worker thread, re-creates the
+ * player boarder's SkeletonData heap inside the boarder object while the main
+ * thread is still tearing the front end's version of that object down; the
+ * main thread then frees the brand-new heap, and the load dies out of memory
+ * and launches d:\Boom.xbe. On one core the teardown finishes first. It
+ * never showed while the software rasteriser kept the main thread waiting on
+ * the GPU, and failed about half the time once the GPU backend let it run.
+ *
+ * So every thread that runs guest code -- the main thread, spawned guest
+ * threads, the timer thread that delivers ISRs and DPCs, the OHCI thread --
+ * shares one host CPU, where the host scheduler's priorities do what the
+ * console's did. The emulated hardware (the pushbuffer executor, the frame
+ * window) keeps the other cores, which is what lets it overlap the title as
+ * a real GPU does.
+ *
+ * RECOMP_GUEST_CPU=<n> turns it on with guest code on logical CPU n (2, the
+ * second physical core on an SMT machine, keeps the guest off most of the
+ * OS's work). Off by default: with it on -- and with Windows' wake-up boosts
+ * disabled, which the console's scheduler does not have -- Amped 2's race
+ * still lost 3 runs in 3 at disc speed, so one CPU alone does not reproduce
+ * the console's ordering. What that ordering depends on is still open. */
+static DWORD_PTR g_guest_cpu_mask, g_host_cpu_mask;
+static int g_cpu_masks_done;
+
+static void cpu_masks_init(void)
+{
+    DWORD_PTR proc = 0, sys = 0;
+    const char *e = getenv("RECOMP_GUEST_CPU");
+    int cpu = 2, n = 0, i;
+
+    if (g_cpu_masks_done)
+        return;
+    g_cpu_masks_done = 1;
+    /* Opt-in: it did not cure the race it was written for (see above), and
+     * it changes how every guest thread is scheduled. */
+    if (!e || _stricmp(e, "all") == 0)
+        return;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc)
+        return;
+    for (i = 0; i < (int)(sizeof(DWORD_PTR) * 8); i++)
+        if (proc & ((DWORD_PTR)1 << i))
+            n++;
+    if (n < 2)
+        return;                               /* nothing to separate */
+    if (e)
+        cpu = atoi(e);
+    if (cpu < 0 || !(proc & ((DWORD_PTR)1 << cpu))) {
+        /* Not available: the highest one that is. */
+        for (cpu = (int)(sizeof(DWORD_PTR) * 8) - 1; cpu >= 0; cpu--)
+            if (proc & ((DWORD_PTR)1 << cpu))
+                break;
+    }
+    g_guest_cpu_mask = (DWORD_PTR)1 << cpu;
+    g_host_cpu_mask = proc & ~g_guest_cpu_mask;
+    /* No dynamic boosts. Windows raises a thread's priority for a while when
+     * it wakes, which lets a freshly readied worker preempt the thread that
+     * readied it -- the console's scheduler does not, and the title's
+     * hand-offs are written for that. */
+    SetProcessPriorityBoost(GetCurrentProcess(), TRUE);
+    fprintf(stderr, "  [CPU] guest code on logical CPU %d; emulated hardware on the"
+            " other %d\n", cpu, n - 1);
+    fflush(stderr);
+}
+
+void xbox_PinGuestThread(void)
+{
+    cpu_masks_init();
+    if (g_guest_cpu_mask)
+        SetThreadAffinityMask(GetCurrentThread(), g_guest_cpu_mask);
+}
+
+void xbox_PinHostThread(void)
+{
+    cpu_masks_init();
+    if (g_host_cpu_mask)
+        SetThreadAffinityMask(GetCurrentThread(), g_host_cpu_mask);
+}
+
 static void xbox_Nv2aAckStart(void)
 {
     dsp_ack_init();
@@ -1189,6 +1277,10 @@ RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
  * big the block is, and how big the per-thread structure slot 0 points
  * at is. Zero total means the image had no TLS directory. */
 static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
+/* The TLS block as the loader built it, before the title ran: what a new
+ * thread starts from. g_tls_template_va is the main thread's own block, which
+ * the title has been writing to ever since. */
+static uint8_t *g_tls_pristine;
 
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
@@ -1801,6 +1893,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;
 
+    xbox_PinGuestThread();  /* the main thread runs the title */
+
     if (g_memory_base) {
         fprintf(stderr, "xbox_MemoryLayoutInit: already initialized\n");
         return FALSE;
@@ -2321,6 +2415,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
                 g_tls_template_va = FAKE_TLS_BLOCK_VA;
                 g_tls_total       = total;
+                g_tls_pristine    = (uint8_t *)malloc(total);
+                if (g_tls_pristine)
+                    memcpy(g_tls_pristine, XBOX_VA(FAKE_TLS_BLOCK_VA), total);
 
                 fprintf(stderr, "  TLS: %u-byte block at 0x%08X,"
                         " fs:[4] = 0x%08X (index will be %d)\n",
@@ -2973,7 +3070,17 @@ uint32_t xbox_AllocThreadTib(void)
     /* The TIB itself, copied so stack bounds and the fields the title filled
      * in are inherited, then the two that must not be. */
     memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), tib_size);
-    memcpy(TIB_VA(block), TIB_VA(g_tls_template_va), total);
+    /* The image's initial thread-local data, as the console's thread
+     * startup copies it -- not the creating thread's current values.
+     *
+     * Copying the main thread's live block handed every new thread the main
+     * thread's state at that moment. Amped 2 keeps a per-thread stack of
+     * "current heap" in TLS, so a loader thread spawned while the main thread
+     * had pushed a small heap allocated its level into that heap, and the
+     * load died out of memory -- only sometimes, because it depended on what
+     * the main thread was doing at the time. */
+    memcpy(TIB_VA(block), g_tls_pristine ? (const void *)g_tls_pristine
+                                         : TIB_VA(g_tls_template_va), total);
     memset(TIB_VA(thread_data), 0, g_tls_thread_size);
 
     /* Slot 0 points at this thread's own copy of the TLS data, which is the

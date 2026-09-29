@@ -26,6 +26,11 @@
  */
 
 #include "kernel.h"
+void xbox_PinGuestThread(void);
+#if defined(_WIN32)
+#include <mmsystem.h>          /* timeBeginPeriod */
+#pragma comment(lib, "winmm.lib")
+#endif
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
@@ -480,6 +485,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * for every thread, which is how two of them ended up inside _lock() each
      * holding the lock the other wanted. */
     g_is_spawned_thread = 1;
+    xbox_PinGuestThread();          /* one guest CPU: see xbox_memory_layout.c */
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
@@ -2123,21 +2129,37 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* Vblanks so far. The pushbuffer executor completes a flip on the next one,
+ * as the CRTC does, which is what paces a title that presents with interval
+ * one: without it the flip landed instantly and a fast renderer ran the
+ * title's frame loop at whatever rate it could draw. */
+volatile long g_xbox_vblank_count;
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    static LARGE_INTEGER freq, next;
+    LARGE_INTEGER now;
 
     if (enabled < 0)
         enabled = getenv("RECOMP_VBLANK") != NULL;
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
+    /* A 60 Hz schedule on the performance counter. GetTickCount's 16 ms
+     * granularity made "every 16 ms" come out as every 16 or every 31, so
+     * the frame clock ran somewhere between 32 and 60 Hz. */
+    QueryPerformanceCounter(&now);
+    if (!freq.QuadPart) {
+        QueryPerformanceFrequency(&freq);
+        next = now;
+    }
+    if (now.QuadPart < next.QuadPart)
         return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    next.QuadPart += freq.QuadPart / 60;
+    if (now.QuadPart - next.QuadPart > freq.QuadPart / 10)
+        next.QuadPart = now.QuadPart + freq.QuadPart / 60;   /* fell behind: resync */
+    InterlockedIncrement(&g_xbox_vblank_count);
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
@@ -2405,6 +2427,10 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     int slot = xbox_worker_stack_alloc();
 
     (void)unused;
+    /* ISRs and DPCs are guest code, so this shares the guest CPU -- above
+     * every guest thread, as interrupts are on the console. */
+    xbox_PinGuestThread();
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     if (slot < 0) {
         fprintf(stderr, "  [KERNEL] timer thread has no worker stack; "
                         "timer DPCs will not run\n");
@@ -2427,12 +2453,16 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    /* A millisecond timer, so the loop below -- vblank, DPCs, timers -- wakes
+     * when asked to rather than on the default 15.6 ms tick. */
+    timeBeginPeriod(1);
+
     for (;;) {
         long long now;
         int i;
         static unsigned held_off;
 
-        Sleep(10);
+        Sleep(1);
 
         /* Every routine this thread runs returns to it with the stack as it
          * was; one that does not leaves the next ISR or DPC running on a
@@ -3381,6 +3411,20 @@ static void bridge_NtReadFile(void)
     }
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+
+    /* RECOMP_DVD_SPEED=<KB/s>: take as long as a disc would -- a millisecond
+     * of seek plus the transfer at that rate. A host SSD delivers a level in
+     * a fraction of the time the title was tuned for, which moves every race
+     * between its loader and its main thread. */
+    {
+        static int kbps = -1;
+        if (kbps < 0) {
+            const char *e = getenv("RECOMP_DVD_SPEED");
+            kbps = e ? atoi(e) : 0;
+        }
+        if (kbps > 0)
+            Sleep(1 + (DWORD)((uint64_t)ios.Information * 1000u / ((uint64_t)kbps * 1024u)));
+    }
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
