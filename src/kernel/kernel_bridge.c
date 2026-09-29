@@ -2135,6 +2135,11 @@ static int kernel_raise_interrupt(uint32_t vector)
  * title's frame loop at whatever rate it could draw. */
 volatile long g_xbox_vblank_count;
 
+/* The APU's interrupt line and the hook that folds its pending events into
+ * it; src/apu sets both when it starts, so the kernel needs no APU. */
+volatile long g_xbox_apu_irq_line;
+void (*volatile g_xbox_apu_irq_poll)(void);
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
@@ -2495,6 +2500,21 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         held_off = 0;
 
         kernel_vblank_tick();  /* the GPU's frame clock */
+        /* The APU's line (vector 5): DirectSound's ISR, while it is up. The
+         * ISR acknowledges through ISTS, which lowers it. */
+        {
+            if (g_xbox_apu_irq_poll)
+                g_xbox_apu_irq_poll();
+            if (g_xbox_apu_irq_line && xbox_GetConnectedInterrupt(5)) {
+                static unsigned n;
+                int claimed = kernel_raise_interrupt(5);
+                if (n++ < 3) {
+                    fprintf(stderr, "  [APU] interrupt -> ISR %s\n",
+                            claimed < 0 ? "not callable" : claimed ? "claimed it" : "declined it");
+                    fflush(stderr);
+                }
+            }
+        }
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 

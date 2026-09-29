@@ -58,6 +58,28 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
+/* The APU's interrupt line (vector 5 on the console), for the kernel's timer
+ * thread to deliver: DirectSound's ISR learns from it that a voice has ended
+ * or a method has been trapped. It was a no-op PCI stub, so DirectSound never
+ * heard a voice finish, XACT never freed a finished cue, and Amped 2 ran its
+ * sound heap out of memory about three minutes into a level. */
+extern volatile long g_xbox_apu_irq_line;          /* kernel_bridge.c */
+extern void (*volatile g_xbox_apu_irq_poll)(void);
+
+static void update_irq(MCPXAPUState *d);
+
+/* A pending set_irq from any path (a frame, a trapped method), folded into
+ * the line. Called by the kernel's timer thread before it looks at the
+ * line, so no path has to remember to. */
+void mcpx_apu_poll_irq(void)
+{
+    MCPXAPUState *d = g_state;
+    if (d && d->set_irq) {
+        d->set_irq = false;
+        update_irq(d);
+    }
+}
+
 static void update_irq(MCPXAPUState *d)
 {
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
@@ -69,10 +91,10 @@ static void update_irq(MCPXAPUState *d)
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
         /* In standalone mode we don't raise a PCI IRQ; the game's kernel
          * stub will poll ISTS directly or we'll signal via a flag. */
-        pci_irq_assert(PCI_DEVICE(d));
+        g_xbox_apu_irq_line = 1;
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
-        pci_irq_deassert(PCI_DEVICE(d));
+        g_xbox_apu_irq_line = 0;
     }
 }
 
@@ -461,6 +483,12 @@ static void *mcpx_apu_frame_thread(void *arg)
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
+            /* A voice event from the frame raises the line (xemu does this
+             * in its frame thread; the port had dropped it). */
+            if (d->set_irq) {
+                d->set_irq = false;
+                update_irq(d);
+            }
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
@@ -526,6 +554,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
     d->ram_ptr = ram_ptr;
+    g_xbox_apu_irq_poll = mcpx_apu_poll_irq;
 
     d->set_irq = false;
     d->exiting = false;
