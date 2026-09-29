@@ -1576,6 +1576,183 @@ static void do_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color,
     }
 }
 
+/* ── Presenting to the window ────────────────────────────────────────────
+ *
+ * A flip-model swap chain on the framebuffer window, fed by a fullscreen
+ * triangle that samples the flipped surface: the window can be resized or
+ * maximised and the image scales to fit, letterboxed to the title's 4:3,
+ * with no CPU copy. GDI stops painting the moment this claims the window.
+ * The readback path stays for dumps (RECOMP_FB_DUMP) and runs only then.
+ * RECOMP_GPU_PRESENT=gdi keeps the old path. */
+extern HWND xbox_FramebufferWindowHwnd(void);
+extern void xbox_FramebufferWindowClaim(void);
+
+static IDXGISwapChain1 *s_swap;
+static ID3D11RenderTargetView *s_bb_rtv;
+static UINT s_bb_w, s_bb_h;
+static ID3D11VertexShader *s_blit_vs;
+static ID3D11PixelShader *s_blit_ps;
+static ID3D11SamplerState *s_blit_smp;
+static ID3D11Buffer *s_blit_cb;
+static int s_present_mode = -1;          /* 0 gdi, 1 swap chain */
+
+static const char s_blit_hlsl[] =
+    "cbuffer B : register(b0) { float4 uvscale; };\n"
+    "Texture2D tx : register(t0); SamplerState sm : register(s0);\n"
+    "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "V vs(uint id : SV_VertexID) {\n"
+    "  V o; float2 t = float2((id << 1) & 2, id & 2);\n"
+    "  o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+    "  o.uv = t * uvscale.xy; return o;\n"
+    "}\n"
+    "float4 ps(V i) : SV_Target { return float4(tx.Sample(sm, i.uv).rgb, 1); }\n";
+
+static int present_init(HWND hwnd)
+{
+    IDXGIDevice *dxgi = NULL;
+    IDXGIAdapter *ad = NULL;
+    IDXGIFactory2 *f2 = NULL;
+    DXGI_SWAP_CHAIN_DESC1 sd;
+    ID3DBlob *vb = NULL, *pb = NULL, *err = NULL;
+    D3D11_SAMPLER_DESC smp;
+    HRESULT hr;
+
+    if (FAILED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&dxgi)))
+        return 0;
+    IDXGIDevice_GetAdapter(dxgi, &ad);
+    IDXGIDevice_Release(dxgi);
+    if (!ad)
+        return 0;
+    IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory2, (void **)&f2);
+    IDXGIAdapter_Release(ad);
+    if (!f2)
+        return 0;
+    memset(&sd, 0, sizeof sd);
+    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    hr = IDXGIFactory2_CreateSwapChainForHwnd(f2, (IUnknown *)s_dev, hwnd, &sd,
+                                               NULL, NULL, &s_swap);
+    if (SUCCEEDED(hr))
+        IDXGIFactory2_MakeWindowAssociation(f2, hwnd, DXGI_MWA_NO_ALT_ENTER);
+    IDXGIFactory2_Release(f2);
+    if (FAILED(hr)) {
+        fprintf(stderr, "  [D3D11] swap chain failed (0x%08lX); presenting through GDI\n",
+                (unsigned long)hr);
+        return 0;
+    }
+    if (FAILED(D3DCompile(s_blit_hlsl, sizeof s_blit_hlsl - 1, NULL, NULL, NULL,
+                          "vs", "vs_5_0", 0, 0, &vb, &err))
+            || FAILED(D3DCompile(s_blit_hlsl, sizeof s_blit_hlsl - 1, NULL, NULL, NULL,
+                                 "ps", "ps_5_0", 0, 0, &pb, &err))) {
+        fprintf(stderr, "  [D3D11] blit shader: %s\n",
+                err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+        return 0;
+    }
+    ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vb),
+                                    ID3D10Blob_GetBufferSize(vb), NULL, &s_blit_vs);
+    ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(pb),
+                                   ID3D10Blob_GetBufferSize(pb), NULL, &s_blit_ps);
+    ID3D10Blob_Release(vb);
+    ID3D10Blob_Release(pb);
+    memset(&smp, 0, sizeof smp);
+    smp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    smp.MaxLOD = D3D11_FLOAT32_MAX;
+    ID3D11Device_CreateSamplerState(s_dev, &smp, &s_blit_smp);
+    s_blit_cb = make_buffer(16, D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DYNAMIC, NULL);
+    xbox_FramebufferWindowClaim();
+    fprintf(stderr, "  [D3D11] presenting through a swap chain on the window\n");
+    return 1;
+}
+
+/* Returns 1 if the frame went to the window. */
+static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
+{
+    HWND hwnd;
+    RECT cr;
+    UINT cw, ch;
+    D3D11_VIEWPORT vp;
+    D3D11_MAPPED_SUBRESOURCE m;
+    float scale;
+
+    if (s_present_mode < 0) {
+        const char *e = getenv("RECOMP_GPU_PRESENT");
+        s_present_mode = !(e && _stricmp(e, "gdi") == 0);
+    }
+    if (!s_present_mode)
+        return 0;
+    hwnd = xbox_FramebufferWindowHwnd();
+    if (!hwnd)
+        return 0;
+    if (!s_swap && !present_init(hwnd)) {
+        s_present_mode = 0;
+        return 0;
+    }
+    GetClientRect(hwnd, &cr);
+    cw = (UINT)(cr.right - cr.left);
+    ch = (UINT)(cr.bottom - cr.top);
+    if (!cw || !ch)
+        return 1;                              /* minimised */
+    if (!s_bb_rtv || cw != s_bb_w || ch != s_bb_h) {
+        ID3D11Texture2D *bb = NULL;
+        if (s_bb_rtv) {
+            ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+            ID3D11RenderTargetView_Release(s_bb_rtv);
+            s_bb_rtv = NULL;
+        }
+        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_swap, 0, cw, ch, DXGI_FORMAT_UNKNOWN, 0)))
+            return 0;
+        IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&bb);
+        if (!bb)
+            return 0;
+        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &s_bb_rtv);
+        ID3D11Texture2D_Release(bb);
+        s_bb_w = cw;
+        s_bb_h = ch;
+    }
+    {
+        const float black[4] = { 0, 0, 0, 1 };
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_bb_rtv, black);
+    }
+    /* Letterbox the title's picture into the window. */
+    scale = (float)cw / (float)w < (float)ch / (float)h ? (float)cw / (float)w
+                                                       : (float)ch / (float)h;
+    vp.Width = (float)w * scale;
+    vp.Height = (float)h * scale;
+    vp.TopLeftX = ((float)cw - vp.Width) * 0.5f;
+    vp.TopLeftY = ((float)ch - vp.Height) * 0.5f;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float uv[4] = { (float)w / (float)rt->w, (float)h / (float)rt->h, 0, 0 };
+        memcpy(m.pData, uv, sizeof uv);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
+    }
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_bb_rtv, NULL);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_RSSetState(s_ctx, NULL);
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    {
+        ID3D11ShaderResourceView *none = NULL;
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    }
+    IDXGISwapChain1_Present(s_swap, 0, 0);
+    return 1;
+}
+
 static void do_flip(uint32_t color_va)
 {
     RtEntry *rt = rt_find(color_va);
@@ -1584,6 +1761,14 @@ static void do_flip(uint32_t color_va)
     s_frame++;
     if (!rt)
         return;
+    {
+        static int dumps = -1;
+        if (dumps < 0)
+            dumps = getenv("RECOMP_FB_DUMP") != NULL;
+        /* On the window already, and nobody wants the pixels on the CPU. */
+        if (present_frame(rt, rt->w, rt->h) && !dumps)
+            return;
+    }
     /* The oldest copy first, then reuse its staging texture for this frame.
      * Three in flight means the one being read was copied two flips ago. */
     readback_one((int)i);

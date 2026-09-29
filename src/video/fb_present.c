@@ -259,6 +259,22 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+/* The window, for a presenter that draws into it directly (the D3D11
+ * backend's swap chain). Once one claims it, GDI stops painting: the two
+ * would fight over the same client area. */
+static volatile HWND s_fb_hwnd;
+static volatile LONG s_fb_gdi_off;
+
+HWND xbox_FramebufferWindowHwnd(void)
+{
+    return s_fb_hwnd;
+}
+
+void xbox_FramebufferWindowClaim(void)
+{
+    InterlockedExchange(&s_fb_gdi_off, 1);
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -293,6 +309,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         return 0;
     }
     hdc = GetDC(hwnd);
+    s_fb_hwnd = hwnd;
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -313,7 +330,13 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_present_idx >= 0 && s_rgb) {
+        if (s_fb_gdi_off && s_present_idx >= 0 && s_rgb) {
+            /* A swap chain owns the client area; keep s_rgb current for the
+             * dumps, paint nothing. */
+            LONG idx = s_present_idx;
+            if (s_present[idx])
+                memcpy(s_rgb, s_present[idx], (size_t)s_fb_width * s_fb_height * 4);
+        } else if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
