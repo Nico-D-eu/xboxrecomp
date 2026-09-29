@@ -42,12 +42,12 @@ def _merge_flag_states(states):
     if all(state == first for state in states[1:]):
         return first
     base = _MIXED_WIDTH_KIND.get(first[0], first[0])
-    if base in ("cmp", "test") and len(first[1]) == 2:
+    if (base in ("cmp", "test") and len(first[1]) == 2
+            and all(_MIXED_WIDTH_KIND.get(k, k) == base and len(o) == 2
+                    for k, o in states[1:])):
         width = _operand_width(first[1][0]) or _operand_width(first[1][1])
         mixed = first[0] != base
         for kind, ops in states[1:]:
-            if _MIXED_WIDTH_KIND.get(kind, kind) != base or len(ops) != 2:
-                return None
             if kind != base:
                 mixed = True
             elif (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
@@ -62,7 +62,7 @@ def _merge_flag_states(states):
         # the old refusal left it on the always-false fallback, every sound
         # failed to start, and the failed cues leaked the sound heap.
         return (_MIXED_WIDTH_MARKER[base], first[1]) if mixed else first
-    return _merge_zero_flag(states)
+    return _merge_zero_flag(states) or _merge_zero_flag_snapshot(states)
 
 
 _MIXED_WIDTH_MARKER = {"cmp": "__cmp_mixed_width", "test": "__test_mixed_width"}
@@ -98,6 +98,34 @@ def _merge_zero_flag(states):
     if len(dests) != 1:
         return None
     return ("__zf_from_dest", [states[0][1][0]])
+
+
+# Setters that leave the value ZF is taken from in _fa: the result-snapshot
+# family writes its result there, inc/dec too, and a `cmp X, 0` (which is
+# also what `test X, X` normalises to) snapshots X.
+_ZF_IN_FA = frozenset({"and", "or", "xor", "add", "sub", "adc", "sbb",
+                       "neg", "inc", "dec"})
+
+
+def _zf_in_fa(state):
+    setter, ops = state
+    if setter in _ZF_IN_FA or setter == "__zf_from_fa":
+        return True
+    return (setter == "cmp" and len(ops) == 2
+            and getattr(ops[1], "type", None) == "imm" and ops[1].imm == 0)
+
+
+def _merge_zero_flag_snapshot(states):
+    """A join whose predecessors took ZF from different registers.
+
+    `test edx, edx` on one edge and `and eax, 80000001h` / `inc eax` on
+    others (Amped 2 0x00066644), or `test esi, esi` against `or esi, ...`
+    (D3D 0x0031E1E0): no single register answers ZF, but every one of these
+    left the value it tested in _fa, masked to its width. Only ZF.
+    """
+    if all(state and _zf_in_fa(state) for state in states):
+        return ("__zf_from_fa", [])
+    return None
 
 
 def _incoming_flag_state(sources, known, is_entry):

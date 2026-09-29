@@ -559,6 +559,15 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc not in safe:
             return None
 
+    # A join whose predecessors all left the value ZF tests in _fa
+    # (translator._merge_zero_flag_snapshot). Only ZF.
+    if flag_setter == "__zf_from_fa":
+        if jcc in ("je", "jz"):
+            return "(_fa == 0)", desc
+        if jcc in ("jne", "jnz"):
+            return "(_fa != 0)", desc
+        return None
+
     if flag_setter == "__zf_from_dest" and flag_ops:
         dest = _fmt_operand_read(flag_ops[0])
         if jcc in ("je", "jz"):
@@ -851,6 +860,20 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({slhs} < 0)", desc
         if jcc == "jns":
             return f"({slhs} >= 0)", desc
+        # The signed relations are the sign of the exact, untruncated result
+        # (dest -/+ src -/+ CF as signed values), which the lift leaves in
+        # _fbs as -1/0/1: SF != OF is "exact < 0", and ZF can only be set by
+        # a truncation to 0 where the exact result is 0 or the one negative
+        # extreme, which jle/jg treat the same way. 64-bit compares are
+        # `sub lo; sbb hi; js ...; jg ...` (Amped 2 0x0022D305, 0x002639C2).
+        if jcc == "jg":
+            return "(_fbs > 0)", desc
+        if jcc == "jge":
+            return "(_fbs >= 0)", desc
+        if jcc == "jl":
+            return "(_fbs < 0)", desc
+        if jcc == "jle":
+            return "(_fbs <= 0)", desc
         return None
 
     # ── and/or/xor: result-based, CF=0, OF=0 ──
@@ -2017,11 +2040,16 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         # sbb reg, reg is a common idiom: result is 0 or 0xFFFFFFFF depending on CF
         if ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-            return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0")
+            return ["_fbs = _cf ? -1 : 0; /* sbb self: exact result -CF */",
+                    _fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0")
                     + " /* sbb self (CF extend) */",
                     self._result_snapshot(ops, "sbb")]
         w = (_operand_width(ops[0]) or 4) * 8
-        return ["{ uint64_t _t = (uint64_t)(%s) - (uint64_t)(%s) - (uint64_t)_cf;"
+        sx = self._SNAP_SX.get(w // 8, "(int32_t)")
+        return ["{ int64_t _e = (int64_t)%s(%s) - (int64_t)%s(%s) - (int64_t)_cf;"
+                " _fbs = (_e > 0) - (_e < 0); /* sign of the exact result */"
+                % (sx, dst, sx, src),
+                "  uint64_t _t = (uint64_t)(%s) - (uint64_t)(%s) - (uint64_t)_cf;"
                 " _cf = (int)((_t >> %d) & 1); %s }  /* sbb */"
                 % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
                 self._result_snapshot(ops, "sbb")]
@@ -2033,7 +2061,11 @@ class Lifter:
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
         w = (_operand_width(ops[0]) or 4) * 8
-        return ["{ uint64_t _t = (uint64_t)(%s) + (uint64_t)(%s) + (uint64_t)_cf;"
+        sx = self._SNAP_SX.get(w // 8, "(int32_t)")
+        return ["{ int64_t _e = (int64_t)%s(%s) + (int64_t)%s(%s) + (int64_t)_cf;"
+                " _fbs = (_e > 0) - (_e < 0); /* sign of the exact result */"
+                % (sx, dst, sx, src),
+                "  uint64_t _t = (uint64_t)(%s) + (uint64_t)(%s) + (uint64_t)_cf;"
                 " _cf = (int)((_t >> %d) & 1); %s }  /* adc */"
                 % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
                 self._result_snapshot(ops, "adc")]

@@ -67,3 +67,35 @@ def test_join_of_16_and_32_bit_cmp_for_jne():
     code = FunctionTranslator(image, db).translate_function(BASE, db[BASE])
     assert '_flags /* jne' not in code, code
     assert 'CMP_NE(_fa, _fb)' in code, code
+
+
+def _translate(image):
+    config._install([config.Section('.text', BASE, len(image), 0, len(image), True)],
+                    entry_point=BASE, kernel_thunk_addr=BASE, origin='flag-join-test')
+    db = {BASE: {'start': hex(BASE), 'end': BASE + len(image),
+                 '_addr': BASE, 'size': len(image)}}
+    return FunctionTranslator(image, db).translate_function(BASE, db[BASE])
+
+
+def test_zero_flag_join_across_registers():
+    # D3D 0x0031E1E0: test ecx,ecx; jz alt; test esi,esi; jmp join;
+    # alt: or esi,80000000h; join: je out; xor edi,edi; out: ret
+    code = _translate(bytes.fromhex('85c97404' '85f6eb06' '81ce00000080'
+                                    '7402' '31ff' 'c3'))
+    assert '_flags /* je' not in code, code
+    assert '(_fa == 0)' in code, code
+
+
+def test_zero_flag_join_does_not_answer_sign():
+    # same shape with js at the join: SF is not merged
+    code = _translate(bytes.fromhex('85c97404' '85f6eb06' '81ce00000080'
+                                    '7802' '31ff' 'c3'))
+    assert '_flags /* js' in code, code
+
+
+def test_sbb_signed_relations_use_the_exact_result():
+    # 0x0022D2FB: sub eax,edi; sbb edx,ecx; js out; jg out; xor edi,edi; out: ret
+    code = _translate(bytes.fromhex('29f8' '19ca' '7804' '7f02' '31ff' 'c3'))
+    assert '_flags /* jg' not in code, code
+    assert '(_fbs > 0)' in code, code
+    assert '_fbs = (_e > 0) - (_e < 0)' in code, code
