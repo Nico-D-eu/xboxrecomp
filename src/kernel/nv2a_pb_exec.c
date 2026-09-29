@@ -1493,6 +1493,72 @@ static int vp_vertex(uint32_t index, float pos[2], float uv[2], uint32_t *argb)
     return 1;
 }
 
+/* Near-plane clipping for program-transformed triangles.
+ *
+ * The Xbox D3D epilogue leaves oPos.xy = clip.xy / w * scale + offset, with
+ * scale and offset in constant memory at XFCTX_VPSCL/VPOFF (c[58], c[59])
+ * and oPos.w = clip w. That inverts exactly, so clip space is recovered per
+ * vertex, the triangle is clipped against w = VP_NEAR_W (Sutherland-Hodgman,
+ * one plane), texture coordinates are interpolated linearly in clip space --
+ * which is the perspective-correct place to do it -- and the 3 or 4 vertex
+ * result is re-projected and drawn as a fan. */
+#define VP_NEAR_W 1e-3f
+
+static void clip_near_and_raster(float p[3][4], const float w[3],
+                                 float uv[3][2], uint32_t argb)
+{
+    const float *scl = s_vp.constants[0x3A], *off = s_vp.constants[0x3B];
+    float cv[3][5], out[4][5];              /* clip x, y, w, u, v */
+    int i, n = 0;
+
+    if (scl[0] == 0.0f || scl[1] == 0.0f)
+        return;                            /* no viewport: cannot invert */
+    for (i = 0; i < 3; i++) {
+        cv[i][0] = (p[i][0] - off[0]) / scl[0] * w[i];
+        cv[i][1] = (p[i][1] - off[1]) / scl[1] * w[i];
+        cv[i][2] = w[i];
+        cv[i][3] = uv[i][0];
+        cv[i][4] = uv[i][1];
+    }
+    for (i = 0; i < 3; i++) {
+        const float *a = cv[i], *b = cv[(i + 1) % 3];
+        int ain = a[2] > VP_NEAR_W, bin = b[2] > VP_NEAR_W;
+        if (ain)
+            memcpy(out[n++], a, sizeof out[0]);
+        if (ain != bin && n < 4) {
+            float t = (a[2] - VP_NEAR_W) / (a[2] - b[2]);
+            int k;
+            for (k = 0; k < 5; k++)
+                out[n][k] = a[k] + t * (b[k] - a[k]);
+            n++;
+        }
+    }
+    if (n < 3)
+        return;                            /* entirely behind the eye */
+    {
+        float sp[4][4], suv[4][2];
+        for (i = 0; i < n; i++) {
+            sp[i][0] = out[i][0] / out[i][2] * scl[0] + off[0];
+            sp[i][1] = out[i][1] / out[i][2] * scl[1] + off[1];
+            sp[i][2] = 0.0f;
+            sp[i][3] = out[i][2];
+            suv[i][0] = out[i][3];
+            suv[i][1] = out[i][4];
+        }
+        for (i = 1; i + 1 < n; i++) {
+            float tp[3][4], tuv[3][2];
+            memcpy(tp[0], sp[0], sizeof tp[0]);
+            memcpy(tp[1], sp[i], sizeof tp[0]);
+            memcpy(tp[2], sp[i + 1], sizeof tp[0]);
+            memcpy(tuv[0], suv[0], sizeof tuv[0]);
+            memcpy(tuv[1], suv[i], sizeof tuv[0]);
+            memcpy(tuv[2], suv[i + 1], sizeof tuv[0]);
+            raster_triangle(tp[0], tp[1], tp[2], argb,
+                            s_gpu.tex.valid ? (const float (*)[2])tuv : NULL);
+        }
+    }
+}
+
 static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 {
     float p[3][4], uv[3][2];
@@ -1514,12 +1580,13 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
          * such a vertex arrives mirrored through the centre of the screen,
          * and the triangle it belongs to becomes a band across the whole
          * surface -- the grey streaks over Amped 2's menus, from background
-         * layers rotating past the camera. Hardware clips these against the
-         * near plane; until that is modelled, the triangle is dropped, which
-         * loses the sliver in front of the eye rather than painting over
-         * everything. */
-        if (w[0] <= 0.0f || w[1] <= 0.0f || w[2] <= 0.0f) {
+         * layers rotating past the camera. Dropping those triangles instead
+         * left holes in a background the title relies on to cover the last
+         * frame (it clears rarely), so old screens showed through. So clip,
+         * as the hardware does: see clip_near_and_raster. */
+        if (w[0] <= VP_NEAR_W || w[1] <= VP_NEAR_W || w[2] <= VP_NEAR_W) {
             s_vp_behind_eye++;
+            clip_near_and_raster(p, w, uv, argb);
             return;
         }
         raster_triangle(p[0], p[1], p[2], argb,
