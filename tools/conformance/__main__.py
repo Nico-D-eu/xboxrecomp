@@ -60,11 +60,13 @@ _COD_ENDP = re.compile(r"^(\S+)\s+ENDP\b")
 def _find_vcvars():
     for root in (os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
                  os.environ.get("ProgramFiles", r"C:\Program Files")):
-        for ed in ("Community", "Professional", "Enterprise", "BuildTools"):
-            p = os.path.join(root, "Microsoft Visual Studio", "2022", ed,
-                             "VC", "Auxiliary", "Build", "vcvars32.bat")
-            if os.path.exists(p):
-                return p
+        # VS 2026 installs under its major version, "18", not a year.
+        for ver in ("2022", "18"):
+            for ed in ("Community", "Professional", "Enterprise", "BuildTools"):
+                p = os.path.join(root, "Microsoft Visual Studio", ver, ed,
+                                 "VC", "Auxiliary", "Build", "vcvars32.bat")
+                if os.path.exists(p):
+                    return p
     return None
 
 
