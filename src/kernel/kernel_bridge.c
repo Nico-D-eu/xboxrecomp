@@ -678,6 +678,27 @@ static void bridge_NtClose(void)
     g_eax = 0; /* STATUS_SUCCESS */
 }
 
+/* RECOMP_CONTIG_TRACE: every contiguous allocation that succeeded, every
+ * pinned one and every free, with the guest address of the caller. Who owns
+ * which part of the window is otherwise invisible, and a render target and a
+ * driver's DMA block that land on each other fault far from either. */
+static int contig_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_CONTIG_TRACE") != NULL;
+    return on;
+}
+
+static void contig_trace_line(const char *what, uint32_t size, uint32_t va)
+{
+    if (!contig_trace() || (!va && size > 0x100000u))
+        return;                  /* the sizing probe's failures are noise */
+    fprintf(stderr, "  [CONTIG] %s size=0x%X -> 0x%08X (caller 0x%08X)\n",
+            what, size, va, BRIDGE_MEM32(g_esp - 4));
+    fflush(stderr);
+}
+
 /* ── MmAllocateContiguousMemory (ordinal 165) ─────────────
  * PVOID MmAllocateContiguousMemory(ULONG NumberOfBytes)
  */
@@ -690,6 +711,7 @@ static void bridge_MmAllocateContiguousMemory(void)
      * is how a driver converts between the address it holds and the one it
      * hands the hardware. See xbox_ContiguousAlloc. */
     uint32_t xbox_va = xbox_ContiguousAlloc(size, 4096);
+    contig_trace_line("alloc", size, xbox_va);
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u → Xbox VA 0x%08X\n",
@@ -775,6 +797,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
          * backing view happened to contain shows up later as structures that
          * are "allocated" but full of garbage. */
         memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+        contig_trace_line("pinned", size, xbox_va);
 
         if (KERNEL_LOG_ON_HALF()) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
@@ -788,6 +811,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 
     if (align < 4096) align = 4096;
     xbox_va = xbox_ContiguousAlloc(size, align);
+    contig_trace_line("allocEx", size, xbox_va);
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
@@ -810,6 +834,7 @@ static void bridge_MmFreeContiguousMemory(void)
      * by allocate-then-free lost everything it probed. Anything the arena does
      * not own (and older callers that did get heap memory) still goes to the
      * heap, which ignores addresses it did not hand out. */
+    contig_trace_line("free", 0, addr);
     if (!xbox_ContiguousFree(addr))
         xbox_HeapFree(addr);
     g_eax = 0;
@@ -1867,6 +1892,8 @@ static void bridge_HalReadSMCTrayState(void)
  *
  * Returns 1 if the routine was found and called.
  */
+extern RECOMP_TLS uint32_t g_xbox_current_dpc;
+
 static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
 {
     uint32_t routine, context;
@@ -1891,14 +1918,49 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
 
+    /* RECOMP_DPC_TRACE: each distinct deferred routine once, with its
+     * context, and the guest esp it starts from -- a DPC that faults deep in
+     * title code shows none of this in the crash's stack scan, because the
+     * runtime's dummy return address is 0. */
+    {
+        static int trace = -1;
+        static uint32_t seen[64];
+        static int nseen;
+        int k, fresh = 1;
+        if (trace < 0)
+            trace = getenv("RECOMP_DPC_TRACE") != NULL;
+        if (trace) {
+            for (k = 0; k < nseen; k++)
+                if (seen[k] == routine) fresh = 0;
+            if (fresh && nseen < 64) {
+                seen[nseen++] = routine;
+                fprintf(stderr, "  [DPC] routine 0x%08X dpc 0x%08X ctx 0x%08X"
+                        " args %08X %08X esp 0x%08X\n", routine, dpc_va,
+                        context, arg1, arg2, g_esp);
+                fflush(stderr);
+            }
+        }
+    }
+
     g_esp -= 4; BRIDGE_MEM32(g_esp) = arg2;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = arg1;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    {
+        uint32_t outer = g_xbox_current_dpc;
+        g_xbox_current_dpc = routine;
+        fn();
+        g_xbox_current_dpc = outer;
+    }
     return 1;
 }
+
+/* The deferred routine this host thread is running, 0 outside one. A fault
+ * inside a DPC shows no trace of it in the guest stack scan -- the dummy
+ * return address the runtime pushes is 0 -- so the crash handler reads this
+ * instead. */
+RECOMP_TLS uint32_t g_xbox_current_dpc;
 
 /* -- KeSynchronizeExecution (ordinal 153) ------------------
  * BOOLEAN KeSynchronizeExecution(PKINTERRUPT Interrupt,
@@ -2368,8 +2430,40 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     for (;;) {
         long long now;
         int i;
+        static unsigned held_off;
 
         Sleep(10);
+
+        /* Every routine this thread runs returns to it with the stack as it
+         * was; one that does not leaves the next ISR or DPC running on a
+         * frame that is off by the difference. Say so once, with the size. */
+        if (g_esp != XBOX_WORKER_STACK_TOP(slot)) {
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "  [KERNEL] timer thread esp drifted: 0x%08X,"
+                        " expected 0x%08X\n", g_esp,
+                        (uint32_t)XBOX_WORKER_STACK_TOP(slot));
+                fflush(stderr);
+            }
+        }
+
+        /* Not while a guest thread holds DISPATCH_LEVEL.
+         *
+         * On the console, raising IRQL masks this whole path: the vblank
+         * ISR, the DPCs it queues and timer DPCs cannot run until the raising
+         * thread lowers, which is the only thing that keeps them out of the
+         * structures the thread is editing. Here they ran on this host thread
+         * in parallel with it. Amped 2's level load then faulted at random
+         * places -- a CString with a null buffer inside a D3D callback on this
+         * thread in one run, a garbage pointer in the USB class driver on the
+         * main thread in the next. The OHCI thread has had the same gate for
+         * the same reason; this is the timer thread catching up. Bounded like
+         * OHCI's, so a leaked raise delays interrupts instead of ending them. */
+        if (xbox_IrqlBlocksInterrupts() && ++held_off <= 200u)
+            continue;
+        held_off = 0;
+
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
