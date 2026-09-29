@@ -2951,6 +2951,63 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     }
     return 0;
 }
+/* Frame pacing on the title's own thread, for a title whose present call is
+ * hooked (Amped 2: D3DDevice_Swap, sub_0031C4B0). Waiting at FLIP_STALL
+ * instead holds the executor, and the title then waits on the executor's
+ * flush acknowledgements too, so every frame paid the wait twice -- about
+ * 50 fps in game where it runs 64 unpaced. Waiting before the swap leaves
+ * the executor draining while the title sleeps. The first call turns the
+ * FLIP_STALL wait off. RECOMP_FLIP_NOWAIT still disables pacing. */
+static volatile int s_present_paced;
+
+void xbox_PresentPace(void)
+{
+    static LARGE_INTEGER qf;
+    static LONGLONG last;
+    static int off = -1;
+    LARGE_INTEGER now;
+    LONGLONG due;
+
+    if (off < 0) {
+        off = getenv("RECOMP_FLIP_NOWAIT") != NULL;
+        QueryPerformanceFrequency(&qf);
+    }
+    s_present_paced = 1;
+    if (off)
+        return;
+    QueryPerformanceCounter(&now);
+    due = last + qf.QuadPart / 60;
+    while (last && now.QuadPart < due) {
+        if (due - now.QuadPart > qf.QuadPart / 500)
+            Sleep(1);
+        else
+            YieldProcessor();
+        QueryPerformanceCounter(&now);
+    }
+    /* A frame late does not bank time for the next one. */
+    last = (last && now.QuadPart - due < qf.QuadPart / 60) ? due : now.QuadPart;
+    /* One line per 600 presents: the rate, and how much of it was waiting. */
+    {
+        static unsigned n;
+        static LONGLONG t0, waited;
+        static LARGE_INTEGER before;
+        if (!t0)
+            t0 = now.QuadPart;
+        (void)before;
+        if (n >= 600) {
+            n = 0;
+            t0 = now.QuadPart;
+        }
+        if (++n == 600 && getenv("RECOMP_PACE_TRACE")) {
+            fprintf(stderr, "  [PACE] 600 presents in %.2f s (%.1f/s)\n",
+                    (double)(now.QuadPart - t0) / (double)qf.QuadPart,
+                    600.0 * (double)qf.QuadPart / (double)(now.QuadPart - t0));
+            t0 = now.QuadPart;
+            (void)waited;
+        }
+    }
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -3185,7 +3242,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 if (iv && atoi(iv) > 0)
                     interval = atoi(iv);
             }
-            if (!nowait) {
+            /* Once per presented frame. FLIP_STALL arrives several times per
+             * frame, and pacing every one of them waited out a sixtieth each
+             * time: 23 fps in game where the title manages 64 unpaced, and
+             * the menus held at 44. Only a stall that follows a new
+             * FLIP_INCREMENT_WRITE -- a frame actually queued -- waits. */
+            static uint32_t paced_flips;
+            if (!nowait && !s_present_paced && s_gpu.flips != paced_flips) {
+                paced_flips = s_gpu.flips;
                 /* At least `interval` sixtieths of a second since the last
                  * flip, measured on the clock rather than waited out to the
                  * next vblank. Nothing scans out here -- frames reach the
@@ -3209,7 +3273,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     LARGE_INTEGER now;
                     LONGLONG due = last_t.QuadPart + qf.QuadPart * interval / 60;
                     QueryPerformanceCounter(&now);
+                    extern void nv2a_pb_scan_progress(void);
+                    /* Let D3D have the space already consumed while the
+                     * flip waits, as the stalled pusher would. */
+                    nv2a_pb_scan_progress();
                     while (last_t.QuadPart && now.QuadPart < due) {
+                        nv2a_pb_scan_progress();
                         if (due - now.QuadPart > qf.QuadPart / 500)
                             Sleep(1);             /* more than 2 ms to go */
                         else

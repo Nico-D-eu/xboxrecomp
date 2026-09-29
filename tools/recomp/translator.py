@@ -2747,6 +2747,10 @@ class BatchTranslator:
         # translated chunks.
         defined = {name for _, name, _ in translations}
         defined |= set(manual_decls.values())   # hand-written, but defined
+        # A wrapped body (sub_X_gen) is called as sub_X, which the project
+        # defines -- not a missing target to stub.
+        defined |= {f"sub_{addr:08X}" for addr, name, _ in translations
+                    if name == f"sub_{addr:08X}_gen"}
         unresolved = {
             addr: name
             for addr, name in self.translator.lifter.referenced_calls.items()
@@ -2781,6 +2785,12 @@ class BatchTranslator:
         for addr, name, _ in translations:
             decl = self._make_declaration(addr, name)
             header_lines.append(f"{decl};")
+        # Wrappers the project defines around a sub_X_gen body: callers and
+        # the dispatch table use the plain name, so it needs declaring.
+        for addr, name, _ in translations:
+            if name == f"sub_{addr:08X}_gen":
+                header_lines.append(
+                    f"void sub_{addr:08X}(void);  /* project wrapper around {name} */")
 
         if manual_decls:
             header_lines.append("")
@@ -3000,6 +3010,8 @@ class BatchTranslator:
         ]
 
         for addr, name, _ in translations:
+            if name == f"sub_{addr:08X}_gen":
+                name = f"sub_{addr:08X}"          # the project's wrapper
             lines.append(f"    {{ 0x{addr:08X}u, (recomp_func_t){name} }},")
 
         addrs = [addr for addr, _, _ in translations]

@@ -1042,6 +1042,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     if (!put_lo || put < put_lo) put_lo = put;
                     if (put > put_hi) put_hi = put;
                     {
+                        extern void nv2a_pb_scan_set_regs(volatile uint32_t *, volatile uint32_t *);
+                        nv2a_pb_scan_set_regs(
+                            (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET),
+                            (volatile uint32_t *)((char *)regs + 0x100410));
+                    }
+                    {
                         extern void nv2a_pb_scan_set_ring(uint32_t, uint32_t);
                         nv2a_pb_scan_set_ring(XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
                                               XBOX_CONTIG_BASE | (put_hi & 0x0FFFFFFFu));

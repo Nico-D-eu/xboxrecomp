@@ -1386,6 +1386,13 @@ class Lifter:
         """
         if addr in self.func_db:
             name = self.func_db[addr].get("name", f"sub_{addr:08X}")
+            # A wrapped function's generated body is sub_X_gen, and the
+            # project defines sub_X around it. Callers must reach the wrapper:
+            # calling sub_X_gen directly bypassed it, so a wrapper only ever
+            # ran for indirect calls (Amped 2's out-of-memory logger never
+            # printed for its direct callers).
+            if name == f"sub_{addr:08X}_gen":
+                name = f"sub_{addr:08X}"
         elif addr in self.label_db:
             name = self.label_db[addr]
         else:

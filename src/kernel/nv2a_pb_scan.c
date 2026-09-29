@@ -51,6 +51,40 @@ static int s_scan_on = -1;
  * how many jumps and calls out of it were followed. */
 static uint32_t s_ring_lo, s_ring_hi, s_tot_followed;
 
+/* GET as the executor goes. The caller used to set GET to PUT only after a
+ * whole segment was executed, so while a big segment ran -- or the executor
+ * waited out a flip -- D3D saw no space freed, kicked and spun on the flush
+ * bit, and the title's thread stood still behind the GPU's. Hardware
+ * advances GET as it consumes; this does too, and acknowledges the flush
+ * request with it, since the flush is D3D asking "how far have you got". */
+static volatile uint32_t *s_get_reg, *s_flush_reg;
+static uint32_t s_cur_va;
+static int s_cur_in_ring;
+
+void nv2a_pb_scan_set_regs(volatile uint32_t *get, volatile uint32_t *flush)
+{
+    s_get_reg = get;
+    s_flush_reg = flush;
+}
+
+static void pb_scan_get(int ack_flush)
+{
+    if (!s_get_reg || !s_cur_in_ring || !s_cur_va)
+        return;
+    *s_get_reg = s_cur_va & 0x0FFFFFFFu;
+    if (ack_flush && s_flush_reg)
+        *s_flush_reg &= ~0x00010000u;
+}
+
+/* From the flip wait: the pusher is stalled at FLIP_STALL, everything before
+ * it is consumed, so GET moves there and a flush request is answered.
+ * Answering flushes mid-walk instead hung boot after 9 frames -- D3D reads
+ * the flush as "idle", as the old fast-ack experiment found. */
+void nv2a_pb_scan_progress(void)
+{
+    pb_scan_get(getenv("RECOMP_PB_FLUSH_IN_WAIT") != NULL);
+}
+
 void nv2a_pb_scan_set_ring(uint32_t lo_va, uint32_t hi_va)
 {
     s_ring_lo = lo_va;
@@ -210,6 +244,12 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
 
         if (va >= limit || words >= 0x100000u)
             break;
+        s_cur_in_ring = !outside && !in_call;
+        if (s_cur_in_ring) {
+            s_cur_va = va;                    /* everything before is consumed */
+            if ((words & 1023u) == 0)
+                pb_scan_get(0);
+        }
         w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
@@ -287,6 +327,7 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
         unknown++;
     }
 
+    s_cur_va = 0;
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
