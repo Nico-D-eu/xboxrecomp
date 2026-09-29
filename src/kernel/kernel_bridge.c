@@ -3428,8 +3428,17 @@ static void bridge_NtReadFile(void)
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
-     * identical from inside the title -- the first bytes settle it. */
-    {
+     * identical from inside the title -- the first bytes settle it.
+     *
+     * Opt-in (RECOMP_READ_TRACE=1). A line and an fflush per read made
+     * Amped 2's skeleton loader, which reads a node at a time, take 11 s
+     * over one front-end character -- 71% of that thread was WriteFile --
+     * and the front end then tore the character down while it was still
+     * loading, which killed the level load. */
+    static int read_trace = -1;
+    if (read_trace < 0)
+        read_trace = getenv("RECOMP_READ_TRACE") != NULL;
+    if (read_trace) {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
         /* The offset matters as much as the length. A title streaming a pack
