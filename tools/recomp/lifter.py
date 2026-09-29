@@ -519,6 +519,16 @@ def _lahf_from_flags(flag_setter, flag_ops):
             f" /* lahf <- {flag_setter} */")
 
 
+_MIXED_WIDTH_SAFE = {
+    "__cmp_mixed_width": ("cmp", frozenset({
+        "je", "jz", "jne", "jnz", "jb", "jnae", "jae", "jnb", "jbe", "jna",
+        "ja", "jl", "jge", "jle", "jg"})),
+    # TEST: only ZF. Its SF is the top bit of the AND at the operands'
+    # width, which the mixed join does not know.
+    "__test_mixed_width": ("test", frozenset({"je", "jz", "jne", "jnz"})),
+}
+
+
 def _make_condition(jcc, flag_setter, flag_ops):
     """
     Generate a C condition expression for a jcc based on what set the flags.
@@ -540,6 +550,15 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # Only ZF is answerable from it. dec does not write CF, so a jb after the
     # same join would be reading a flag one predecessor never set; returning
     # None there leaves the existing fallback in place.
+    # A join of CMPs (or TESTs) of different operand widths: see
+    # translator._merge_flag_states. The snapshots answer ZF and the
+    # unsigned/signed relations for either width; SF, OF and PF of the
+    # result depend on the width and stay unanswered.
+    if flag_setter in _MIXED_WIDTH_SAFE:
+        flag_setter, safe = _MIXED_WIDTH_SAFE[flag_setter]
+        if jcc not in safe:
+            return None
+
     if flag_setter == "__zf_from_dest" and flag_ops:
         dest = _fmt_operand_read(flag_ops[0])
         if jcc in ("je", "jz"):

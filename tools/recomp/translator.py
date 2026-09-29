@@ -41,15 +41,32 @@ def _merge_flag_states(states):
     first = states[0]
     if all(state == first for state in states[1:]):
         return first
-    if first[0] in ("cmp", "test") and len(first[1]) == 2:
+    base = _MIXED_WIDTH_KIND.get(first[0], first[0])
+    if base in ("cmp", "test") and len(first[1]) == 2:
         width = _operand_width(first[1][0]) or _operand_width(first[1][1])
+        mixed = first[0] != base
         for kind, ops in states[1:]:
-            if kind != first[0] or len(ops) != 2:
+            if _MIXED_WIDTH_KIND.get(kind, kind) != base or len(ops) != 2:
                 return None
-            if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
-                return None
-        return first
+            if kind != base:
+                mixed = True
+            elif (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
+                mixed = True
+        # Different widths: the snapshots are still comparable -- _fa/_fb are
+        # masked to each compare's own width and _fas/_fbs sign-extended from
+        # it -- so equality and the unsigned and signed relations read the
+        # same from either predecessor. What is not is anything taken from
+        # the width of the result (sign, overflow, parity); the marker lets
+        # _make_condition answer only the former. Amped 2's XACT track state
+        # machine (0x00316595) joins a 16-bit and a 32-bit cmp at one jne;
+        # the old refusal left it on the always-false fallback, every sound
+        # failed to start, and the failed cues leaked the sound heap.
+        return (_MIXED_WIDTH_MARKER[base], first[1]) if mixed else first
     return _merge_zero_flag(states)
+
+
+_MIXED_WIDTH_MARKER = {"cmp": "__cmp_mixed_width", "test": "__test_mixed_width"}
+_MIXED_WIDTH_KIND = {v: k for k, v in _MIXED_WIDTH_MARKER.items()}
 
 
 def _merge_zero_flag(states):

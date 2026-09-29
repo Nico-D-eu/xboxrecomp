@@ -33,7 +33,37 @@ def test_mixed_operations_are_not_guessed():
     b = Operand(type='reg', reg='edx')
     assert _merge_flag_states([('cmp', [a, b]), ('test', [a, b])]) is None
 
-def test_mixed_widths_are_not_guessed():
+def test_mixed_widths_merge_to_a_marker():
     wide = [Operand(type='reg', reg='eax'), Operand(type='reg', reg='edx')]
     narrow = [Operand(type='reg', reg='al'), Operand(type='reg', reg='dl')]
-    assert _merge_flag_states([('cmp', wide), ('cmp', narrow)]) is None
+    merged = _merge_flag_states([('cmp', wide), ('cmp', narrow)])
+    assert merged == ('__cmp_mixed_width', wide)
+    # and it keeps merging with further cmps of either width
+    assert _merge_flag_states([merged, ('cmp', narrow)]) == merged
+    assert _merge_flag_states([('test', wide), ('cmp', narrow)]) is None
+
+
+def test_mixed_width_marker_answers_only_width_independent_conditions():
+    from tools.recomp.lifter import _make_condition
+    ops = [Operand(type='reg', reg='eax'), Operand(type='imm', imm=7)]
+    for jcc, macro in (('jne', 'CMP_NE(_fa, _fb)'), ('jb', 'CMP_B(_fa, _fb)'),
+                       ('jle', 'CMP_LE(_fas, _fbs)')):
+        cond = _make_condition(jcc, '__cmp_mixed_width', ops)
+        assert cond and macro in cond[0], (jcc, cond)
+    for jcc in ('js', 'jns', 'jo', 'jp'):
+        assert _make_condition(jcc, '__cmp_mixed_width', ops) is None, jcc
+    assert _make_condition('jl', '__test_mixed_width', ops) is None
+
+
+def test_join_of_16_and_32_bit_cmp_for_jne():
+    # Amped 2 0x003165D9: cmp eax,7; jmp join / cmp word [esi+30h],7; join: jne
+    # test ecx,ecx; jz alt; cmp eax,7; jmp join; alt: cmp word [esi+30h],7;
+    # join: jne out; xor edi,edi; out: ret
+    image = bytes.fromhex('85c974058' '3f807eb05' '66837e3007' '7502' '31ff' 'c3')
+    config._install([config.Section('.text', BASE, len(image), 0, len(image), True)],
+                    entry_point=BASE, kernel_thunk_addr=BASE, origin='flag-join-test')
+    db = {BASE: {'start': hex(BASE), 'end': BASE + len(image),
+                 '_addr': BASE, 'size': len(image)}}
+    code = FunctionTranslator(image, db).translate_function(BASE, db[BASE])
+    assert '_flags /* jne' not in code, code
+    assert 'CMP_NE(_fa, _fb)' in code, code
