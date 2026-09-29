@@ -634,23 +634,40 @@ def _make_condition(jcc, flag_setter, flag_ops):
         )
         desc = f"{desc} ({void_a} vs {void_b})" if desc else desc
         a, b = "_fca", "_fcb"
-        # comiss uses unsigned condition codes (CF, ZF)
+        # (U)COMISS sets ZF, PF, CF: greater 0,0,0; less 0,0,1; equal
+        # 1,0,0; unordered 1,1,1. OF, SF and AF are cleared.
+        #
+        # Every flag is answerable, which matters beyond the jcc itself:
+        # `ucomiss; lahf; test ah, 44h; jp` is how MSVC asks "is this
+        # component non-zero", and lahf only lifts when all of SF, ZF, PF
+        # and CF have a condition here. Without js it fell back to a
+        # comment, AH kept whatever eax last held, and Amped 2's scene graph
+        # decided at random whether a node's position was set -- one GUI
+        # camera came out looking sideways and blanked most of the menus.
+        # jp/jnp were also hard-wired to "ordered", which is wrong for NaN.
+        unord = f"({a} != {a} || {b} != {b})"
+        zf = f"({a} == {b} || {unord})"
+        cf = f"({a} < {b} || {unord})"
         if jcc in ("ja", "jnbe"):
-            return f"({a} > {b})", desc
+            return f"(!{cf} && !{zf})", desc
         if jcc in ("jae", "jnb", "jnc"):
-            return f"({a} >= {b})", desc
+            return f"(!{cf})", desc
         if jcc in ("jb", "jnae", "jc"):
-            return f"({a} < {b})", desc
+            return cf, desc
         if jcc in ("jbe", "jna"):
-            return f"({a} <= {b})", desc
+            return f"({cf} || {zf})", desc
         if jcc in ("je", "jz"):
-            return f"({a} == {b})", desc
+            return zf, desc
         if jcc in ("jne", "jnz"):
-            return f"({a} != {b})", desc
-        if jcc == "jp":
-            return f"0 /* {jcc}: unordered/NaN */", desc
-        if jcc == "jnp":
-            return f"1 /* {jcc}: ordered */", desc
+            return f"(!{zf})", desc
+        if jcc in ("jp", "jpe"):
+            return unord, desc
+        if jcc in ("jnp", "jpo"):
+            return f"(!{unord})", desc
+        if jcc == "js":
+            return "0", desc
+        if jcc == "jns":
+            return "1", desc
         return None
 
     # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
