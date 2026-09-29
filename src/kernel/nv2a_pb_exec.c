@@ -281,7 +281,13 @@ static struct {
     uint32_t zeta_offset, depth_test, depth_func, depth_mask, zclear;
     uint32_t alpha_test, alpha_func, alpha_ref;
     uint32_t zbuf_rejects, alpha_rejects;
-} s_gpu = { .depth_func = 0x0201, .depth_mask = 1, .alpha_func = 0x0207 };
+    /* SET_COLOR_MASK, one byte per channel (A R G B), each 0 or 1. A depth-
+     * only pass -- a shadow map, a Z pre-pass -- is drawn with this at 0 and
+     * a colour offset of 0, because there is no colour target; honouring it
+     * is what keeps such a pass from painting physical page 0. */
+    uint32_t color_mask;
+} s_gpu = { .depth_func = 0x0201, .depth_mask = 1, .alpha_func = 0x0207,
+            .color_mask = 0x01010101u };
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -987,6 +993,26 @@ static int surface_begin_batch(const uint8_t *mem)
 
     if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return 0;
+    /* A surface at the very bottom of the contiguous window. Nothing a
+     * title renders to normally lives in its first 64 KB, and a driver's
+     * DMA structures often do; say which surface it was, once per offset. */
+    if (base >= XBOX_CONTIG_BASE && base < XBOX_CONTIG_BASE + 0x10000u) {
+        static uint32_t said[8];
+        static int nsaid;
+        int k, fresh = 1;
+        for (k = 0; k < nsaid; k++)
+            if (said[k] == s_gpu.color_offset) fresh = 0;
+        if (fresh && nsaid < 8) {
+            said[nsaid++] = s_gpu.color_offset;
+            fprintf(stderr, "  [GPU] batch renders to the bottom of contiguous"
+                    " memory: colour offset 0x%08X -> 0x%08X, pitch %u,"
+                    " clip %ux%u+%u+%u, format 0x%X, zeta 0x%08X, colour mask 0x%08X\n",
+                    s_gpu.color_offset, base, s_gpu.pitch, s_gpu.clip_w,
+                    s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.format,
+                    s_gpu.zeta_offset, s_gpu.color_mask);
+            fflush(stderr);
+        }
+    }
     s_surface = (uint8_t *)mem + base;
     return 1;
 }
@@ -1023,7 +1049,46 @@ static int blend_factors(uint32_t f, const float s[4], const float d[4],
     return 1;
 }
 
+static void put_pixel_unmasked(uint8_t *mem, uint32_t bpp, int x, int y,
+                               uint32_t argb);
+
+/* The colour write, through SET_COLOR_MASK. Fully masked writes nothing --
+ * the depth-only pass case -- and a partial mask keeps the masked channels of
+ * what was there. */
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
+{
+    uint32_t m = s_gpu.color_mask;
+    uint32_t keep32 = 0, keep16 = 0, old = 0;
+    uint8_t *px;
+
+    if (!(m & 0x01010101u))
+        return;
+    if ((m & 0x01010101u) == 0x01010101u) {
+        put_pixel_unmasked(mem, bpp, x, y, argb);
+        return;
+    }
+    if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w)
+            || y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
+        return;
+    px = s_surface + (size_t)y * s_gpu.pitch + (size_t)x * bpp;
+    if (!(m & 0x01000000u)) keep32 |= 0xFF000000u;
+    if (!(m & 0x00010000u)) { keep32 |= 0x00FF0000u; keep16 |= 0xF800u; }
+    if (!(m & 0x00000100u)) { keep32 |= 0x0000FF00u; keep16 |= 0x07E0u; }
+    if (!(m & 0x00000001u)) { keep32 |= 0x000000FFu; keep16 |= 0x001Fu; }
+    if (bpp == 4)
+        old = *(uint32_t *)px;
+    else if (bpp == 2)
+        old = *(uint16_t *)px;
+    put_pixel_unmasked(mem, bpp, x, y, argb);
+    if (bpp == 4)
+        *(uint32_t *)px = (*(uint32_t *)px & ~keep32) | (old & keep32);
+    else if (bpp == 2)
+        *(uint16_t *)px = (uint16_t)((*(uint16_t *)px & ~keep16)
+                                     | (old & keep16));
+}
+
+static void put_pixel_unmasked(uint8_t *mem, uint32_t bpp, int x, int y,
+                               uint32_t argb)
 {
     uint8_t *row;
 
@@ -2340,6 +2405,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case 0x0340:                           /* SET_ALPHA_REF */
         s_gpu.alpha_ref = param;
+        break;
+    case 0x0358:                           /* SET_COLOR_MASK: A R G B bytes */
+        s_gpu.color_mask = param;
         break;
     case NV097_SET_BLEND_FUNC_SFACTOR:
         s_gpu.blend_sfactor = param;
