@@ -142,12 +142,118 @@ static const uint8_t *guest(void)
 
 /* ── Shaders ─────────────────────────────────────────────────────────── */
 
+/* Compiled shaders persist in a directory (RECOMP_SHADER_CACHE, default
+ * "shader_cache"; "0" turns it off), one file per HLSL source, target and
+ * flags. D3DCompile takes 100-400 ms for the larger generated programs, on
+ * the render thread, so each new one used to be a visible hitch -- in Amped
+ * 2's ML1 a few every 10 s for minutes, since programs keep turning up as
+ * the run goes on. With the cache only the first run pays. */
+static const char *shader_cache_dir(void)
+{
+    static int init;
+    static char dir[260];
+    if (!init) {
+        const char *e = getenv("RECOMP_SHADER_CACHE");
+        init = 1;
+        if (e && strcmp(e, "0") == 0)
+            dir[0] = 0;
+        else {
+            snprintf(dir, sizeof dir, "%s", e && *e ? e : "shader_cache");
+            CreateDirectoryA(dir, NULL);
+        }
+    }
+    return dir[0] ? dir : NULL;
+}
+
+static ID3DBlob *compile_uncached(const char *src, size_t len, const char *target,
+                                  UINT flags);
+
+/* The cached bytecode for this source, or NULL. */
+static ID3DBlob *compile_cached_only(const char *src, size_t len, const char *target,
+                                     UINT flags);
+
 static ID3DBlob *compile(const char *src, size_t len, const char *target,
                          UINT flags)
 {
+    const char *dir = shader_cache_dir();
+    char path[320];
+    ID3DBlob *code = NULL;
+    FILE *f;
+
+    if (!dir)
+        return compile_uncached(src, len, target, flags);
+    if ((code = compile_cached_only(src, len, target, flags)) != NULL)
+        return code;
+    {
+        uint64_t h = hash64(src, len, 0xCBF29CE484222325ull);
+        h = hash64(target, strlen(target), h);
+        h = hash64(&flags, sizeof flags, h);
+        snprintf(path, sizeof path, "%s\\%s_%016llx.cso", dir, target,
+                 (unsigned long long)h);
+    }
+    code = compile_uncached(src, len, target, flags);
+    if (getenv("RECOMP_SHADER_CACHE_SRC")) {        /* the HLSL beside it */
+        char hp[330];
+        snprintf(hp, sizeof hp, "%s.hlsl", path);
+        if ((f = fopen(hp, "wb")) != NULL) {
+            fwrite(src, 1, len, f);
+            fclose(f);
+        }
+    }
+    if (code && (f = fopen(path, "wb")) != NULL) {
+        fwrite(ID3D10Blob_GetBufferPointer(code), 1, ID3D10Blob_GetBufferSize(code), f);
+        fclose(f);
+    }
+    return code;
+}
+
+static ID3DBlob *compile_cached_only(const char *src, size_t len, const char *target,
+                                     UINT flags)
+{
+    const char *dir = shader_cache_dir();
+    char path[320];
+    ID3DBlob *code = NULL;
+    FILE *f;
+    uint64_t h;
+    long n;
+
+    if (!dir)
+        return NULL;
+    h = hash64(src, len, 0xCBF29CE484222325ull);
+    h = hash64(target, strlen(target), h);
+    h = hash64(&flags, sizeof flags, h);
+    snprintf(path, sizeof path, "%s\\%s_%016llx.cso", dir, target,
+             (unsigned long long)h);
+    if (!(f = fopen(path, "rb")))
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n > 0 && SUCCEEDED(D3DCreateBlob((SIZE_T)n, &code))
+            && fread(ID3D10Blob_GetBufferPointer(code), 1, (size_t)n, f) == (size_t)n) {
+        fclose(f);
+        return code;
+    }
+    if (code)
+        ID3D10Blob_Release(code);
+    fclose(f);
+    return NULL;
+}
+
+static ID3DBlob *compile_uncached(const char *src, size_t len, const char *target,
+                                  UINT flags)
+{
     ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(src, len, NULL, NULL, NULL, "main", target,
-                            flags, 0, &code, &err);
+    LARGE_INTEGER ta, tb, tf;
+    HRESULT hr;
+    QueryPerformanceCounter(&ta);
+    hr = D3DCompile(src, len, NULL, NULL, NULL, "main", target,
+                    flags, 0, &code, &err);
+    QueryPerformanceCounter(&tb);
+    QueryPerformanceFrequency(&tf);
+    if (getenv("RECOMP_PACE_TRACE") && (tb.QuadPart - ta.QuadPart) * 50 > tf.QuadPart)
+        fprintf(stderr, "  [D3D11] D3DCompile %s took %.0f ms\n", target,
+                (double)(tb.QuadPart - ta.QuadPart) * 1000.0 / tf.QuadPart);
 
     if (FAILED(hr)) {
         static int dumped;
@@ -219,6 +325,114 @@ static uint64_t vp_hash(const Nv2aVpState *vp)
     return h;
 }
 
+/* Asynchronous shader creation (RECOMP_GPU_ASYNC_SHADERS=0 turns it off).
+ *
+ * A program never seen before -- not even in the disk cache -- compiles on a
+ * worker thread, and the draws that need it are skipped until it is ready,
+ * usually a frame or two. D3DCompile takes 100-300 ms for the larger
+ * generated vertex programs, and Amped 2 meets new ones for minutes into a
+ * level, so compiling on the render thread was a visible hitch each time.
+ * The device is free-threaded for creation. The slot the result lands in is
+ * never moved or reused (the caches only ever add), so the worker publishes
+ * into it with one interlocked store; SHADER_PENDING marks it in flight. */
+#define SHADER_FAILED  ((void *)(uintptr_t)1)
+#define SHADER_PENDING ((void *)(uintptr_t)2)
+
+typedef struct ShaderJob {
+    struct ShaderJob *next;
+    void **slot;
+    int pixel;
+    size_t len;
+    char src[1];
+} ShaderJob;
+
+static CRITICAL_SECTION s_job_lock;
+static HANDLE s_job_event;
+static ShaderJob *s_job_head, *s_job_tail;
+static int s_async = -1;
+
+static DWORD WINAPI shader_worker(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        ShaderJob *j;
+
+        WaitForSingleObject(s_job_event, INFINITE);
+        for (;;) {
+            ID3DBlob *code;
+            void *obj = NULL;
+
+            EnterCriticalSection(&s_job_lock);
+            j = s_job_head;
+            if (j && !(s_job_head = j->next))
+                s_job_tail = NULL;
+            LeaveCriticalSection(&s_job_lock);
+            if (!j)
+                break;
+            code = compile(j->src, j->len, j->pixel ? "ps_5_0" : "vs_5_0",
+                           j->pixel ? 0 : D3DCOMPILE_IEEE_STRICTNESS);
+            if (code) {
+                HRESULT hr = j->pixel
+                    ? ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                          ID3D10Blob_GetBufferSize(code), NULL, (ID3D11PixelShader **)&obj)
+                    : ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                          ID3D10Blob_GetBufferSize(code), NULL, (ID3D11VertexShader **)&obj);
+                if (FAILED(hr))
+                    obj = NULL;
+                else if (j->pixel)
+                    s_st.ps_compiled++;
+                else
+                    s_st.vs_compiled++;
+                ID3D10Blob_Release(code);
+            }
+            InterlockedExchangePointer(j->slot, obj ? obj : SHADER_FAILED);
+            free(j);
+        }
+    }
+    return 0;
+}
+
+/* Queue src for the worker. 0 when asynchronous creation is off or the worker
+ * could not start: the caller then compiles in place. */
+static int shader_queue(void **slot, int pixel, const char *src, size_t len)
+{
+    ShaderJob *j;
+
+    if (s_async < 0) {
+        const char *e = getenv("RECOMP_GPU_ASYNC_SHADERS");
+        s_async = !(e && *e == '0');
+        if (s_async) {
+            HANDLE th;
+            InitializeCriticalSection(&s_job_lock);
+            s_job_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+            th = s_job_event ? CreateThread(NULL, 0, shader_worker, NULL, 0, NULL) : NULL;
+            if (th) {
+                SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL);
+                CloseHandle(th);
+            } else {
+                s_async = 0;
+            }
+        }
+    }
+    if (!s_async || !slot || !(j = (ShaderJob *)malloc(sizeof *j + len)))
+        return 0;
+    j->next = NULL;
+    j->slot = slot;
+    j->pixel = pixel;
+    j->len = len;
+    memcpy(j->src, src, len);
+    *slot = SHADER_PENDING;
+    EnterCriticalSection(&s_job_lock);
+    if (s_job_tail)
+        s_job_tail->next = j;
+    else
+        s_job_head = j;
+    s_job_tail = j;
+    LeaveCriticalSection(&s_job_lock);
+    SetEvent(s_job_event);
+    return 1;
+}
+
 static ID3D11VertexShader *vs_for(const Nv2aVpState *vp)
 {
     static const Nv2aVpState *last_vp;
@@ -242,11 +456,26 @@ static ID3D11VertexShader *vs_for(const Nv2aVpState *vp)
         len = nv2a_hlsl_vs(vp, s_src, sizeof s_src, &writes_consts);
         if (writes_consts)
             s_st.vs_const_writes++;
-        code = len ? compile(s_src, len, "vs_5_0", D3DCOMPILE_IEEE_STRICTNESS) : NULL;
+        code = len ? compile_cached_only(s_src, len, "vs_5_0", D3DCOMPILE_IEEE_STRICTNESS) : NULL;
+        if (!code && len && shader_queue(slot, 0, s_src, len)) {
+            last_vp = NULL;                 /* ask again next draw */
+            return NULL;
+        }
+        if (!code && len)
+            code = compile(s_src, len, "vs_5_0", D3DCOMPILE_IEEE_STRICTNESS);
         if (code) {
-            if (SUCCEEDED(ID3D11Device_CreateVertexShader(s_dev,
+            LARGE_INTEGER a, b, f;
+            HRESULT hr;
+            QueryPerformanceCounter(&a);
+            hr = ID3D11Device_CreateVertexShader(s_dev,
                     ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code),
-                    NULL, &vs))) {
+                    NULL, &vs);
+            QueryPerformanceCounter(&b);
+            QueryPerformanceFrequency(&f);
+            if (getenv("RECOMP_PACE_TRACE") && (b.QuadPart - a.QuadPart) * 50 > f.QuadPart)
+                fprintf(stderr, "  [D3D11] CreateVertexShader took %.0f ms\n",
+                        (double)(b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart);
+            if (SUCCEEDED(hr)) {
                 s_st.vs_compiled++;
                 if (slot)
                     *slot = vs;
@@ -256,6 +485,10 @@ static ID3D11VertexShader *vs_for(const Nv2aVpState *vp)
         /* A program that will not compile is not retried every draw. */
         if (!vs && slot)
             *slot = (void *)(uintptr_t)1;
+    }
+    if ((void *)vs == SHADER_PENDING) {
+        last_vp = NULL;
+        return NULL;
     }
     if ((uintptr_t)vs == 1)
         vs = NULL;
@@ -286,11 +519,26 @@ static ID3D11PixelShader *ps_for(const Nv2aCombiner *c)
         ps = (ID3D11PixelShader *)*slot;
     } else {
         size_t len = nv2a_hlsl_ps(&key, s_src, sizeof s_src);
-        ID3DBlob *code = len ? compile(s_src, len, "ps_5_0", 0) : NULL;
+        ID3DBlob *code = len ? compile_cached_only(s_src, len, "ps_5_0", 0) : NULL;
+        if (!code && len && shader_queue(slot, 1, s_src, len)) {
+            last_c = NULL;
+            return NULL;
+        }
+        if (!code && len)
+            code = compile(s_src, len, "ps_5_0", 0);
         if (code) {
-            if (SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev,
+            LARGE_INTEGER a, b, f;
+            HRESULT hr;
+            QueryPerformanceCounter(&a);
+            hr = ID3D11Device_CreatePixelShader(s_dev,
                     ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code),
-                    NULL, &ps))) {
+                    NULL, &ps);
+            QueryPerformanceCounter(&b);
+            QueryPerformanceFrequency(&f);
+            if (getenv("RECOMP_PACE_TRACE") && (b.QuadPart - a.QuadPart) * 50 > f.QuadPart)
+                fprintf(stderr, "  [D3D11] CreatePixelShader took %.0f ms\n",
+                        (double)(b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart);
+            if (SUCCEEDED(hr)) {
                 s_st.ps_compiled++;
                 if (slot)
                     *slot = ps;
@@ -299,6 +547,10 @@ static ID3D11PixelShader *ps_for(const Nv2aCombiner *c)
         }
         if (!ps && slot)
             *slot = (void *)(uintptr_t)1;
+    }
+    if ((void *)ps == SHADER_PENDING) {
+        last_c = NULL;
+        return NULL;
     }
     if ((uintptr_t)ps == 1)
         ps = NULL;
@@ -1884,17 +2136,62 @@ static void pace_display(void)
     if (off)
         return;
     QueryPerformanceCounter(&now);
-    while (due && now.QuadPart < due) {
-        if (due - now.QuadPart > qf.QuadPart / 500)
-            Sleep(1);
-        else
-            YieldProcessor();
-        QueryPerformanceCounter(&now);
+    {
+        /* RECOMP_PACE_TRACE: every 600 flips, how many arrived late (the
+         * frame was not ready when it was due), how many resynced, the
+         * time spent waiting here, and the render thread's idle time --
+         * whether the display or the producer sets the rate. */
+        static int trace = -1;
+        static unsigned n, late, resync;
+        static LONGLONG t0, waited, entry;
+        extern LONGLONG g_d3d11_idle_ticks;
+        if (trace < 0)
+            trace = getenv("RECOMP_PACE_TRACE") != NULL;
+        if (trace) {
+            if (due && now.QuadPart > due) late++;
+            if (due && now.QuadPart - due >= qf.QuadPart / 30) {
+                static LONGLONG start;
+                if (!start) start = now.QuadPart;
+                resync++;
+                fprintf(stderr, "  [PACE] frame %.0f ms late at %.2f s (render idle so far %.0f ms;"
+                        " %u VS + %u PS compiled, %u texture uploads)\n",
+                        (double)(now.QuadPart - due) * 1000.0 / qf.QuadPart,
+                        (double)(now.QuadPart - start) / qf.QuadPart,
+                        (double)g_d3d11_idle_ticks * 1000.0 / qf.QuadPart,
+                        s_st.vs_compiled, s_st.ps_compiled, s_st.tex_uploads);
+            }
+            entry = now.QuadPart;
+        }
+        while (due && now.QuadPart < due) {
+            if (due - now.QuadPart > qf.QuadPart / 500)
+                Sleep(1);
+            else
+                YieldProcessor();
+            QueryPerformanceCounter(&now);
+        }
+        if (trace) {
+            waited += now.QuadPart - entry;
+            if (!t0) t0 = now.QuadPart;
+            if (++n == 600) {
+                double secs = (double)(now.QuadPart - t0) / (double)qf.QuadPart;
+                fprintf(stderr, "  [PACE] 600 flips in %.2f s (%.1f/s): %u late, %u resynced, "
+                        "%.1f ms/flip pacing wait, %.1f ms/flip render idle\n",
+                        secs, 600.0 / secs, late, resync,
+                        (double)waited * 1000.0 / qf.QuadPart / 600.0,
+                        (double)g_d3d11_idle_ticks * 1000.0 / qf.QuadPart / 600.0);
+                n = late = resync = 0;
+                waited = 0;
+                g_d3d11_idle_ticks = 0;
+                t0 = now.QuadPart;
+            }
+        }
     }
     /* Keep the 60 Hz schedule through a late frame; resync after a stall. */
     due = (due && now.QuadPart - due < qf.QuadPart / 30) ? due + qf.QuadPart / 60
                                                        : now.QuadPart + qf.QuadPart / 60;
 }
+
+LONGLONG g_d3d11_idle_ticks;
 
 int nv2a_d3d11_frames_in_flight(void)
 {
@@ -2096,10 +2393,14 @@ static DWORD WINAPI render_thread(LPVOID unused)
         PktHdr *h;
 
         if (tail == s_ring_head) {
+            LARGE_INTEGER a, b;
+            QueryPerformanceCounter(&a);
             InterlockedExchange(&s_consumer_idle, 1);
             if (tail == s_ring_head)
                 WaitForSingleObject(s_ring_wake, 2);
             InterlockedExchange(&s_consumer_idle, 0);
+            QueryPerformanceCounter(&b);
+            g_d3d11_idle_ticks += b.QuadPart - a.QuadPart;
             continue;
         }
         MemoryBarrier();

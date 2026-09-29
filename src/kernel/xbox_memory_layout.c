@@ -1848,6 +1848,10 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                 *(const uint32_t *)(mem + a));
     }
     fflush(stderr);
+    {
+        extern void (*g_xbox_flush_logs)(void);
+        if (g_xbox_flush_logs) g_xbox_flush_logs();
+    }
     _exit(3);
     return 0;
 }

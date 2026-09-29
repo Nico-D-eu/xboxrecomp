@@ -16,6 +16,11 @@
 #include <stdlib.h>
 #if defined(_WIN32)
 #include <intrin.h>
+
+/* Called before the process exits by a path that skips atexit (ExitProcess,
+ * _exit): the host sets it when its logs are buffered, so the last lines --
+ * usually the ones that matter -- reach the file. */
+void (*g_xbox_flush_logs)(void);
 #endif
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma intrinsic(_ReturnAddress)
@@ -389,6 +394,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
     DebugBreak();
 #endif
 
+    if (g_xbox_flush_logs) g_xbox_flush_logs();
     ExitProcess(BugCheckCode);
 }
 
@@ -407,6 +413,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     DebugBreak();
 #endif
 
+    if (g_xbox_flush_logs) g_xbox_flush_logs();
     ExitProcess(BugCheckCode);
 }
 
@@ -452,12 +459,14 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "HalReturnToFirmware: routine=%u (exiting)", Routine);
+    if (g_xbox_flush_logs) g_xbox_flush_logs();
     ExitProcess(0);
 }
 
 VOID __stdcall xbox_HalInitiateShutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
+    if (g_xbox_flush_logs) g_xbox_flush_logs();
     ExitProcess(0);
 }
 

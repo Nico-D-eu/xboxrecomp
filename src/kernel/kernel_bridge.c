@@ -9307,7 +9307,15 @@ static void kernel_thunk_dispatch(void)
         fflush(stderr);
     }
 
-    {
+    /* RECOMP_KERNEL_SUMMARY: every 2 s, the call count and the six busiest
+     * ordinals. Opt-in: it ran on whichever guest thread crossed the 2 s
+     * mark (often several at once) and printed and flushed from inside the
+     * dispatch, and Amped 2's ML1 hitched for about 100 ms every 2 s,
+     * holding it near 55 fps against a 60 Hz display. */
+    static int summary_on = -1;
+    if (summary_on < 0)
+        summary_on = getenv("RECOMP_KERNEL_SUMMARY") != NULL;
+    if (summary_on) {
         static DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
