@@ -67,6 +67,7 @@ static void vs_common(Sb *s)
     sb(s, "cbuffer VSC : register(b0) { float4 c[192]; };\n"
           "cbuffer VSD : register(b1) {\n"
           "  float4 g_adef[16]; uint4 g_afmt[16]; float4 g_vp; uint4 g_roles;\n"
+          "  float4 g_fog;   /* param 0, param 1, mode (0 off, 1 linear, 2 exp, 3 exp2), abs */\n"
           "};\n"
           "struct VSIn {\n");
     for (i = 0; i < 16; i++)
@@ -123,6 +124,17 @@ static void vs_common(Sb *s)
            * so oPos arrives as window x, y, z and clip w; multiplying back by
            * w is what lets the GPU clip and interpolate perspective-
            * correctly. */
+          /* The fog factor from the program's oFog.x, as xemu computes it:
+           * Xbox D3D biases SET_FOG_PARAMS so that these offsets land on
+           * D3D's own formulas. 1 = no fog. */
+          "float fog_factor(float d) {\n"
+          "  float f = 1.0;\n"
+          "  if (g_fog.z == 1.0) f = g_fog.x + d * g_fog.y - 1.0;\n"
+          "  else if (g_fog.z == 2.0) f = g_fog.x + exp2(d * g_fog.y * 16.0) - 1.5;\n"
+          "  else if (g_fog.z == 3.0) f = g_fog.x + exp2(-d * d * g_fog.y * g_fog.y * 32.0) - 1.5;\n"
+          "  if (g_fog.w != 0.0) f = abs(f);\n"
+          "  return f;\n"
+          "}\n"
           "float4 to_clip(float4 p, float w) {\n"
           "  if (w == 0.0 || isinf(w) || isnan(w)) w = 1.0;\n"
           "  return float4((p.x * g_vp.x - 1.0) * w, (1.0 - p.y * g_vp.y) * w,\n"
@@ -315,7 +327,7 @@ size_t nv2a_hlsl_vs(const Nv2aVpState *vp, char *buf, size_t size,
            "  o.pos = to_clip(oPos, oPos.w);\n"
            "  o.d0 = saturate(oD0); o.d1 = saturate(oD1);\n"
            "  o.t0 = oT0; o.t1 = oT1; o.t2 = oT2; o.t3 = oT3;\n"
-           "  o.fog = oFog.x;\n"
+           "  o.fog = fog_factor(oFog.x);\n"
            "  return o;\n"
            "}\n");
     return sb_done(&s);
@@ -343,7 +355,7 @@ size_t nv2a_hlsl_vs_passthrough(char *buf, size_t size)
            "  o.d0 = saturate(v[g_roles.x]);\n"
            "  o.d1 = saturate(v[4]);\n"
            "  o.t0 = v[g_roles.y]; o.t1 = v[10]; o.t2 = v[11]; o.t3 = v[12];\n"
-           "  o.fog = 0.0;\n"
+           "  o.fog = 1.0;\n"
            "  return o;\n"
            "}\n");
     return sb_done(&s);
@@ -556,7 +568,7 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
             break;
         }
     }
-    sb(&s, "  float4 fog = float4(fogc.rgb, 1.0);\n"
+    sb(&s, "  float4 fog = float4(fogc.rgb, saturate(i.fog));\n"
            "  float4 r0 = float4(0, 0, 0, t0.a), r1 = 0;\n"
            "  float4 outc;\n");
 

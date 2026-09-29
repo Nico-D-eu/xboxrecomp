@@ -43,6 +43,8 @@ typedef struct {
     uint32_t afmt[16][4];        /* x = NV2A_HLSL_AFMT_*, y = components */
     float    vp[4];              /* 2/width, 2/height, 1/zmax, unused   */
     uint32_t roles[4];           /* pass-through: diffuse, tex0 attribute */
+    float    fog[4];             /* param 0, param 1, mode (0 off, 1 linear,
+                                    2 exp, 3 exp2), 1 = absolute value */
 } Nv2aHlslVsParams;
 
 typedef struct {

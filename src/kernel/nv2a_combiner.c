@@ -160,6 +160,11 @@ void nv2a_comb_eval(const Nv2aCombiner *c, const float v0[4], const float v1[4],
     for (k = 0; k < 4; k++)
         memcpy(regs[R_T0 + k], t[k], sizeof regs[0]);
     unpack(c->fog_color, regs[R_FOG]);
+    {   /* SET_FOG_COLOR keeps red in the low byte (A B G R). */
+        float r = regs[R_FOG][2];
+        regs[R_FOG][2] = regs[R_FOG][0];
+        regs[R_FOG][0] = r;
+    }
     regs[R_FOG][3] = fog_factor;
     regs[R_R0][3] = t[0][3];                               /* R0.a = T0.a */
 

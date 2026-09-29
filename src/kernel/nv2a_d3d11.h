@@ -46,6 +46,8 @@ typedef struct {
     uint32_t blend_enable, blend_sfactor, blend_dfactor, blend_eq, blend_color;
     uint32_t color_mask;
     uint32_t cull_enable, cull_face, front_face;
+    uint32_t fog_enable, fog_mode;
+    float    fog_param[3];
 
     /* Geometry. */
     uint32_t prim;

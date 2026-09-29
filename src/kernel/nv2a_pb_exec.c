@@ -314,6 +314,8 @@ static struct {
     uint32_t color_mask;
     /* State only the D3D11 backend acts on so far. */
     uint32_t zpitch, blend_eq, blend_color;
+    uint32_t fog_enable, fog_mode;
+    float    fog_param[3];
     uint32_t cull_enable, cull_face, front_face;
     uint32_t stencil_test, stencil_mask, stencil_func, stencil_ref,
              stencil_func_mask, stencil_fail, stencil_zfail, stencil_zpass;
@@ -2260,6 +2262,9 @@ static void hw_fill_targets(Nv2aHwDraw *d)
     d->cull_enable = s_gpu.cull_enable;
     d->cull_face = s_gpu.cull_face;
     d->front_face = s_gpu.front_face;
+    d->fog_enable = s_gpu.fog_enable;
+    d->fog_mode = s_gpu.fog_mode;
+    memcpy(d->fog_param, s_gpu.fog_param, sizeof d->fog_param);
     d->vp = &s_vp;
     d->comb = &s_comb;
 }
@@ -2442,6 +2447,18 @@ static void raster_batch(void)
             for (k = 0; k < (uint32_t)nseen; k++)
                 if (seen[k] == sig)
                     bad = 0;
+            /* RECOMP_VP_SKIN: skinned batches regardless, for comparing one
+             * that renders with one that does not. */
+            {
+                static int skin = -1;
+                if (skin < 0)
+                    skin = getenv("RECOMP_VP_SKIN") != NULL;
+                if (skin && s_gpu.attr[2].size && s_gpu.attr[3].size
+                        && s_gpu.attr[3].type == 4 && s_gpu.idx_count > 100) {
+                    bad = 1;
+                    fprintf(stderr, "  [VPBAD] (skinned, spread %.1f px)\n", spread);
+                }
+            }
             if (bad && nseen < 64)
                 seen[nseen++] = sig;
             if (bad) {
@@ -2458,7 +2475,10 @@ static void raster_batch(void)
                             || in0[k][2] != 0.0f || in0[k][3] != 1.0f)
                         fprintf(stderr, "  [VPBAD]   in v%u = (%g %g %g %g)\n", k,
                                 in0[k][0], in0[k][1], in0[k][2], in0[k][3]);
-                if (s_gpu.idx_count > 600) {
+                /* Skinned layouts (weights in v2, indices in v3) get the whole
+                 * program and constant state printed. */
+                if (s_gpu.attr[2].size && s_gpu.attr[3].size
+                        && s_gpu.attr[3].type == 4 && s_gpu.idx_count > 100) {
                     uint32_t pc;
                     for (pc = s_vp.program_start; pc < NV2A_VP_SLOTS; pc++) {
                         fprintf(stderr, "  [VPBAD]   slot %3u: %08X %08X %08X\n", pc,
@@ -3004,6 +3024,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0358:                           /* SET_COLOR_MASK: A R G B bytes */
         s_gpu.color_mask = param;
         break;
+    case 0x02A4: s_gpu.fog_enable = param; break;         /* SET_FOG_ENABLE */
+    case 0x029C: s_gpu.fog_mode = param; break;           /* SET_FOG_MODE */
+    case 0x09C0: case 0x09C4: case 0x09C8: {              /* SET_FOG_PARAMS */
+        union { uint32_t u; float f; } fv;
+        fv.u = param;
+        s_gpu.fog_param[(method - 0x09C0) / 4] = fv.f;
+        break;
+    }
     case 0x0308: s_gpu.cull_enable = param; break;        /* SET_CULL_FACE_ENABLE */
     case 0x039C: s_gpu.cull_face = param; break;          /* SET_CULL_FACE */
     case 0x03A0: s_gpu.front_face = param; break;         /* SET_FRONT_FACE */

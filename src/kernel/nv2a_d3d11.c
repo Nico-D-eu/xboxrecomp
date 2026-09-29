@@ -1368,6 +1368,19 @@ void nv2a_d3d11_draw(const Nv2aHwDraw *d)
     vsd.vp[0] = 2.0f / (float)w;
     vsd.vp[1] = 2.0f / (float)h;
     vsd.vp[2] = 1.0f / (((d->format >> 4) & 0xFu) == 1u ? 65535.0f : 16777215.0f);
+    if (d->fog_enable) {
+        vsd.fog[0] = d->fog_param[0];
+        vsd.fog[1] = d->fog_param[1];
+        switch (d->fog_mode) {
+        case 0x2601: vsd.fog[2] = 1.0f; break;                    /* LINEAR */
+        case 0x0804: vsd.fog[2] = 1.0f; vsd.fog[3] = 1.0f; break; /* LINEAR_ABS */
+        case 0x0800: vsd.fog[2] = 2.0f; break;                    /* EXP */
+        case 0x0802: vsd.fog[2] = 2.0f; vsd.fog[3] = 1.0f; break; /* EXP_ABS */
+        case 0x0801: vsd.fog[2] = 3.0f; break;                    /* EXP2 */
+        case 0x0803: vsd.fog[2] = 3.0f; vsd.fog[3] = 1.0f; break; /* EXP2_ABS */
+        default: break;
+        }
+    }
     vsd.roles[0] = d->diffuse_attr;
     vsd.roles[1] = d->tex0_attr;
     if (!d->use_vp && !vsd.afmt[d->diffuse_attr & 15][0]
@@ -1400,7 +1413,14 @@ void nv2a_d3d11_draw(const Nv2aHwDraw *d)
     }
     unpack_argb(d->comb->final_factor0, psd.ff0);
     unpack_argb(d->comb->final_factor1, psd.ff1);
+    /* SET_FOG_COLOR is A B G R from the top byte down -- red is the low
+     * byte, unlike every other colour register here. */
     unpack_argb(d->comb->fog_color, psd.fogc);
+    {
+        float r = psd.fogc[2];
+        psd.fogc[2] = psd.fogc[0];
+        psd.fogc[0] = r;
+    }
     psd.atest[0] = d->alpha_test;
     psd.atest[1] = d->alpha_func;
     psd.atest[2] = d->alpha_ref;
