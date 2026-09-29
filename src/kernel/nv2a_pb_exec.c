@@ -42,6 +42,11 @@
 
 static Nv2aVpState s_vp;
 static Nv2aCombiner s_comb;
+/* Batches seen, for probes that name one. */
+static unsigned s_batch_no;
+/* Frames (full-screen target switches) and when the first one was seen. */
+static unsigned s_frames_seen;
+static unsigned long long s_frames_t0;
 /* Set per batch: vertices go through s_vp instead of being read as screen
  * space. */
 static int s_batch_vp;
@@ -1169,6 +1174,33 @@ static void put_pixel_unmasked(uint8_t *mem, uint32_t bpp, int x, int y,
     if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
         return;
     s_gpu.pixels++;
+    /* RECOMP_PIXEL_PROBE=x,y[,from]: every write to one pixel from batch
+     * <from> on, with the state that drew it. The quickest way from "this
+     * part of the picture is wrong" to the batch responsible. */
+    {
+        static int px = -2, py, pfrom, shown;
+        if (px == -2) {
+            const char *e = getenv("RECOMP_PIXEL_PROBE");
+            px = -1;
+            if (e)
+                sscanf(e, "%d,%d,%d", &px, &py, &pfrom);
+        }
+        if (x == px && y == py && s_batch_no >= (unsigned)pfrom && shown < 800) {
+            shown++;
+            fprintf(stderr, "  [PROBE] batch %u surf %08X argb %08X | mode 0x%X prim %u"
+                    " z %u/%X/%u a %u/%X/%u blend %u %X/%X mask %08X | t0 %d %ux%u"
+                    " fmt %X @%08X | t1 %d %ux%u fmt %X | stages %08X comb %u\n",
+                    s_batch_no, s_gpu.color_offset, argb, s_vp.execution_mode,
+                    s_gpu.prim, s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
+                    s_gpu.alpha_test, s_gpu.alpha_func, s_gpu.alpha_ref,
+                    s_gpu.blend_enable, s_gpu.blend_sfactor, s_gpu.blend_dfactor,
+                    s_gpu.color_mask, s_stex[0].valid && s_stex_enable[0],
+                    s_stex[0].width, s_stex[0].height, s_stex[0].color,
+                    s_stex[0].offset, s_stex[1].valid && s_stex_enable[1],
+                    s_stex[1].width, s_stex[1].height, s_stex[1].color,
+                    s_comb.stage_program, s_comb.control & 0xFFu);
+        }
+    }
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
     row = s_surface + (size_t)y * s_gpu.pitch;
@@ -2036,6 +2068,7 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 
 static void raster_batch(void)
 {
+    s_batch_no++;
     uint32_t i;
     uint32_t before = s_gpu.tris_drawn;
 
@@ -2541,6 +2574,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.pitch = param & 0xFFFF;      /* colour pitch; zeta is the top half */
         break;
     case NV097_SET_SURFACE_COLOR_OFFSET:
+        /* A frame, as far as the executor can tell: the colour target moving
+         * to a different full-screen buffer. Counted with the wall clock so
+         * the report can say how fast the title is actually running. */
+        if (param != s_gpu.color_offset && param
+                && s_gpu.clip_w >= 640 && s_gpu.clip_h >= 480) {
+            s_frames_seen++;
+            if (!s_frames_t0)
+                s_frames_t0 = GetTickCount64();
+        }
         s_gpu.color_offset = param;
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
@@ -3020,6 +3062,11 @@ void nv2a_pb_exec_report(void)
                     " %u triangles behind the eye\n",
             s_vp.execution_mode, s_vp.program_start, s_vp.program_writes,
             s_vp_batches, s_vp_vertices, s_vp_failed, s_vp_behind_eye);
+    if (s_frames_seen > 1) {
+        double secs = (double)(GetTickCount64() - s_frames_t0) / 1000.0;
+        fprintf(stderr, "[GPU] frames: %u in %.0f s (%.2f fps)\n", s_frames_seen,
+                secs, secs > 0 ? s_frames_seen / secs : 0.0);
+    }
     fprintf(stderr, "[GPU] depth: test %u func 0x%X mask %u zeta 0x%X;"
                     " %u pixels failed depth, %u failed alpha (func 0x%X ref %u)\n",
             s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
