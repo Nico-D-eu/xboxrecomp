@@ -308,14 +308,15 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     if (xa2_is_active()) {
         int16_t out[256][2];
 
-        /* Opt-in for now (RECOMP_APU_GUEST_AUDIO=1): Amped 2's output through
-         * this path is a clipping 750 Hz buzz -- an exact 64-sample repeat,
-         * probably effect sends its own DSP program would have processed,
-         * summed raw by the GP stub's all-bin mixdown. Silence is the better
-         * default until that is understood. */
+        /* RECOMP_APU_GUEST_AUDIO=0 mutes the guest's audio. (A clipping
+         * 750 Hz buzz seen here was the APU reading its voices from low RAM
+         * instead of the contiguous window -- a ram_ptr problem in the
+         * caller, fixed in Amped 2's main.c.) */
         static int guest = -1;
-        if (guest < 0)
-            guest = getenv("RECOMP_APU_GUEST_AUDIO") != NULL;
+        if (guest < 0) {
+            const char *e = getenv("RECOMP_APU_GUEST_AUDIO");
+            guest = !(e && *e == '0');
+        }
         if (guest)
             memcpy(out, d->monitor.frame_buf, sizeof out);
         else

@@ -175,7 +175,14 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
                 state = 1;
             }
         }
-        if (state == 1) {
+        static uint64_t skipped, skip = (uint64_t)-1;
+        if (skip == (uint64_t)-1) {
+            const char *e = getenv("RECOMP_AUDIO_WAV_SKIP");     /* seconds */
+            skip = e ? (uint64_t)atoi(e) * 48000u : 0;
+        }
+        if (state == 1 && skipped < skip) {
+            skipped += (uint64_t)copy_samples;
+        } else if (state == 1) {
             uint32_t bytes = (uint32_t)copy_samples * XA2_CHANNELS * 2u;
             fwrite(samples, 1, bytes, wav);
             written += bytes;
