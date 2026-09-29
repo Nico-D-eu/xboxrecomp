@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
 
@@ -25,7 +26,9 @@
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+/* Submissions are 256 samples (5.3 ms) now, one per 8 APU frames; 16 in the
+ * queue is 85 ms of slack against the frame thread's jitter. */
+#define XA2_NUM_BUFS      16
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -153,6 +156,69 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;
+
+    /* RECOMP_AUDIO_WAV=<file>: the first 60 s of output as a 48 kHz stereo
+     * WAV, to listen to what a headless run played. */
+    {
+        static FILE *wav;
+        static int state = -1;
+        static uint32_t written;
+        if (state < 0) {
+            const char *path = getenv("RECOMP_AUDIO_WAV");
+            state = 0;
+            if (path && (wav = fopen(path, "wb")) != NULL) {
+                static const uint8_t hdr[44] = {
+                    'R','I','F','F', 0,0,0,0, 'W','A','V','E', 'f','m','t',' ',
+                    16,0,0,0, 1,0, 2,0, 0x80,0xBB,0,0, 0x00,0xEE,0x02,0, 4,0, 16,0,
+                    'd','a','t','a', 0,0,0,0 };
+                fwrite(hdr, 1, sizeof hdr, wav);
+                state = 1;
+            }
+        }
+        if (state == 1) {
+            uint32_t bytes = (uint32_t)copy_samples * XA2_CHANNELS * 2u;
+            fwrite(samples, 1, bytes, wav);
+            written += bytes;
+            if (written >= 48000u * 4u * 60u) {
+                uint32_t riff = 36 + written;
+                fseek(wav, 4, SEEK_SET);
+                fwrite(&riff, 4, 1, wav);
+                fseek(wav, 40, SEEK_SET);
+                fwrite(&written, 4, 1, wav);
+                fclose(wav);
+                state = 2;
+                fprintf(stderr, "  [AUDIO] 60 s of output written to %s\n",
+                        getenv("RECOMP_AUDIO_WAV"));
+            }
+        }
+    }
+
+    /* RECOMP_AUDIO_METER=1: the output's peak and how often it was non-silent,
+     * every ~5 s -- whether anything the title plays reaches the speakers,
+     * on a machine nobody is listening to. */
+    {
+        static int meter = -1;
+        static int peak;
+        static unsigned bufs, loud;
+        int i, p = 0;
+        if (meter < 0)
+            meter = getenv("RECOMP_AUDIO_METER") != NULL;
+        if (meter) {
+            for (i = 0; i < copy_samples * XA2_CHANNELS; i++) {
+                int v = samples[i] < 0 ? -samples[i] : samples[i];
+                if (v > p) p = v;
+            }
+            if (p > peak) peak = p;
+            if (p > 64) loud++;
+            if (++bufs >= 48000u * 5u / (unsigned)(copy_samples ? copy_samples : 1)) {
+                fprintf(stderr, "  [AUDIO] 5 s: peak %d, %u of %u buffers audible\n",
+                        peak, loud, bufs);
+                fflush(stderr);
+                peak = 0;
+                bufs = loud = 0;
+            }
+        }
+    }
     return 1;
 }
 

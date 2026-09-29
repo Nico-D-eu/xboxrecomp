@@ -296,37 +296,48 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 path: the guest's audio, then the host mixer on top.
+     *
+     * monitor.frame_buf holds what the VP and the DSP stage accumulated over
+     * the last 8 frames (256 samples). This path used to clear it and render
+     * only the test tone and the host-side mixer, so everything the title
+     * played through DirectSound was thrown away -- and it submitted 1024
+     * samples for 256 samples' worth of time. Now it submits exactly the
+     * frames that elapsed, with the mixer and tone added (mixer_render
+     * accumulates with clamping). */
     if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+        int16_t out[256][2];
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
+        /* Opt-in for now (RECOMP_APU_GUEST_AUDIO=1): Amped 2's output through
+         * this path is a clipping 750 Hz buzz -- an exact 64-sample repeat,
+         * probably effect sends its own DSP program would have processed,
+         * summed raw by the GP stub's all-bin mixdown. Silence is the better
+         * default until that is understood. */
+        static int guest = -1;
+        if (guest < 0)
+            guest = getenv("RECOMP_APU_GUEST_AUDIO") != NULL;
+        if (guest)
+            memcpy(out, d->monitor.frame_buf, sizeof out);
+        else
+            memset(out, 0, sizeof out);
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        if (g_audio_muted) {
+            memset(out, 0, sizeof out);
+        } else {
+            if (g_test_tone.active) {
+                for (int i = 0; i < 256; i++) {
+                    int32_t s = (int32_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                    int32_t l = out[i][0] + s, r = out[i][1] + s;
+                    out[i][0] = (int16_t)(l > 32767 ? 32767 : (l < -32768 ? -32768 : l));
+                    out[i][1] = (int16_t)(r > 32767 ? 32767 : (r < -32768 ? -32768 : r));
                     g_test_tone.phase += g_test_tone.phase_inc;
                     if (g_test_tone.phase >= 2.0 * M_PI)
                         g_test_tone.phase -= 2.0 * M_PI;
                 }
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
+            mixer_render(out, 256);
         }
-
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        xa2_submit_samples((const int16_t *)out, 256);
         return;
     }
 
