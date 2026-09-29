@@ -37,6 +37,8 @@ static void mixer_init(void);
 static void mixer_render(int16_t frame_buf[][2], int num_samples);
 static APUMixerVoice g_mixer_voices[APU_MIXER_MAX_VOICES];
 static volatile int g_mixer_active_count = 0;
+/* Guest MMIO handlers queued on d->lock (voice_lock in apu_vp.c). */
+volatile long g_apu_lock_waiters;
 static CRITICAL_SECTION g_mixer_cs;
 static bool g_mixer_initialized = false;
 struct McpxApuDebug g_dbg;
@@ -305,9 +307,11 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             stats = getenv("RECOMP_APU_STATS") != NULL;
         if (stats && ++n % 938 == 0)            /* ~5 s of 256-sample frames */
             fprintf(stderr, "  [APU] voices on %u, off %u (%u by PIO), notifications %u; "
-                    "ISTS %08X IEN %08X FENADDR %08X\n",
+                    "ISTS %08X IEN %08X FENADDR %08X; %d frames/s (1500 is real "
+                    "time), %.0f%% busy\n",
                     g_apu_stat_on, g_apu_stat_off, g_apu_stat_pio_off, g_apu_stat_notify,
-                    d->regs[NV_PAPU_ISTS], d->regs[NV_PAPU_IEN], d->regs[NV_PAPU_FENADDR]);
+                    d->regs[NV_PAPU_ISTS], d->regs[NV_PAPU_IEN], d->regs[NV_PAPU_FENADDR],
+                    g_dbg.frames_processed, g_dbg.utilization * 100.0f);
     }
 
     /* XAudio2 path: the guest's audio, then the host mixer on top.
@@ -519,6 +523,22 @@ static void *mcpx_apu_frame_thread(void *arg)
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
+        }
+
+        /* Hand the lock to a queued guest write. throttle() only releases
+         * it while it sleeps, and a frame thread that has fallen behind real
+         * time never sleeps: a Critical Section is not fair, so it took the
+         * lock straight back every frame, and DirectSound's VOICE_LOCK
+         * write waited for good while holding the title's own DirectSound
+         * lock -- the whole game stopped (Amped 2 ML1, 1-4 min in, once its
+         * sounds actually played). */
+        if (qatomic_read(&g_apu_lock_waiters)) {
+            int64_t until = qemu_clock_get_us(QEMU_CLOCK_REALTIME) + 2000;
+            qemu_mutex_unlock(&d->lock);
+            while (qatomic_read(&g_apu_lock_waiters) &&
+                   qemu_clock_get_us(QEMU_CLOCK_REALTIME) < until)
+                SwitchToThread();
+            qemu_mutex_lock(&d->lock);
         }
     }
 

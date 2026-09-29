@@ -149,8 +149,13 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
 
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
+    extern volatile long g_apu_lock_waiters;
     assert(v < MCPX_HW_MAX_VOICES);
+    /* Announce the wait: the frame thread holds d->lock for as long as it is
+     * behind real time and hands it over only when someone is queued. */
+    _InterlockedIncrement(&g_apu_lock_waiters);
     qemu_mutex_lock(&d->lock);
+    _InterlockedDecrement(&g_apu_lock_waiters);
 
     uint64_t mask = 1ULL << (v % 64);
     if (lock) {
@@ -969,7 +974,14 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
 
         int count = voice_get_samples(d, v, &samples[sample_count],
                                       requested_num - sample_count);
-        if (count < 0) break;
+        /* Nothing more this frame. Report it as -1 when nothing came at all:
+         * a 0 made voice_process's loop call again, forever -- a persist
+         * stream voice whose SSLs have run dry stays active and answers -1
+         * (with a notification) every time, so the frame thread spun under
+         * d->lock, the notifications ran into the tens of millions, and the
+         * first guest VOICE_LOCK after it hung the title (Amped 2 in game,
+         * once XACT's sounds started). */
+        if (count < 0) return sample_count ? sample_count : -1;
         if (count == 0) return -1;
         sample_count += count;
     }
