@@ -1,3 +1,4 @@
+#include <math.h>
 /*
  * MCPX APU DSP (GP/EP) - Stub implementation
  *
@@ -138,6 +139,24 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
     (void)d;
 }
 
+double g_apu_bin_sq[32];
+
+/* Identity up to 0.8; above it the excess is squeezed smoothly so the output
+ * approaches 1.0 without reaching it until the input is far past it. */
+static inline float apu_soft_limit(float x)
+{
+    const float knee = 0.8f, room = 0.2f;
+    float a = x < 0 ? -x : x;
+    if (a <= knee)
+        return x;
+    a = knee + room * (1.0f - expf(-(a - knee) / room));
+    return x < 0 ? -a : a;
+}
+float g_apu_mix_peak;
+double g_apu_voice_dc[256], g_apu_voice_nyq[256], g_apu_voice_sq[256];
+unsigned long g_apu_voice_n[256];
+unsigned long g_apu_bin_n;
+
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -158,6 +177,12 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
     dsp_ack_frame(d);
+
+    /* Per-bin energy for RECOMP_APU_STATS (printed by apu_core.c). */
+    for (int b = 0; b < NUM_MIXBINS && b < 32; b++)
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            g_apu_bin_sq[b] += (double)mixbins[b][i] * mixbins[b][i];
+    g_apu_bin_n += NUM_SAMPLES_PER_FRAME;
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -200,7 +225,20 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 left = mixbins[0][i];
                 right = mixbins[1][i];
             }
-            /* Clamp to [-1, 1] range */
+            /* Peak before the clamp, for RECOMP_APU_STATS. */
+            {
+                extern float g_apu_mix_peak;
+                float a = left < 0 ? -left : left, b = right < 0 ? -right : right;
+                if (a > g_apu_mix_peak) g_apu_mix_peak = a;
+                if (b > g_apu_mix_peak) g_apu_mix_peak = b;
+            }
+            /* Soft knee above 0.8, then the clamp. The mixdown has none of
+             * the headroom the GP/EP would apply, and with every voice
+             * decoding correctly Amped 2's mix peaks at 0.65-1.05 in play;
+             * loud moments clipped 4% of samples, which is heard as
+             * crackle. Below the knee the signal is untouched. */
+            left = apu_soft_limit(left);
+            right = apu_soft_limit(right);
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;

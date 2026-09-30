@@ -163,6 +163,16 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
         VirtualFree(BaseAddress, 0, MEM_RELEASE);
 }
 
+/* Which store each physical page handed to hardware lives in: 1 when the
+ * address came from ordinary memory (low RAM), 0 when from the contiguous
+ * window. Physical addresses are ambiguous here -- the two are separate
+ * storage with overlapping offsets -- and a device model that reads physical
+ * memory needs to know which one the title meant. DirectSound builds its
+ * scatter-gather tables with this call, one page at a time; XACT keeps its
+ * wave banks in the ordinary heap, so the APU read every ADPCM sound effect
+ * out of the wrong store and played noise. */
+volatile uint8_t g_xbox_phys_lowram[0x04000000u >> 12];
+
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
 {
     /*
@@ -179,9 +189,16 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      * nothing naming this function.
      */
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    if (va >= XBOX_CONTIG_BASE &&
+            (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE) {
+        uint32_t pa = va - XBOX_CONTIG_BASE;
+        if (pa < 0x04000000u)
+            g_xbox_phys_lowram[pa >> 12] = 0;
+        return (ULONG_PTR)pa;
+    }
+    if (va < 0x04000000u)
+        g_xbox_phys_lowram[va >> 12] = 1;
+    return (ULONG_PTR)va;
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

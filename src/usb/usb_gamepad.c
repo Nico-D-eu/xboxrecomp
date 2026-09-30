@@ -246,6 +246,35 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
  * This is a bring-up probe and nothing else. It is off unless the variable
  * is set, and a real pad on the host is always the better input.
  */
+/* The pad's output report: rumble. Six bytes -- report id 0, length 6, then
+ * the left (low-frequency) and right (high-frequency) motor speeds as 16-bit
+ * little-endian values -- passed to the host pad. RECOMP_RUMBLE=0 turns it
+ * off. Sent only when it changes: the title repeats it every frame or so,
+ * and a host call per report is wasted work. */
+void usb_gamepad_output(const uint8_t *r, int len)
+{
+    static int on = -1;
+    static XBOX_VIBRATION last = { 0xFFFF, 0xFFFF };
+    XBOX_VIBRATION v;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_RUMBLE");
+        on = !(e && *e == '0');
+    }
+    if (!on || len < 6 || r[1] < 6)
+        return;
+    v.wLeftMotorSpeed  = (WORD)(r[2] | (r[3] << 8));
+    v.wRightMotorSpeed = (WORD)(r[4] | (r[5] << 8));
+    if (v.wLeftMotorSpeed == last.wLeftMotorSpeed
+            && v.wRightMotorSpeed == last.wRightMotorSpeed)
+        return;
+    last = v;
+    xbox_InputSetState(0, &v);
+    if (getenv("RECOMP_INPUT_DIAG"))
+        fprintf(stderr, "  [INPUT] rumble %u / %u\n",
+                (unsigned)v.wLeftMotorSpeed, (unsigned)v.wRightMotorSpeed);
+}
+
 /* Reports handed to the title, for RECOMP_INPUT_DIAG (ohci.c prints it). */
 unsigned long s_reports;
 

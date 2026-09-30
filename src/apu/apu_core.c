@@ -29,6 +29,7 @@
  * ============================================================ */
 
 uint8_t *g_apu_ram_ptr = NULL;
+uint8_t *g_apu_lowram_ptr = NULL;
 
 MCPXAPUState *g_state = NULL;
 
@@ -315,16 +316,102 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                     d->regs[NV_PAPU_SECTL], d->regs[NV_PAPU_FECTL],
                     d->regs[NV_PAPU_TVL2D] & 0xFFFF, d->regs[NV_PAPU_TVL3D] & 0xFFFF,
                     d->regs[NV_PAPU_TVLMP] & 0xFFFF);
-        if (stats && n % 938 == 0 && (d->regs[NV_PAPU_TVL2D] & 0xFFFF) != 0xFFFF) {
-            /* The 2D list's first voice: format, state, offsets. */
-            hwaddr vb = d->regs[NV_PAPU_VPVADDR]
-                      + (d->regs[NV_PAPU_TVL2D] & 0xFFFF) * NV_PAVS_SIZE;
-            fprintf(stderr, "  [APU]   voice %04X: fmt %08X state %08X offset %08X next %08X\n",
-                    d->regs[NV_PAPU_TVL2D] & 0xFFFF,
-                    ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_CFG_FMT),
-                    ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_PAR_STATE),
-                    ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_PAR_OFFSET),
-                    ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_PAR_NEXT));
+        if (stats && n % 938 == 0) {
+            /* Every voice on the three lists: bins (CFG_VBIN), format
+             * (stream bit 24, persist 23), state (active 21, paused 18),
+             * offsets and the first two target volumes. Then the level of
+             * each mix bin over the last 5 s (g_apu_bin_rms, apu_dsp.c). */
+            extern double g_apu_bin_sq[32];
+            extern unsigned long g_apu_bin_n;
+            static const uint32_t tops[3] = { NV_PAPU_TVL2D, NV_PAPU_TVL3D, NV_PAPU_TVLMP };
+            static const char *names[3] = { "2D", "3D", "MP" };
+            int l, b;
+            for (l = 0; l < 3; l++) {
+                uint32_t v = d->regs[tops[l]] & 0xFFFF;
+                int guard = 0;
+                while (v != 0xFFFF && v < 256 && guard++ < 64) {
+                    hwaddr vb = d->regs[NV_PAPU_VPVADDR] + v * NV_PAVS_SIZE;
+                    uint32_t fmt = ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_CFG_FMT);
+                    uint32_t st  = ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_PAR_STATE);
+                    fprintf(stderr, "  [APU]   %s voice %02X: vbin %08X fmt %08X%s%s state %08X%s%s"
+                            " offset %08X next %08X vol %08X link %08X\n",
+                            names[l], v,
+                            ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_CFG_VBIN),
+                            fmt, (fmt & (1u << 24)) ? " STREAM" : "", (fmt & (1u << 23)) ? " PERSIST" : "",
+                            st, (st & (1u << 21)) ? " ACTIVE" : "", (st & (1u << 18)) ? " PAUSED" : "",
+                            ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_PAR_OFFSET),
+                            ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_PAR_NEXT),
+                            ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_TAR_VOLA),
+                            ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_TAR_PITCH_LINK));
+                    if (!(fmt & (1u << 24)) && !(fmt & (1u << 21))) {
+                        /* A buffer voice: where its data is, and what each of
+                         * the two stores holds there. Physical addresses are
+                         * ambiguous here -- low RAM and the contiguous window
+                         * are separate storage -- so the answer to "which
+                         * one did the title mean" is whichever is not
+                         * garbage. */
+                        extern void *xbox_GetMemoryBase(void);
+                        uint32_t ba = ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_CUR_PSL_START)
+                                    & NV_PAVS_VOICE_CUR_PSL_START_BA;
+                        uint32_t pa = ldl_le_phys(address_space_memory,
+                                                  d->regs[NV_PAPU_VPSGEADDR] + (ba / 4096) * 8)
+                                    + ba % 4096;
+                        const uint8_t *c = g_apu_ram_ptr + (pa & 0x03FFFFFF);
+                        const uint8_t *lo = (const uint8_t *)xbox_GetMemoryBase() + (pa & 0x03FFFFFF);
+                        fprintf(stderr, "  [APU]     buffer ba %06X -> phys %08X; contig"
+                                " %02X%02X%02X%02X%02X%02X%02X%02X low RAM"
+                                " %02X%02X%02X%02X%02X%02X%02X%02X\n", ba, pa,
+                                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+                                lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7]);
+                    }
+                    v = ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_TAR_PITCH_LINK) & 0xFFFF;
+                }
+            }
+            {
+                /* The six voices that produced the most, with their DC and
+                 * Nyquist content relative to their level. */
+                extern double g_apu_voice_dc[256], g_apu_voice_nyq[256], g_apu_voice_sq[256];
+                extern unsigned long g_apu_voice_n[256];
+                int shown[6] = { -1, -1, -1, -1, -1, -1 }, k, j;
+                for (k = 0; k < 6; k++) {
+                    int best = -1;
+                    for (j = 0; j < 256; j++) {
+                        int dup = 0, q;
+                        for (q = 0; q < k; q++) dup |= shown[q] == j;
+                        if (!dup && g_apu_voice_n[j]
+                                && (best < 0 || g_apu_voice_sq[j] > g_apu_voice_sq[best]))
+                            best = j;
+                    }
+                    shown[k] = best;
+                }
+                fprintf(stderr, "  [APU]   voices by output (rms, dc, nyquist):");
+                for (k = 0; k < 6 && shown[k] >= 0; k++) {
+                    j = shown[k];
+                    fprintf(stderr, " %02X:%.3f/%.3f/%.3f", j,
+                            sqrt(g_apu_voice_sq[j] / g_apu_voice_n[j]),
+                            g_apu_voice_dc[j] / g_apu_voice_n[j],
+                            g_apu_voice_nyq[j] / g_apu_voice_n[j]);
+                }
+                fprintf(stderr, "\n");
+                memset(g_apu_voice_dc, 0, sizeof g_apu_voice_dc);
+                memset(g_apu_voice_nyq, 0, sizeof g_apu_voice_nyq);
+                memset(g_apu_voice_sq, 0, sizeof g_apu_voice_sq);
+                memset(g_apu_voice_n, 0, sizeof g_apu_voice_n);
+            }
+            {
+                extern float g_apu_mix_peak;
+                fprintf(stderr, "  [APU]   mix peak before clamp %.2f\n", g_apu_mix_peak);
+                g_apu_mix_peak = 0;
+            }
+            if (g_apu_bin_n) {
+                fprintf(stderr, "  [APU]   bin rms x1000:");
+                for (b = 0; b < 32; b++) {
+                    fprintf(stderr, " %d:%.0f", b, 1000.0 * sqrt(g_apu_bin_sq[b] / g_apu_bin_n));
+                    g_apu_bin_sq[b] = 0;
+                }
+                fprintf(stderr, "\n");
+                g_apu_bin_n = 0;
+            }
         }
     }
 
@@ -612,6 +699,14 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     }
 
     g_apu_ram_ptr = ram_ptr;
+    {
+        /* Low RAM, for the pages MmGetPhysicalAddress says came from
+         * ordinary memory (apu_phys). */
+        extern void *xbox_GetMemoryBase(void);
+        g_apu_lowram_ptr = (uint8_t *)xbox_GetMemoryBase();
+        if (g_apu_lowram_ptr == ram_ptr)
+            g_apu_lowram_ptr = NULL;        /* the old single-store setup */
+    }
     g_state = d;
     d->ram_ptr = ram_ptr;
     g_xbox_apu_irq_poll = mcpx_apu_poll_irq;

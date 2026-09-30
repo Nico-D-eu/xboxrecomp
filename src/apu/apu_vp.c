@@ -857,7 +857,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
+                    memcpy(adpcm_block, apu_phys(addr),
                            block_size);
                 } else {
                     linear_addr += ba;
@@ -1149,6 +1149,21 @@ static void voice_process(MCPXAPUState *d,
         if (hrtf_handle != HRTF_NULL_HANDLE) {
             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
         }
+    }
+
+    /* RECOMP_APU_STATS: per voice, the mean (DC), the alternating-sign mean
+     * (a tone at Nyquist) and the energy of what it produced, before
+     * volume. apu_core.c prints the loudest. */
+    {
+        extern double g_apu_voice_dc[256], g_apu_voice_nyq[256], g_apu_voice_sq[256];
+        extern unsigned long g_apu_voice_n[256];
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            double s0 = samples[i][0];
+            g_apu_voice_dc[v & 255] += s0;
+            g_apu_voice_nyq[v & 255] += (i & 1) ? -s0 : s0;
+            g_apu_voice_sq[v & 255] += s0 * s0;
+        }
+        g_apu_voice_n[v & 255] += NUM_SAMPLES_PER_FRAME;
     }
 
     /* Mix into bins */

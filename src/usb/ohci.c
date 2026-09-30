@@ -600,8 +600,16 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             moved = n;
         }
     } else {
-        /* OUT: the status stage of an IN control transfer, or rumble. Both
-         * are accepted and discarded. */
+        /* OUT: the status stage of an IN control transfer, or rumble --
+         * the 6-byte output report, either as the data stage of a HID
+         * SET_REPORT (21 09 on endpoint 0, what XAPI sends) or on the
+         * interrupt OUT endpoint. The report goes to the host pad. */
+        extern void usb_gamepad_output(const uint8_t *report, int len);
+        if (len >= 6 && guest_ptr(cbp, 6)
+                && ((endpoint == 0 && g_setup_pending
+                     && g_setup.bmRequestType == 0x21 && g_setup.bRequest == 0x09)
+                    || endpoint != 0))
+            usb_gamepad_output(guest_ptr(cbp, 6), len);
         moved = len;
         g_setup_pending = 0;
     }
