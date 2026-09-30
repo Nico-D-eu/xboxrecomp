@@ -246,6 +246,9 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
  * This is a bring-up probe and nothing else. It is off unless the variable
  * is set, and a real pad on the host is always the better input.
  */
+/* Reports handed to the title, for RECOMP_INPUT_DIAG (ohci.c prints it). */
+unsigned long s_reports;
+
 static unsigned synthetic_buttons(void)
 {
     static int      configured = -1;
@@ -291,6 +294,7 @@ int usb_gamepad_report(uint8_t *out, int max)
 
     if (max < 20)
         return 0;
+    s_reports++;
     memset(out, 0, 20);
     out[0] = 0;
     out[1] = 20;
@@ -320,12 +324,18 @@ int usb_gamepad_report(uint8_t *out, int max)
                 XBOX_INPUT_STATE probe;
                 DWORD rc = xbox_InputGetState(0, &probe);
                 last = now;
+                static unsigned long last_reports;
                 fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
-                        "InputGetState=%lu buttons=0x%04X\n",
+                        "InputGetState=%lu buttons=0x%04X A=%u LX=%d; "
+                        "%lu reports to the title in the last second\n",
                         getenv("RECOMP_KEYBOARD") ? 1 : 0,
                         xbox_FramebufferKeyDown(0x0D),
                         (unsigned long)rc,
-                        rc == 0 ? probe.Gamepad.wButtons : 0);
+                        rc == 0 ? probe.Gamepad.wButtons : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[0] : 0,
+                        rc == 0 ? probe.Gamepad.sThumbLX : 0,
+                        s_reports - last_reports);
+                last_reports = s_reports;
                 fflush(stderr);
             }
         }

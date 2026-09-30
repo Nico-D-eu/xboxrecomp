@@ -2042,6 +2042,13 @@ static void bridge_KeRemoveQueueDpc(void)
 typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
+/* More than one thread queues DPCs: the OHCI model raises the USB interrupt
+ * on its own thread and the timer thread raises the APU's, and both ISRs
+ * queue here. Unlocked, two inserts at once took the same slot and one DPC
+ * was lost. Losing the USB one leaves the controller's interrupts masked
+ * for good (its ISR masks them and the DPC re-enables them), so the pad
+ * went silent -- in Amped 2 as soon as the audio got busy, at level load. */
+static SRWLOCK g_dpc_lock = SRWLOCK_INIT;
 
 static void bridge_KeInsertQueueDpc(void)
 {
@@ -2052,18 +2059,29 @@ static void bridge_KeInsertQueueDpc(void)
 
     if (!dpc) { g_eax = 0; return; }
 
+    AcquireSRWLockExclusive(&g_dpc_lock);
+    /* KDPC.Inserted (byte 2): a DPC already in the queue is not queued
+     * again, and the call says so -- as the real kernel does. */
+    if (BRIDGE_MEM8(dpc + 2)) {
+        ReleaseSRWLockExclusive(&g_dpc_lock);
+        g_eax = 0;
+        return;
+    }
     tail = g_dpc_tail;
     next = (tail + 1) % XBOX_MAX_PENDING_DPC;
     if (next == g_dpc_head) {
+        ReleaseSRWLockExclusive(&g_dpc_lock);
         fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
         fflush(stderr);
         g_eax = 0;
         return;
     }
+    BRIDGE_MEM8(dpc + 2) = 1;
     g_dpc_queue[tail].dpc  = dpc;
     g_dpc_queue[tail].arg1 = arg1;
     g_dpc_queue[tail].arg2 = arg2;
     g_dpc_tail = next;
+    ReleaseSRWLockExclusive(&g_dpc_lock);
     g_eax = 1;
 }
 
@@ -2187,10 +2205,19 @@ static void kernel_vblank_tick(void)
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
 {
-    while (g_dpc_head != g_dpc_tail) {
-        LONG head = g_dpc_head;
-        PendingDpc d = g_dpc_queue[head];
-        g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
+    for (;;) {
+        PendingDpc d;
+        AcquireSRWLockExclusive(&g_dpc_lock);
+        if (g_dpc_head == g_dpc_tail) {
+            ReleaseSRWLockExclusive(&g_dpc_lock);
+            break;
+        }
+        d = g_dpc_queue[g_dpc_head];
+        g_dpc_head = (g_dpc_head + 1) % XBOX_MAX_PENDING_DPC;
+        /* Out of the queue before it runs: the routine may queue itself. */
+        if (d.dpc)
+            BRIDGE_MEM8(d.dpc + 2) = 0;
+        ReleaseSRWLockExclusive(&g_dpc_lock);
         kernel_run_dpc(d.dpc, d.arg1, d.arg2);
     }
 }

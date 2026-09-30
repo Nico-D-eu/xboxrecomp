@@ -534,7 +534,11 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             g_setup_pending = 1;
             g_ctrl_len = -1;   /* answered lazily on the first IN */
             g_ctrl_sent = 0;
-            if (s_trace) {
+            static int setup_diag = -1;
+            static unsigned setups;
+            if (setup_diag < 0)
+                setup_diag = getenv("RECOMP_INPUT_DIAG") != NULL;
+            if (s_trace || (setup_diag && setups++ < 400)) {
                 fprintf(stderr, "  [OHCI%d] SETUP %02X %02X value %04X "
                                 "index %04X len %u\n",
                         hc->index, g_setup.bmRequestType, g_setup.bRequest,
@@ -674,15 +678,13 @@ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
     hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
 }
 
-static int ohci_run_control_list(OhciController *hc)
+/* The list walkers add what they finish to *done_head and leave publishing
+ * to the caller, so one tick's completions from every list go out as one
+ * done list -- see the frame loop in ohci_thread. */
+static int ohci_run_control_list(OhciController *hc, uint32_t *done_head)
 {
-    uint32_t done_head = 0;
-    int completed = ohci_walk_eds(hc,
-            hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, &done_head);
-
-    if (completed)
-        ohci_publish_done(hc, done_head);
-    return completed;
+    return ohci_walk_eds(hc, hc->reg[HcControlHeadED / 4] & ED_PTR_MASK,
+                         done_head);
 }
 
 /* The periodic list for the current frame.
@@ -691,10 +693,9 @@ static int ohci_run_control_list(OhciController *hc)
  * services the one the frame number selects. An interrupt endpoint polled
  * every 4 ms appears in several slots, so cycling through them the way the
  * frame counter does is what makes its transfers happen at all. */
-static int ohci_run_periodic_list(OhciController *hc)
+static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
 {
     uint32_t hcca = hc->reg[HcHCCA / 4];
-    uint32_t done_head = 0;
     uint32_t slot, ed;
     int completed;
 
@@ -723,10 +724,8 @@ static int ohci_run_periodic_list(OhciController *hc)
                     "info=%08X\n", hc->index, slot, ed, rd32(ed));
             fflush(stderr);
         }
-        completed += ohci_walk_eds(hc, ed, &done_head);
+        completed += ohci_walk_eds(hc, ed, done_head);
     }
-    if (completed)
-        ohci_publish_done(hc, done_head);
     return completed;
 }
 
@@ -797,8 +796,16 @@ static int ohci_call_isr(OhciController *hc)
  * controller that interrupts through either of those while they are clear is
  * a controller the driver has every right to be confused by.
  */
+static unsigned long s_raised, s_held;     /* RECOMP_INPUT_DIAG */
+static unsigned long s_raised_bit[8];
+
 static void ohci_raise(OhciController *hc, uint32_t source)
 {
+    int b;
+    s_raised++;
+    for (b = 0; b < 8; b++)
+        if (source & (1u << b))
+            s_raised_bit[b]++;
     uint32_t enable = hc->reg[HcInterruptEnable / 4];
     int claimed;
 
@@ -926,8 +933,61 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     for (;;) {
         OhciController *hc = &s_hc[s_device_hc];
         uint32_t control, enable, status;
+        uint32_t done_all;
+        int done_any;
 
         Sleep(OHCI_TICK_MS);
+        {
+            /* RECOMP_INPUT_DIAG: how often the title fetched the pad and how
+             * often we interrupted it, every 5 s. The pad should report every
+             * few milliseconds. */
+            static int diag = -1;
+            static DWORD t0;
+            static unsigned long last_rep, last_raised, last_held;
+            extern unsigned long s_reports;
+            if (diag < 0)
+                diag = getenv("RECOMP_INPUT_DIAG") != NULL;
+            if (diag && GetTickCount() - t0 >= 5000) {
+                t0 = GetTickCount();
+                fprintf(stderr, "  [USB] last 5 s: %lu pad reports, %lu interrupts raised, "
+                        "%lu ticks held off by IRQL; WDH pending %d\n",
+                        s_reports - last_rep, s_raised - last_raised, s_held - last_held,
+                        (hc->reg[HcInterruptStatus / 4] & INTR_WDH) ? 1 : 0);
+                last_rep = s_reports;
+                last_raised = s_raised;
+                last_held = s_held;
+                {
+                    /* Every distinct ED on the interrupt table, with its
+                     * skip and halt bits and whether a TD is queued. */
+                    uint32_t hcca = hc->reg[HcHCCA / 4], seen[16];
+                    int nseen = 0, k, slot;
+                    fprintf(stderr, "  [USB]   raised by bit (SO WDH SF RD UE FNO RHSC OC): "
+                            "%lu %lu %lu %lu %lu %lu %lu %lu; port1 %08X enable %08X\n",
+                            s_raised_bit[0], s_raised_bit[1], s_raised_bit[2], s_raised_bit[3],
+                            s_raised_bit[4], s_raised_bit[5], s_raised_bit[6], s_raised_bit[7],
+                            hc->reg[HcRhPortStatus1 / 4], hc->reg[HcInterruptEnable / 4]);
+                    fprintf(stderr, "  [USB]   HcControl %08X EDs:", hc->reg[HcControl / 4]);
+                    for (slot = 0; hcca && slot < 32; slot++) {
+                        uint32_t ed = rd32(hcca + slot * 4u) & ED_PTR_MASK;
+                        int guard = 0;
+                        while (ed && guest_ok(ed, 16) && guard++ < 8) {
+                            for (k = 0; k < nseen && seen[k] != ed; k++) ;
+                            if (k == nseen && nseen < 16) {
+                                uint32_t info = rd32(ed), head = rd32(ed + 8), tail = rd32(ed + 4);
+                                seen[nseen++] = ed;
+                                fprintf(stderr, " [%08X info %08X%s head %08X%s tail %08X%s]",
+                                        ed, info, (info & ED_SKIP) ? " SKIP" : "",
+                                        head, (head & ED_HEAD_HALT) ? " HALT" : "",
+                                        tail & ED_PTR_MASK,
+                                        ((head & ED_PTR_MASK) != (tail & ED_PTR_MASK)) ? " queued" : " empty");
+                            }
+                            ed = rd32(ed + 12) & ED_PTR_MASK;
+                        }
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 
@@ -1011,6 +1071,19 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (hc->reg[HcInterruptStatus / 4] & INTR_WDH)
             goto deliver;
 
+        /* One done list per acknowledgement, across all three lists.
+         *
+         * Each list used to publish what it finished on its own, and the
+         * WDH check above guarded only the start of the tick: the periodic
+         * list published a pad report, the control list then published its
+         * own list over it, and that report's completion was gone. The
+         * driver waits for it and never polls again. In Amped 2 that began
+         * in game, where the title sends rumble (SET_REPORT on endpoint 0)
+         * alongside the reports, and the pad went dead a few seconds into
+         * every level. Now every list adds to one chain, published once. */
+        done_all = 0;
+        done_any = 0;
+
         /* PeriodicListEnable, bit 2 of HcControl. */
         if (control & 0x04u) {
             if (!hc->ple_seen) {
@@ -1020,7 +1093,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                         hc->index, control, hc->reg[HcHCCA / 4]);
                 fflush(stderr);
             }
-            ohci_run_periodic_list(hc);
+            done_any += ohci_run_periodic_list(hc, &done_all);
         }
 
         /* BulkListEnable, bit 5. Nothing on this device uses bulk, but the
@@ -1028,19 +1101,25 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * there is owed the same service. */
         if ((control & 0x20u)
          && guest_ok(hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK, 16)) {
-            uint32_t done_head = 0;
-            if (ohci_walk_eds(hc, hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK,
-                              &done_head)) {
-                ohci_publish_done(hc, done_head);
+            int n = ohci_walk_eds(hc, hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK,
+                                  &done_all);
+            if (n) {
+                done_any += n;
                 hc->reg[HcCommandStatus / 4] &= ~0x04u;   /* BLF consumed */
             }
         }
 
         if ((control & 0x10u)
          && guest_ok(hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, 16)) {
-            if (ohci_run_control_list(hc))
+            int n = ohci_run_control_list(hc, &done_all);
+            if (n) {
+                done_any += n;
                 hc->reg[HcCommandStatus / 4] &= ~0x02u;   /* CLF consumed */
+            }
         }
+
+        if (done_any)
+            ohci_publish_done(hc, done_all);
 
         /* Level-triggered, which is what OHCI is: while an enabled source is
          * set, the line is asserted. The handler clears the status bit, so
@@ -1062,6 +1141,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * guest's critical section; the pathological case costs a delay
          * instead of the device. */
         if (xbox_IrqlBlocksInterrupts() && ++held_off <= OHCI_IRQ_HOLDOFF) {
+            s_held++;
             if (!held_off_warned) {
                 held_off_warned = 1;
                 fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "

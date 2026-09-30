@@ -400,10 +400,13 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
     static int all;
     uint32_t va;
 
+    static int crt;
     if (enabled < 0) {
         const char *v = getenv("RECOMP_CS_TRACE_CRT");
-        enabled = v != NULL;
+        crt = v != NULL;
         all = v && !strcmp(v, "all");
+        /* RECOMP_CS_WATCH works on its own, without the CRT-lock lines. */
+        enabled = crt || getenv("RECOMP_CS_WATCH") != NULL;
     }
     if (!enabled)
         return;
@@ -434,6 +437,8 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
         }
     }
 
+    if (!crt)
+        return;
     if (all) {
         fprintf(stderr, "  [CSTRACE] t%-6lu %-4s 0x%08X idx %d\n",
                 GetCurrentThreadId(), what, va, idx);
