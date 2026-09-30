@@ -781,7 +781,39 @@ typedef struct {
     ID3D11RenderTargetView *rtv;
     ID3D11ShaderResourceView *srv;
     uint32_t drawn_frame;
+    /* A sampled signature of the guest memory under the surface when it was
+     * last drawn. Rendering never writes guest memory here, so while that
+     * memory is unchanged nothing else has claimed the address, and the
+     * surface is still what a texture there means -- however many frames
+     * ago it was drawn. */
+    uint64_t mem_sig;
+    uint32_t sig_frame;
 } RtEntry;
+
+static uint64_t rt_mem_sig(const RtEntry *e)
+{
+    const uint8_t *g = (const uint8_t *)xbox_GetMemoryOffset();
+    uint64_t h = 0xCBF29CE484222325ull;
+    uint32_t bytes = e->w * e->h * 4u, step, off;
+    step = bytes / 256u;
+    if (step < 4)
+        step = 4;
+    step &= ~3u;
+    for (off = 0; off < bytes; off += step) {
+        h ^= *(const uint32_t *)(g + e->va + off);
+        h *= 0x100000001B3ull;
+    }
+    return h;
+}
+
+/* Is the surface at src still what the title samples there? Drawn in the
+ * last two frames, or the memory under it unchanged since it was. */
+static int rt_still_current(RtEntry *src, uint32_t frame)
+{
+    if (src->drawn_frame + 2 >= frame)
+        return 1;
+    return src->sig_frame && rt_mem_sig(src) == src->mem_sig;
+}
 
 typedef struct {
     uint32_t va, w, h;
@@ -960,6 +992,7 @@ typedef struct {
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
     int bad;
+    int cube;               /* six faces, each its own mip chain */
 } TexEntry;
 
 #define TEX_SLOTS 4096
@@ -996,9 +1029,21 @@ static int tex_upload(TexEntry *e, const Nv2aHwTexture *t, int create)
     uint32_t bb = dxt_block(t->color);
     int linear = !d3d8_format_is_swizzled(t->color) && !bb;
     int bc = bb && (e->w % 4 == 0) && (e->h % 4 == 0);
-    uint32_t lv, w = e->w, h = e->h, off = 0;
+    uint32_t lv, w = e->w, h = e->h, off = 0, face, faces = e->cube ? 6 : 1;
+    uint32_t face_stride = 0;
     static uint32_t *scratch;
     static size_t scratch_n;
+
+    /* A cube map is six faces in a row, each a full mip chain, each face
+     * starting on a 128-byte boundary. */
+    for (lv = 0; lv < e->levels; lv++) {
+        face_stride += level_bytes(t->color, w, h, t->pitch, linear);
+        if (w > 1) w >>= 1;
+        if (h > 1) h >>= 1;
+    }
+    face_stride = (face_stride + 127u) & ~127u;
+    w = e->w;
+    h = e->h;
 
     if (create) {
         D3D11_TEXTURE2D_DESC td;
@@ -1006,7 +1051,9 @@ static int tex_upload(TexEntry *e, const Nv2aHwTexture *t, int create)
         td.Width = e->w;
         td.Height = e->h;
         td.MipLevels = e->levels;
-        td.ArraySize = 1;
+        td.ArraySize = faces;
+        if (e->cube)
+            td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
         td.Format = bc ? (bb == 8 ? DXGI_FORMAT_BC1_UNORM
                                   : (t->color == 0x0E ? DXGI_FORMAT_BC2_UNORM
                                                       : DXGI_FORMAT_BC3_UNORM))
@@ -1016,14 +1063,29 @@ static int tex_upload(TexEntry *e, const Nv2aHwTexture *t, int create)
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &e->tex)))
             return 0;
-        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex,
-                                              NULL, &e->srv);
+        if (e->cube) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC vd;
+            memset(&vd, 0, sizeof vd);
+            vd.Format = td.Format;
+            vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+            vd.TextureCube.MipLevels = e->levels;
+            ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex,
+                                                  &vd, &e->srv);
+        } else {
+            ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex,
+                                                  NULL, &e->srv);
+        }
     }
+    for (face = 0; face < faces; face++) {
+    w = e->w;
+    h = e->h;
+    off = face * face_stride;
     for (lv = 0; lv < e->levels; lv++) {
         uint32_t lb = level_bytes(t->color, w, h, t->pitch, linear);
+        uint32_t sub = lv + face * e->levels;
         if (bc) {
             ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex,
-                    lv, NULL, src + off, ((w + 3) / 4) * bb, 0);
+                    sub, NULL, src + off, ((w + 3) / 4) * bb, 0);
         } else {
             size_t need = (size_t)w * h;
             if (need > scratch_n) {
@@ -1037,11 +1099,12 @@ static int tex_upload(TexEntry *e, const Nv2aHwTexture *t, int create)
                                       linear ? t->pitch : 0, scratch))
                 return 0;
             ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex,
-                    lv, NULL, scratch, w * 4, 0);
+                    sub, NULL, scratch, w * 4, 0);
         }
         off += lb;
         if (w > 1) w >>= 1;
         if (h > 1) h >>= 1;
+    }
     }
     s_st.tex_uploads++;
     return 1;
@@ -1055,6 +1118,7 @@ static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w
     uint32_t w = t->width, h = t->height, levels = 1, bytes = 0, lv, lw, lh;
     uint32_t rect = (t->width << 16) | (t->height & 0xFFFFu);
     uint32_t at, i;
+    int cube;
     TexEntry *e = NULL, *victim = NULL;
 
     if (swz) {
@@ -1080,6 +1144,10 @@ static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w
         lw = lw > 1 ? lw >> 1 : 1;
         lh = lh > 1 ? lh >> 1 : 1;
     }
+    /* SET_TEXTURE_FORMAT bit 2: a cube map, six square faces. */
+    cube = (t->format & 4u) && swz && w == h;
+    if (cube)
+        bytes = ((bytes + 127u) & ~127u) * 6u;
 
     at = (t->va * 2654435761u ^ t->format * 40503u) & (TEX_SLOTS - 1);
     for (i = 0; i < 16; i++) {
@@ -1100,7 +1168,7 @@ static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w
         tex_release(victim);
         e = victim;
         e->va = t->va; e->format = t->format; e->pitch = t->pitch; e->rect = rect;
-        e->w = w; e->h = h; e->levels = levels; e->bytes = bytes;
+        e->w = w; e->h = h; e->levels = levels; e->bytes = bytes; e->cube = cube;
         e->hash = hash64(guest() + t->va, bytes, 7);
         e->shash = hash_sparse(guest() + t->va, bytes);
         e->hashed_frame = e->full_frame = s_frame;
@@ -1690,7 +1758,7 @@ static void do_draw(const Nv2aHwDraw *d)
         psd.atest[3] = (uint32_t)dbg;
     }
     {
-        ID3D11ShaderResourceView *srv[4] = { NULL, NULL, NULL, NULL };
+        ID3D11ShaderResourceView *srv[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
         ID3D11SamplerState *smp[4] = { NULL, NULL, NULL, NULL };
         for (i = 0; i < 4; i++) {
             const Nv2aHwTexture *t = &d->tex[i];
@@ -1703,7 +1771,18 @@ static void do_draw(const Nv2aHwDraw *d)
             /* A surface drawn this frame or the last, at this address: the
              * title is sampling what it rendered. */
             src_rt = rt_find(t->va);
-            if (src_rt && src_rt != rt && src_rt->drawn_frame + 2 >= s_frame) {
+            if (src_rt && src_rt != rt && !rt_still_current(src_rt, s_frame)) {
+                static int said;
+                if (said < 12 && getenv("RECOMP_RT_TRACE")) {
+                    said++;
+                    fprintf(stderr, "  [D3D11] texture %08X %ux%u fmt %02X is surface %ux%u drawn %u"
+                            " frames ago, memory %s -- sampling guest memory instead\n",
+                            t->va, t->width, t->height, t->color, src_rt->w, src_rt->h,
+                            s_frame - src_rt->drawn_frame,
+                            src_rt->sig_frame ? "changed" : "never signed");
+                }
+            }
+            if (src_rt && src_rt != rt && rt_still_current(src_rt, s_frame)) {
                 srv[i] = src_rt->srv;
                 tw = src_rt->w;
                 th = src_rt->h;
@@ -1715,6 +1794,11 @@ static void do_draw(const Nv2aHwDraw *d)
                 srv[i] = tex_srv(t, &tw, &th, &lv);
                 if (!srv[i])
                     continue;
+                if ((t->format & 4u) && t->width == t->height
+                        && (d3d8_format_is_swizzled(t->color) || dxt_block(t->color))) {
+                    srv[4 + i] = srv[i];          /* TextureCube cx<i> */
+                    srv[i] = NULL;
+                }
                 psd.tsc[i][0] = norm ? 1.0f : 1.0f / (float)tw;
                 psd.tsc[i][1] = norm ? 1.0f : 1.0f / (float)th;
             }
@@ -1725,7 +1809,7 @@ static void do_draw(const Nv2aHwDraw *d)
             psd.tsc[i][3] = 1.0f;
             smp[i] = sampler(t, lv);
         }
-        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srv);
         ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
     }
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_psc, 0,
@@ -1770,8 +1854,13 @@ static void do_draw(const Nv2aHwDraw *d)
     ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, ib_at / 4, 0);
     s_st.draws++;
     s_st.tris += nidx / 3;
-    if (rt)
+    if (rt) {
         rt->drawn_frame = s_frame;
+        if (rt->sig_frame != s_frame) {       /* once a frame per surface */
+            rt->sig_frame = s_frame;
+            rt->mem_sig = rt_mem_sig(rt);
+        }
+    }
     QueryPerformanceCounter(&t_out);
     s_st.draw_ticks += (uint64_t)(t_out.QuadPart - t_in.QuadPart);
 }

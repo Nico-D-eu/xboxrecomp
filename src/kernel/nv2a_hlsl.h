@@ -62,6 +62,7 @@ typedef struct {
     uint32_t count;                  /* stages in use, 0..8             */
     uint32_t control;                /* mux-msb and unique-constant bits */
     uint32_t stage_program;
+    uint32_t other_stage_input, dot_mapping;   /* for the dot-product modes */
     uint32_t color_icw[8], color_ocw[8], alpha_icw[8], alpha_ocw[8];
     uint32_t final_cw0, final_cw1;
 } Nv2aHlslPsKey;

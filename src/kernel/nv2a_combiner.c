@@ -62,6 +62,7 @@ static int comb_method(Nv2aCombiner *c, uint32_t method, uint32_t param)
     case 0x1E60: c->control = param; c->programmed = 1; return 1;
     case 0x1E70: c->stage_program = param; return 1;
     case 0x1E78: c->other_stage_input = param; return 1;
+    case 0x1E74: c->dot_mapping = param; return 1;
     default: return 0;
     }
 }

@@ -370,6 +370,8 @@ void nv2a_hlsl_ps_key(const Nv2aCombiner *c, Nv2aHlslPsKey *key)
     memset(key, 0, sizeof *key);
     key->programmed = (uint32_t)c->programmed;
     key->stage_program = c->stage_program;
+    key->other_stage_input = c->other_stage_input;
+    key->dot_mapping = c->dot_mapping;
     if (!c->programmed)
         return;
     key->count = c->control & 0xFFu;
@@ -506,6 +508,13 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
 
     sb(&s, "Texture2D tx0 : register(t0); Texture2D tx1 : register(t1);\n"
            "Texture2D tx2 : register(t2); Texture2D tx3 : register(t3);\n"
+           "TextureCube cx0 : register(t4); TextureCube cx1 : register(t5);\n"
+           "TextureCube cx2 : register(t6); TextureCube cx3 : register(t7);\n"
+           /* The dot mappings (PS_DOTMAPPING): how a texel becomes a vector. */
+           "float3 dm_unsigned(float3 c) { return c; }\n"
+           "float3 dm_d3d(float3 c) { float3 t = floor(c * 255.0 + 0.5);\n"
+           "  t = t >= 128.0 ? t - 256.0 : t; return clamp(t / 127.0, -1.0, 1.0); }\n"
+           "float3 dm_gl(float3 c) { return c * 2.0 - 1.0; }\n"
            "SamplerState s0 : register(s0); SamplerState s1 : register(s1);\n"
            "SamplerState s2 : register(s2); SamplerState s3 : register(s3);\n"
            "cbuffer PSC : register(b0) {\n"
@@ -533,8 +542,17 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
 
     /* The texture stages, before anything that could discard, so every
      * sample has its derivatives. */
+    sb(&s, "  float dot1 = 0.0, dot2 = 0.0;\n");
     for (st = 0; st < 4; st++) {
         uint32_t mode = (k->stage_program >> (5 * st)) & 0x1Fu;
+        /* The dot-product modes read another stage's texel as a vector
+         * (PS_INPUTTEXTURE: the input for stage n in bits 16+4(n-1)) through
+         * that stage's dot mapping (PS_DOTMAPPING: bits 4(n-1)). */
+        uint32_t in_st = st ? (k->other_stage_input >> (16 + 4 * (st - 1))) & 0xFu : 0;
+        uint32_t map = st ? (k->dot_mapping >> (4 * (st - 1))) & 0x7u : 0;
+        const char *dm = map == 0 ? "dm_unsigned" : map == 1 ? "dm_d3d" : "dm_gl";
+        if (in_st >= st)
+            in_st = st ? st - 1 : 0;
         if (!k->programmed && st > 0)
             break;
         if (!k->programmed)
@@ -542,10 +560,44 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
         switch (mode) {
         case NV2A_TEXMODE_NONE:
             break;
+        case NV2A_TEXMODE_CUBE:
+            sb(&s, "  t%d = cx%d.Sample(s%d, i.t%d.xyz);\n", st, st, st, st);
+            sb(&s, "  if (tsc[%d].w == 0.0) t%d = 0;\n", st, st);
+            break;
+        case 0x11:                                   /* DOT_PRODUCT */
+            sb(&s, "  dot%d = dot(i.t%d.xyz, %s(t%u.rgb));\n", st == 1 ? 1 : 2, st, dm, in_st);
+            break;
+        case 0x09:                                   /* DOT_ST */
+            sb(&s, "  t%d = tx%d.Sample(s%d, float2(dot1, dot(i.t%d.xyz, %s(t%u.rgb))) * tsc[%d].xy);\n",
+               st, st, st, st, dm, in_st, st);
+            break;
+        case 0x0B:                                   /* DOT_RFLCT_DIFF */
+        case 0x0C:                                   /* DOT_RFLCT_SPEC */
+        case 0x0E:                                   /* DOT_STR_CUBE */
+        case 0x12: {                                 /* DOT_RFLCT_SPEC_CONST */
+            /* The normal from the three dot products; for stage 2 (diffuse)
+             * the third comes from stage 3's coordinates, as on hardware. */
+            if (mode == 0x0B)
+                sb(&s, "  { float3 n = float3(dot1, dot(i.t%d.xyz, %s(t%u.rgb)), dot(i.t3.xyz, %s(t%u.rgb)));\n",
+                   st, dm, in_st, dm, in_st);
+            else
+                sb(&s, "  { float3 n = float3(dot1, dot2, dot(i.t%d.xyz, %s(t%u.rgb)));\n",
+                   st, dm, in_st);
+            if (mode == 0x0C)
+                sb(&s, "    float3 e = float3(i.t1.w, i.t2.w, i.t3.w);\n"
+                       "    float3 r = 2.0 * n * dot(n, e) / max(dot(n, n), 1e-8) - e;\n");
+            else if (mode == 0x12)
+                sb(&s, "    float3 e = float3(0.0, 0.0, 1.0);\n"
+                       "    float3 r = 2.0 * n * dot(n, e) / max(dot(n, n), 1e-8) - e;\n");
+            else
+                sb(&s, "    float3 r = n;\n");
+            sb(&s, "    t%d = cx%d.Sample(s%d, r); }\n", st, st, st);
+            sb(&s, "  if (tsc[%d].w == 0.0) t%d = 0;\n", st, st);
+            break;
+        }
         case NV2A_TEXMODE_2D_PROJECTIVE:
-        case NV2A_TEXMODE_3D_PROJECTIVE:
-        case NV2A_TEXMODE_CUBE: {
-            int proj = mode != NV2A_TEXMODE_CUBE;
+        case NV2A_TEXMODE_3D_PROJECTIVE: {
+            int proj = 1;
             sb(&s, "  {\n    float4 tc = i.t%d;\n", st);
             if (proj)
                 sb(&s, "    float q = (tc.w != 0.0) ? tc.w : 1.0;\n");

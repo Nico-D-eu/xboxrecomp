@@ -26,7 +26,8 @@ typedef struct {
     uint32_t final_factor0, final_factor1;
     uint32_t control;             /* SET_COMBINER_CONTROL */
     uint32_t stage_program;       /* SET_SHADER_STAGE_PROGRAM */
-    uint32_t other_stage_input;
+    uint32_t other_stage_input;   /* SET_SHADER_OTHER_STAGE_INPUT */
+    uint32_t dot_mapping;         /* SET_DOT_RGBMAPPING */
     uint32_t fog_color;           /* ARGB */
     int      programmed;          /* COMBINER_CONTROL has been written */
     uint32_t gen;                 /* bumped by every combiner method */
