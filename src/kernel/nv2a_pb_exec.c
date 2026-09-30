@@ -133,6 +133,18 @@ static uint32_t dma_resolve(uint32_t offset)
      * black straight through the guest heap -- which faulted the title three
      * frames later on a pointer that had been overwritten, while the real
      * framebuffer at 0x80A6C000 stayed untouched and the screen stayed black. */
+    /* RECOMP_GPU_LOWRAM_PAGES=1: a page MmGetPhysicalAddress handed out from
+     * ordinary memory is low RAM (see g_xbox_phys_lowram). Opt-in: D3D
+     * computes its own contiguous addresses without that call, so a page
+     * DirectSound registered can collide with a texture in the window. */
+    {
+        static int on = -1;
+        extern volatile uint8_t g_xbox_phys_lowram[];
+        if (on < 0)
+            on = getenv("RECOMP_GPU_LOWRAM_PAGES") != NULL;
+        if (on && offset < 0x04000000u && g_xbox_phys_lowram[offset >> 12])
+            return offset;
+    }
     if (offset < xbox_ContiguousAllocatedBytes())
         return XBOX_CONTIG_BASE + offset;
     if (!surface_hits_image(offset, 1))

@@ -2005,6 +2005,57 @@ static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
     return 1;
 }
 
+/* RECOMP_GPU_SHOT=<prefix>: the presented frame as <prefix>NNNN.bmp every
+ * RECOMP_GPU_SHOT_MS (default 1000) -- the title's own picture, whatever
+ * window is in front of it. A blocking readback, so a hitch per shot. */
+static void gpu_shot(RtEntry *rt)
+{
+    static const char *prefix = (const char *)1;
+    static DWORD last, every;
+    static unsigned seq;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11Texture2D *st = NULL;
+    char path[300];
+    FILE *f;
+    uint32_t x, y, w = rt->w, h = rt->h, row = w * 3, pad = (4 - row % 4) % 4;
+
+    if (prefix == (const char *)1) {
+        const char *e = getenv("RECOMP_GPU_SHOT_MS");
+        prefix = getenv("RECOMP_GPU_SHOT");
+        every = e ? (DWORD)atoi(e) : 1000;
+    }
+    if (!prefix || GetTickCount() - last < every)
+        return;
+    last = GetTickCount();
+    memset(&td, 0, sizeof td);
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_STAGING; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
+        return;
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)rt->tex);
+    snprintf(path, sizeof path, "%s%04u.bmp", prefix, seq++);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))
+            && (f = fopen(path, "wb")) != NULL) {
+        uint8_t hdr[54] = { 'B', 'M' };
+        uint32_t size = 54 + (row + pad) * h;
+        memcpy(hdr + 2, &size, 4); hdr[10] = 54; hdr[14] = 40;
+        memcpy(hdr + 18, &w, 4); memcpy(hdr + 22, &h, 4); hdr[26] = 1; hdr[28] = 24;
+        fwrite(hdr, 1, 54, f);
+        for (y = h; y-- > 0; ) {
+            const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
+            uint8_t zero[3] = { 0 };
+            for (x = 0; x < w; x++)
+                fwrite(src + x * 4, 1, 3, f);
+            fwrite(zero, 1, pad, f);
+        }
+        fclose(f);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+    }
+    ID3D11Texture2D_Release(st);
+}
+
 static void do_flip(uint32_t color_va)
 {
     RtEntry *rt = rt_find(color_va);
@@ -2013,6 +2064,7 @@ static void do_flip(uint32_t color_va)
     s_frame++;
     if (!rt)
         return;
+    gpu_shot(rt);
     {
         static int dumps = -1;
         if (dumps < 0)
