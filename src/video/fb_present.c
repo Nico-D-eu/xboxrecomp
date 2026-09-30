@@ -148,7 +148,19 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     switch (m) {
     case WM_CLOSE:
     case WM_DESTROY:
+        /* Closing the window is quitting the game. Clearing s_fb_running
+         * alone left the title running with no window -- a process only the
+         * task manager could end. There is nothing to shut down in order:
+         * the title saves as it goes, as a console that is switched off
+         * would. Flush the host's buffered log first. */
         InterlockedExchange(&s_fb_running, 0);
+        {
+            extern void (*g_xbox_flush_logs)(void);
+            fprintf(stderr, "  [WINDOW] closed -- exiting\n");
+            if (g_xbox_flush_logs)
+                g_xbox_flush_logs();
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
         return 0;
 
     case WM_KEYDOWN:
