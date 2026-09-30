@@ -2267,6 +2267,21 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
+        # A block nothing reaches -- alignment padding after an unconditional
+        # jmp, `lea esi, [esi]` -- still falls through into the next one, and
+        # as a predecessor with no flag state it made that join give up (the
+        # jne at Amped 2 0x00274D34 compiled as never taken). Unreachable
+        # means: no predecessor, not the entry, and not a label anything could
+        # jump to (which covers jump tables and address-taken code).
+        while True:
+            dead = {bb.start for bb in blocks
+                    if not preds[bb.start] and bb.start != start
+                    and bb.start not in label_addrs}
+            if not any(preds[b.start] & dead for b in blocks):
+                break
+            for b in blocks:
+                preds[b.start] -= dead
+
         # Settle the flag state before emitting anything.
         #
         # Blocks are walked in address order, so the predecessor on a back

@@ -99,3 +99,12 @@ def test_sbb_signed_relations_use_the_exact_result():
     assert '_flags /* jg' not in code, code
     assert '(_fbs > 0)' in code, code
     assert '_fbs = (_e > 0) - (_e < 0)' in code, code
+
+
+def test_unreachable_padding_is_not_a_predecessor():
+    # 0x00274D10 shape: cmp edi,ecx; jge join; xor eax,eax; jmp out;
+    # pad: lea esi,[esi] (falls into join, reached by nothing); join: jne out;
+    # xor edi,edi; out: ret
+    code = _translate(bytes.fromhex('39cf' '7d06' '31c0' 'eb08' '8d36' '8d3f'
+                                    '7502' '31ff' 'c3'))
+    assert '_flags /* jne' not in code, code
