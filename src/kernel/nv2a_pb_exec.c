@@ -3028,6 +3028,84 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
     }
+    /* The last methods, so a state write that makes no sense can be shown in
+     * context: a depth function outside 0x200..0x207 (seen in play as
+     * 0xBC2F3242 -- a float) means the stream was misread before it. */
+    {
+        static struct { uint32_t subch, method, param; } ring[24];
+        static unsigned pos, reported;
+        ring[pos % 24].subch = subch;
+        ring[pos % 24].method = method;
+        ring[pos % 24].param = param;
+        pos++;
+        if (method == 0x0354 && (param < 0x200 || param > 0x207) && reported < 6) {
+            unsigned k;
+            reported++;
+            extern uint32_t g_pb_hdr_va, g_pb_hdr, g_pb_hdr_where, g_pb_hdr_from;
+            extern void *xbox_GetMemoryBase(void);
+            const uint32_t *win = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset()
+                                                     + g_pb_hdr_va);
+            const uint32_t *low = (const uint32_t *)((const uint8_t *)xbox_GetMemoryBase()
+                                                     + (g_pb_hdr_va & 0x03FFFFFFu));
+            fprintf(stderr, "  [GPU] bad SET_DEPTH_FUNC 0x%08X; header 0x%08X at 0x%08X (%s, from 0x%08X)\n",
+                    param, g_pb_hdr, g_pb_hdr_va,
+                    g_pb_hdr_where == 2 ? "in a followed call" :
+                    g_pb_hdr_where == 1 ? "in a followed jump" : "in the ring", g_pb_hdr_from);
+            fprintf(stderr, "  [GPU]   window there: %08X %08X %08X %08X; low RAM there: %08X %08X %08X %08X\n",
+                    win[0], win[1], win[2], win[3], low[0], low[1], low[2], low[3]);
+            {
+                extern uint32_t g_pb_entry_src, g_pb_entry_word, g_pb_entry_target;
+                const uint32_t *ew = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset()
+                                                        + g_pb_entry_target);
+                const uint32_t *el = (const uint32_t *)((const uint8_t *)xbox_GetMemoryBase()
+                                                        + (g_pb_entry_target & 0x03FFFFFFu));
+                fprintf(stderr, "  [GPU]   entered via 0x%08X at 0x%08X -> 0x%08X; window there:"
+                        " %08X %08X %08X %08X; low RAM there: %08X %08X %08X %08X\n",
+                        g_pb_entry_word, g_pb_entry_src, g_pb_entry_target,
+                        ew[0], ew[1], ew[2], ew[3], el[0], el[1], el[2], el[3]);
+            }
+            {
+                extern uint32_t g_pb_entry_hist[32][2], g_pb_entry_hist_pos;
+                unsigned k;
+                fprintf(stderr, "  [GPU]   headers decoded before leaving the ring (oldest first):");
+                for (k = 0; k < 32; k++) {
+                    unsigned i = (g_pb_entry_hist_pos + k) % 32;
+                    fprintf(stderr, "%s%08X:%08X", (k % 4) ? " " : "\n  [GPU]     ",
+                            g_pb_entry_hist[i][0], g_pb_entry_hist[i][1]);
+                }
+                fprintf(stderr, "\n");
+            }
+            if (g_pb_hdr_from) {
+                /* How the followed buffer should have ended: its first
+                 * control-flow words after the target (headers skipped by
+                 * their counts). */
+                const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+                uint32_t va = g_pb_hdr_from, shown = 0, steps = 0;
+                while (va < g_pb_hdr_va && shown < 6 && steps++ < 200000) {
+                    uint32_t w = *(const uint32_t *)(mem + va);
+                    if ((w & 3u) == 1u || (w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u
+                            || (w & 0xE0000003u) == 0x20000000u) {
+                        fprintf(stderr, "  [GPU]   control word 0x%08X at 0x%08X\n", w, va);
+                        shown++;
+                        va += 4;
+                    } else if ((w & 0x00030003u) == 0u) {
+                        va += 4 + ((w >> 18) & 0x7FFu) * 4;
+                    } else {
+                        fprintf(stderr, "  [GPU]   unknown word 0x%08X at 0x%08X\n", w, va);
+                        shown++;
+                        va += 4;
+                    }
+                }
+            }
+            fprintf(stderr, "  [GPU] last methods (oldest first):\n");
+            for (k = 0; k < 24; k++) {
+                unsigned i = (pos + k) % 24;
+                fprintf(stderr, "  [GPU]   subch %u method 0x%04X = 0x%08X\n",
+                        ring[i].subch, ring[i].method, ring[i].param);
+            }
+            fflush(stderr);
+        }
+    }
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. */

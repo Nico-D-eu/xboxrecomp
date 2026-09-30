@@ -203,6 +203,16 @@ volatile long long g_nv2a_scan_ticks;
 
 static void pb_scan_body(uint32_t start_va, uint32_t end_va);
 
+/* The method header being executed and where the walk was (0 ring,
+ * 1 followed jump, 2 followed call, with that target), for reports. */
+uint32_t g_pb_hdr_va, g_pb_hdr, g_pb_hdr_where, g_pb_hdr_from;
+/* The walk's first jump or call out of the ring. */
+uint32_t g_pb_entry_src, g_pb_entry_word, g_pb_entry_target;
+/* The last 32 words the walker decoded as headers or control flow. */
+uint32_t g_pb_hist[32][2], g_pb_hist_pos;
+uint32_t g_pb_entry_hist[32][2], g_pb_entry_hist_pos;   /* as it was at the entry */
+static uint32_t g_pb_jump_target, g_pb_call_target;
+
 void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     LARGE_INTEGER a, b;
@@ -211,6 +221,23 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     QueryPerformanceCounter(&b);
     g_nv2a_scan_ticks += b.QuadPart - a.QuadPart;
 }
+
+/* A method whose data ran past the end of a segment.
+ *
+ * D3D may set PUT in the middle of a long command -- a batch of inline
+ * indices, say -- and the hardware simply waits for the rest. This walk ends
+ * each segment at PUT, and it used to drop the remaining count there, so the
+ * next segment began by decoding index pairs as headers: 0x00D100D0 is
+ * nothing, 0x00D200D1 reads as a jump and 0x00D200D2 as a call, and the
+ * walker went off through zeroed memory into texture data, where a word like
+ * 0xFF000000 sets 1984 consecutive methods from 0. In Amped 2 that was the
+ * in-game terrain drawn without ground and the other state garbage (a depth
+ * function of 0xBC2F3242). The unfinished method is kept here and finished
+ * first when the walk resumes where it stopped. */
+static struct {
+    int      active, noninc;
+    uint32_t subch, method, remaining, resume_va;
+} s_pend;
 
 static void pb_scan_body(uint32_t start_va, uint32_t end_va)
 {
@@ -238,6 +265,31 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
     int outside = 0, in_call = 0;
     uint32_t call_ret = 0, followed = 0;
 
+    if (s_pend.active) {
+        /* Only where it stopped; a segment starting anywhere else (a reset
+         * of the ring, a lost PUT) cannot be the rest of that method. */
+        if (s_pend.resume_va == va) {
+            while (s_pend.remaining && va < end_va) {
+                if (s_scan_on)
+                    note(s_pend.subch, s_pend.method);
+                if (s_exec_enabled)
+                    nv2a_pb_exec_method(s_pend.subch, s_pend.method,
+                                        *(const uint32_t *)(mem + va));
+                if (!s_pend.noninc)
+                    s_pend.method += 4;
+                s_pend.remaining--;
+                va += 4;
+                words++;
+            }
+            s_pend.resume_va = va;
+            if (s_pend.remaining) {           /* still more to come */
+                s_tot_words += words;
+                return;
+            }
+        }
+        s_pend.active = 0;
+    }
+
     for (;;) {
         uint32_t limit = (outside || in_call) ? XBOX_CONTIG_BASE + 0x04000000u : end_va;
         uint32_t w;
@@ -251,6 +303,9 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
                 pb_scan_get(0);
         }
         w = *(const uint32_t *)(mem + va);
+        g_pb_hist[g_pb_hist_pos % 32][0] = va;      /* control/header words */
+        g_pb_hist[g_pb_hist_pos % 32][1] = w;
+        g_pb_hist_pos++;
         va += 4;
         words++;
 
@@ -272,6 +327,10 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
                     break;                    /* not memory, or runaway */
                 outside = 1;
                 s_tot_followed++;
+                g_pb_jump_target = target;
+                g_pb_entry_src = va - 4; g_pb_entry_word = w; g_pb_entry_target = target;
+                memcpy(g_pb_entry_hist, g_pb_hist, sizeof g_pb_hist);
+                g_pb_entry_hist_pos = g_pb_hist_pos;
                 va = target;
                 continue;
             }
@@ -288,6 +347,12 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
                 in_call = 1;
                 call_ret = va;
                 s_tot_followed++;
+                g_pb_call_target = target;
+                if (!outside) {
+                    g_pb_entry_src = va - 4; g_pb_entry_word = w; g_pb_entry_target = target;
+                    memcpy(g_pb_entry_hist, g_pb_hist, sizeof g_pb_hist);
+                    g_pb_entry_hist_pos = g_pb_hist_pos;
+                }
                 va = target;
             }
             continue;
@@ -301,11 +366,16 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
         }
         if ((w & 0x00030003u) == 0u) {
             uint32_t count  = (w >> 18) & 0x7FFu;
+            g_pb_hdr_va = va - 4;             /* for the executor's reports */
+            g_pb_hdr = w;
+            g_pb_hdr_where = in_call ? 2 : outside ? 1 : 0;
+            g_pb_hdr_from = in_call ? g_pb_call_target : outside ? g_pb_jump_target : 0;
             uint32_t subch  = (w >> 13) & 7u;
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            for (uint32_t i = 0; i < count && va < limit; i++) {
+            uint32_t i;
+            for (i = 0; i < count && va < limit; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 /* The survey's table is a linear search per method word --
                  * half the executor thread's time once the GPU backend made
@@ -321,6 +391,14 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
                                         *(const uint32_t *)(mem + va));
                 va += 4;
                 words++;
+            }
+            if (i < count && !outside && !in_call) {
+                s_pend.active = 1;
+                s_pend.noninc = noninc;
+                s_pend.subch = subch;
+                s_pend.method = noninc ? method : method + i * 4;
+                s_pend.remaining = count - i;
+                s_pend.resume_va = va;
             }
             continue;
         }
