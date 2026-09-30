@@ -308,11 +308,24 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         if (stats && ++n % 938 == 0)            /* ~5 s of 256-sample frames */
             fprintf(stderr, "  [APU] voices on %u, off %u (%u by PIO), notifications %u; "
                     "ISTS %08X IEN %08X FENADDR %08X; %d frames/s (1500 is real "
-                    "time), %.0f%% busy; SECTL %08X FECTL %08X\n",
+                    "time), %.0f%% busy; SECTL %08X FECTL %08X; list tops 2D %04X 3D %04X MP %04X\n",
                     g_apu_stat_on, g_apu_stat_off, g_apu_stat_pio_off, g_apu_stat_notify,
                     d->regs[NV_PAPU_ISTS], d->regs[NV_PAPU_IEN], d->regs[NV_PAPU_FENADDR],
                     g_dbg.frames_processed, g_dbg.utilization * 100.0f,
-                    d->regs[NV_PAPU_SECTL], d->regs[NV_PAPU_FECTL]);
+                    d->regs[NV_PAPU_SECTL], d->regs[NV_PAPU_FECTL],
+                    d->regs[NV_PAPU_TVL2D] & 0xFFFF, d->regs[NV_PAPU_TVL3D] & 0xFFFF,
+                    d->regs[NV_PAPU_TVLMP] & 0xFFFF);
+        if (stats && n % 938 == 0 && (d->regs[NV_PAPU_TVL2D] & 0xFFFF) != 0xFFFF) {
+            /* The 2D list's first voice: format, state, offsets. */
+            hwaddr vb = d->regs[NV_PAPU_VPVADDR]
+                      + (d->regs[NV_PAPU_TVL2D] & 0xFFFF) * NV_PAVS_SIZE;
+            fprintf(stderr, "  [APU]   voice %04X: fmt %08X state %08X offset %08X next %08X\n",
+                    d->regs[NV_PAPU_TVL2D] & 0xFFFF,
+                    ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_CFG_FMT),
+                    ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_PAR_STATE),
+                    ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_PAR_OFFSET),
+                    ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_PAR_NEXT));
+        }
     }
 
     /* XAudio2 path: the guest's audio, then the host mixer on top.
