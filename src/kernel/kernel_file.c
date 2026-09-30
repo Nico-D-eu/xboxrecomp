@@ -652,7 +652,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         WCHAR* clean_path = dir_path;
         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
             clean_path += 4;
-        if (FileName && FileName->Buffer) {
+        /* An empty pattern (a buffer of length 0, which is how Amped 2 asks
+         * for everything in d:\Audio\Music) means "*": searching "dir\"
+         * found nothing, so the jukebox saw no genres and never played a
+         * song. */
+        if (FileName && FileName->Buffer && FileName->Length > 0) {
             WCHAR pattern_wide[MAX_PATH];
             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                 pattern_wide, MAX_PATH);

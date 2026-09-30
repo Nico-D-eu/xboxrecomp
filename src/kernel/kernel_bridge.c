@@ -3664,6 +3664,21 @@ static void bridge_NtQueryDirectoryFile(void)
                 XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
                 pfn, (BOOLEAN)restart);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
+    /* RECOMP_DIR_TRACE: each directory query, its pattern and result. */
+    {
+        static int trace = -1;
+        if (trace < 0)
+            trace = getenv("RECOMP_DIR_TRACE") != NULL;
+        if (trace)
+        {
+            PXBOX_FILE_DIRECTORY_INFORMATION e =
+                (PXBOX_FILE_DIRECTORY_INFORMATION)XBOX_TO_NATIVE(info_va);
+            int n = (g_eax == 0 && e) ? (int)e->FileNameLength : 0;
+            fprintf(stderr, "  [DIR] query class %u pattern '%.*s' restart %u -> 0x%08X '%.*s'\n",
+                    info_class, pfn ? (int)pfn->Length : 0, pfn ? pfn->Buffer : "",
+                    restart, g_eax, n > 60 ? 60 : n, n ? (const char *)e->FileName : "");
+        }
+    }
 }
 
 /* ── NtOpenSymbolicLinkObject (ordinal 203, 2 args = 8 bytes) */
