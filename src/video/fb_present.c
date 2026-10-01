@@ -143,6 +143,35 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* Borderless fullscreen: the window as a popup over its whole monitor, with
+ * the windowed placement kept to come back to. F11 or Alt+Enter toggles it;
+ * RECOMP_WINDOW_MODE=borderless starts in it. The D3D11 presenter follows
+ * the client size, so nothing else has to know. */
+static int s_borderless;
+static WINDOWPLACEMENT s_windowed_place = { sizeof(WINDOWPLACEMENT) };
+
+static void fb_set_borderless(HWND h, int on)
+{
+    if (on == s_borderless)
+        return;
+    if (on) {
+        MONITORINFO mi = { sizeof mi };
+        GetWindowPlacement(h, &s_windowed_place);
+        GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi);
+        SetWindowLongA(h, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    } else {
+        SetWindowLongA(h, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPlacement(h, &s_windowed_place);
+        SetWindowPos(h, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+    s_borderless = on;
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -165,6 +194,13 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        /* F11, or Alt+Enter (Enter with the context bit): fullscreen. Not
+         * passed to the title, so Alt+Enter is not also START. */
+        if ((w == VK_F11 || (w == VK_RETURN && m == WM_SYSKEYDOWN))
+                && !(l & (1 << 30))) {
+            fb_set_borderless(h, !s_borderless);
+            return 0;
+        }
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
@@ -309,16 +345,39 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
-    r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+    /* RECOMP_WINDOW_SIZE=<w>x<h>: the client area (the guest's own size by
+     * default); RECOMP_WINDOW_TITLE: the caption. */
+    {
+        const char *sz = getenv("RECOMP_WINDOW_SIZE");
+        unsigned cw = s_fb_width, ch = s_fb_height;
+        if (sz) {
+            unsigned a = 0, b = 0;
+            if (sscanf(sz, "%ux%u", &a, &b) == 2 && a >= 320 && b >= 240
+                    && a <= 16384 && b <= 16384) {
+                cw = a;
+                ch = b;
+            }
+        }
+        r.left = 0; r.top = 0; r.right = (LONG)cw; r.bottom = (LONG)ch;
+    }
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                           CW_USEDEFAULT, CW_USEDEFAULT,
-                           r.right - r.left, r.bottom - r.top,
-                           NULL, NULL, GetModuleHandleA(NULL), NULL);
+    {
+        const char *title = getenv("RECOMP_WINDOW_TITLE");
+        hwnd = CreateWindowExA(0, "XboxRecompFramebuffer",
+                               title && *title ? title : "Xbox Recomp - Framebuffer",
+                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                               CW_USEDEFAULT, CW_USEDEFAULT,
+                               r.right - r.left, r.bottom - r.top,
+                               NULL, NULL, GetModuleHandleA(NULL), NULL);
+    }
     if (!hwnd) {
         InterlockedExchange(&s_fb_running, 0);
         return 0;
+    }
+    {
+        const char *mode = getenv("RECOMP_WINDOW_MODE");
+        if (mode && (!_stricmp(mode, "borderless") || !_stricmp(mode, "fullscreen")))
+            fb_set_borderless(hwnd, 1);
     }
     hdc = GetDC(hwnd);
     s_fb_hwnd = hwnd;

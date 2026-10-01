@@ -13,6 +13,7 @@
 #include "xinput_xbox.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -75,53 +76,200 @@ static BOOL key_down(int vk)
     return xbox_FramebufferKeyDown(vk) ? TRUE : FALSE;
 }
 
-/* A thumb axis from two keys, at the full deflection a digital key implies. */
-static SHORT axis_from_keys(int negative, int positive)
+/* The keyboard's bindings: up to three keys for each pad input.
+ *
+ * The defaults are the original layout (arrows = d-pad, Z X A S = A B X Y,
+ * numeric pad = left stick, I J K L = right stick). RECOMP_KEYMAP_PRESET=wasd
+ * puts the left stick on W A S D and moves the buttons out of its way;
+ * RECOMP_KEYMAP="A=SPACE,START=RETURN|ESCAPE,LX-=A,..." then changes single
+ * bindings (names below; a key is a letter or digit, a name such as SPACE,
+ * F1 or NUMPAD4, or a code like 0x41). */
+enum {
+    KB_UP, KB_DOWN, KB_LEFT, KB_RIGHT, KB_START, KB_BACK, KB_LTHUMB, KB_RTHUMB,
+    KB_A, KB_B, KB_X, KB_Y, KB_WHITE, KB_BLACK, KB_LT, KB_RT,
+    KB_LX_NEG, KB_LX_POS, KB_LY_NEG, KB_LY_POS,
+    KB_RX_NEG, KB_RX_POS, KB_RY_NEG, KB_RY_POS, KB_COUNT
+};
+static const char *const kb_names[KB_COUNT] = {
+    "UP", "DOWN", "LEFT", "RIGHT", "START", "BACK", "LTHUMB", "RTHUMB",
+    "A", "B", "X", "Y", "WHITE", "BLACK", "LT", "RT",
+    "LX-", "LX+", "LY-", "LY+", "RX-", "RX+", "RY-", "RY+"
+};
+static unsigned char kb_map[KB_COUNT][3];
+
+static int kb_key_code(const char *s, size_t n)
+{
+    static const struct { const char *name; int vk; } names[] = {
+        { "UP", VK_UP }, { "DOWN", VK_DOWN }, { "LEFT", VK_LEFT }, { "RIGHT", VK_RIGHT },
+        { "RETURN", VK_RETURN }, { "ENTER", VK_RETURN }, { "BACK", VK_BACK },
+        { "BACKSPACE", VK_BACK }, { "SPACE", VK_SPACE }, { "TAB", VK_TAB },
+        { "ESCAPE", VK_ESCAPE }, { "ESC", VK_ESCAPE }, { "SHIFT", VK_SHIFT },
+        { "LSHIFT", VK_SHIFT }, { "CTRL", VK_CONTROL }, { "CONTROL", VK_CONTROL },
+        { "ALT", VK_MENU }, { "INSERT", VK_INSERT }, { "DELETE", VK_DELETE },
+        { "HOME", VK_HOME }, { "END", VK_END }, { "PAGEUP", VK_PRIOR },
+        { "PAGEDOWN", VK_NEXT }, { "COMMA", VK_OEM_COMMA }, { "PERIOD", VK_OEM_PERIOD },
+    };
+    char buf[16];
+    size_t i;
+    if (!n || n >= sizeof buf)
+        return 0;
+    for (i = 0; i < n; i++)
+        buf[i] = (char)((s[i] >= 'a' && s[i] <= 'z') ? s[i] - 32 : s[i]);
+    buf[n] = 0;
+    if (n == 1 && ((buf[0] >= 'A' && buf[0] <= 'Z') || (buf[0] >= '0' && buf[0] <= '9')))
+        return buf[0];
+    if (buf[0] == '0' && buf[1] == 'X')
+        return (int)strtol(buf, NULL, 16) & 0xFF;
+    if (buf[0] == 'F' && n <= 3 && atoi(buf + 1) >= 1 && atoi(buf + 1) <= 24)
+        return VK_F1 + atoi(buf + 1) - 1;
+    if (!strncmp(buf, "NUMPAD", 6) && n == 7 && buf[6] >= '0' && buf[6] <= '9')
+        return VK_NUMPAD0 + (buf[6] - '0');
+    for (i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (!strcmp(buf, names[i].name))
+            return names[i].vk;
+    return 0;
+}
+
+static void kb_bind(int target, const char *keys, size_t n)
+{
+    size_t start = 0, i;
+    int k = 0;
+    memset(kb_map[target], 0, sizeof kb_map[target]);
+    for (i = 0; i <= n && k < 3; i++) {
+        if (i == n || keys[i] == '|') {
+            int vk = kb_key_code(keys + start, i - start);
+            if (vk)
+                kb_map[target][k++] = (unsigned char)vk;
+            start = i + 1;
+        }
+    }
+}
+
+static void kb_init(void)
+{
+    static const char *const defaults =
+        "UP=UP,DOWN=DOWN,LEFT=LEFT,RIGHT=RIGHT,START=RETURN,BACK=BACK,"
+        "LTHUMB=SHIFT,RTHUMB=CTRL,A=Z,B=X,X=A,Y=S,WHITE=Q,BLACK=E,LT=1,RT=3,"
+        "LX-=NUMPAD4,LX+=NUMPAD6,LY-=NUMPAD2,LY+=NUMPAD8,RX-=J,RX+=L,RY-=K,RY+=I";
+    static const char *const wasd =
+        "LX-=A,LX+=D,LY-=S,LY+=W,A=SPACE,B=J,X=K,Y=L,WHITE=U,BLACK=O,LT=Q,RT=E,"
+        "START=RETURN|ESCAPE,BACK=BACK|TAB,LTHUMB=SHIFT,RTHUMB=CTRL,"
+        "RX-=LEFT,RX+=RIGHT,RY-=DOWN,RY+=UP,UP=NUMPAD8,DOWN=NUMPAD2,"
+        "LEFT=NUMPAD4,RIGHT=NUMPAD6";
+    const char *lists[3];
+    int l;
+    lists[0] = defaults;
+    {
+        const char *p = getenv("RECOMP_KEYMAP_PRESET");
+        lists[1] = (p && !_stricmp(p, "wasd")) ? wasd : NULL;
+    }
+    lists[2] = getenv("RECOMP_KEYMAP");
+    for (l = 0; l < 3; l++) {
+        const char *p = lists[l];
+        while (p && *p) {
+            const char *eq = strchr(p, '='), *end = strchr(p, ',');
+            int t;
+            if (!end)
+                end = p + strlen(p);
+            if (eq && eq < end) {
+                for (t = 0; t < KB_COUNT; t++)
+                    if (strlen(kb_names[t]) == (size_t)(eq - p)
+                            && !_strnicmp(p, kb_names[t], (size_t)(eq - p)))
+                        kb_bind(t, eq + 1, (size_t)(end - eq - 1));
+            }
+            p = *end ? end + 1 : end;
+        }
+    }
+}
+
+static BOOL kb_down(int target)
+{
+    int k;
+    for (k = 0; k < 3 && kb_map[target][k]; k++)
+        if (key_down(kb_map[target][k]))
+            return TRUE;
+    return FALSE;
+}
+
+static SHORT kb_axis(int negative, int positive)
 {
     int v = 0;
-    if (key_down(negative)) v -= 32767;
-    if (key_down(positive)) v += 32767;
+    if (kb_down(negative)) v -= 32767;
+    if (kb_down(positive)) v += 32767;
     return (SHORT)v;
 }
 
 static void keyboard_state(XBOX_INPUT_STATE *pState)
 {
     static DWORD packet;
+    static int inited;
     WORD b = 0;
 
+    if (!inited) {
+        kb_init();
+        inited = 1;
+    }
     memset(pState, 0, sizeof(*pState));
 
-    if (key_down(VK_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
-    if (key_down(VK_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
-    if (key_down(VK_LEFT))   b |= XBOX_GAMEPAD_DPAD_LEFT;
-    if (key_down(VK_RIGHT))  b |= XBOX_GAMEPAD_DPAD_RIGHT;
-    if (key_down(VK_RETURN)) b |= XBOX_GAMEPAD_START;
-    if (key_down(VK_BACK))   b |= XBOX_GAMEPAD_BACK;
-    if (key_down(VK_SHIFT))  b |= XBOX_GAMEPAD_LEFT_THUMB;
-    if (key_down(VK_CONTROL))b |= XBOX_GAMEPAD_RIGHT_THUMB;
+    if (kb_down(KB_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
+    if (kb_down(KB_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (kb_down(KB_LEFT))   b |= XBOX_GAMEPAD_DPAD_LEFT;
+    if (kb_down(KB_RIGHT))  b |= XBOX_GAMEPAD_DPAD_RIGHT;
+    if (kb_down(KB_START))  b |= XBOX_GAMEPAD_START;
+    if (kb_down(KB_BACK))   b |= XBOX_GAMEPAD_BACK;
+    if (kb_down(KB_LTHUMB)) b |= XBOX_GAMEPAD_LEFT_THUMB;
+    if (kb_down(KB_RTHUMB)) b |= XBOX_GAMEPAD_RIGHT_THUMB;
     pState->Gamepad.wButtons = b;
 
     /* Analog on the console, so a key is 255 rather than a flag -- a title
      * that reads these as a pressure never sees a press if they are 1. */
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = key_down('Z') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = key_down('X') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = key_down('A') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = key_down('S') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = key_down('Q') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = key_down('E') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = key_down('1') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = key_down('3') ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = kb_down(KB_A) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = kb_down(KB_B) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = kb_down(KB_X) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = kb_down(KB_Y) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = kb_down(KB_WHITE) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = kb_down(KB_BLACK) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = kb_down(KB_LT) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = kb_down(KB_RT) ? 255 : 0;
 
-    /* W/A/S/D would collide with the face buttons above, so the left thumb
-     * shares the arrow keys' row on the numeric pad instead. */
-    pState->Gamepad.sThumbLX = axis_from_keys(VK_NUMPAD4, VK_NUMPAD6);
-    pState->Gamepad.sThumbLY = axis_from_keys(VK_NUMPAD2, VK_NUMPAD8);
-    pState->Gamepad.sThumbRX = axis_from_keys('J', 'L');
-    pState->Gamepad.sThumbRY = axis_from_keys('K', 'I');
+    pState->Gamepad.sThumbLX = kb_axis(KB_LX_NEG, KB_LX_POS);
+    pState->Gamepad.sThumbLY = kb_axis(KB_LY_NEG, KB_LY_POS);
+    pState->Gamepad.sThumbRX = kb_axis(KB_RX_NEG, KB_RX_POS);
+    pState->Gamepad.sThumbRY = kb_axis(KB_RY_NEG, KB_RY_POS);
 
     /* The title's input layer looks for button edges, so the packet number
      * has to move whenever the state does or a press is never noticed. */
     pState->dwPacketNumber = ++packet;
+}
+
+/* RECOMP_PAD_DEADZONE=<0..0.9>: a radial dead zone on the host pad's sticks,
+ * as a fraction of full deflection, with the rest rescaled so the edge of the
+ * zone reads as 0 and full deflection is still full. Unset or 0: the stick
+ * as XInput reports it (the title applies its own). */
+static void stick_deadzone(SHORT *x, SHORT *y)
+{
+    static double dz = -1.0;
+    double fx, fy, m, k;
+    if (dz < 0.0) {
+        const char *e = getenv("RECOMP_PAD_DEADZONE");
+        dz = e ? atof(e) : 0.0;
+        if (dz < 0.0 || dz > 0.9)
+            dz = 0.0;
+    }
+    if (dz <= 0.0)
+        return;
+    fx = *x / 32767.0;
+    fy = *y / 32767.0;
+    m = sqrt(fx * fx + fy * fy);
+    if (m <= dz) {
+        *x = *y = 0;
+        return;
+    }
+    k = (m > 1.0 ? 1.0 : (m - dz) / (1.0 - dz)) / m;
+    fx *= k;
+    fy *= k;
+    *x = (SHORT)(fx > 1.0 ? 32767 : fx < -1.0 ? -32767 : fx * 32767.0);
+    *y = (SHORT)(fy > 1.0 ? 32767 : fy < -1.0 ? -32767 : fy * 32767.0);
 }
 
 void xbox_InputInit(void)
@@ -177,6 +325,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
     pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
     pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
+    stick_deadzone(&pState->Gamepad.sThumbLX, &pState->Gamepad.sThumbLY);
+    stick_deadzone(&pState->Gamepad.sThumbRX, &pState->Gamepad.sThumbRY);
 
     /* Merge the keyboard on top rather than only standing in for a missing
      * pad.

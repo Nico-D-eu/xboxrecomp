@@ -65,6 +65,16 @@ int xa2_init(void)
         fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
         goto fail;
     }
+    /* RECOMP_AUDIO_VOLUME=<0..100>: the master volume, in percent. */
+    {
+        const char *e = getenv("RECOMP_AUDIO_VOLUME");
+        if (e && *e) {
+            int pct = atoi(e);
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+            IXAudio2MasteringVoice_SetVolume(g_xa2_master, (float)pct / 100.0f, 0);
+        }
+    }
 
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
     wfx.nChannels       = XA2_CHANNELS;
