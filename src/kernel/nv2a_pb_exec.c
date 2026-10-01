@@ -3097,6 +3097,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     }
                 }
             }
+            {
+                extern uint32_t g_pb_seg[16][4], g_pb_seg_pos;
+                uint32_t k;
+                fprintf(stderr, "  [GPU] last segments (start, end, stopped at, why):\n");
+                for (k = 0; k < 16; k++) {
+                    const uint32_t *g = g_pb_seg[(g_pb_seg_pos + k) % 16];
+                    if (g[0])
+                        fprintf(stderr, "  [GPU]   %08X..%08X -> %08X (%u)\n", g[0], g[1], g[2], g[3]);
+                }
+            }
             fprintf(stderr, "  [GPU] last methods (oldest first):\n");
             for (k = 0; k < 24; k++) {
                 unsigned i = (pos + k) % 24;
@@ -3144,6 +3154,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     if (nv2a_comb_method(&s_comb, method, param))
         return;
+    if (method == 0x1D70) {
+        /* BACK_END_WRITE_SEMAPHORE_RELEASE: D3D's fence. Released here, as
+         * the walk executes it, for the fence mirror to report. */
+        extern volatile uint32_t g_nv2a_sem_released;
+        extern volatile int g_nv2a_sem_seen;
+        g_nv2a_sem_released = param;
+        g_nv2a_sem_seen = 1;
+    }
+    if (method == 0x1D6C || method == 0x1D70 || method == 0x1D74 || method == 0x1D7C) {
+        static int said;
+        if (said < 24 && getenv("RECOMP_SEM_TRACE")) {
+            said++;
+            fprintf(stderr, "  [GPU] semaphore method 0x%04X = 0x%08X\n", method, param);
+        }
+    }
     switch (method) {
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;

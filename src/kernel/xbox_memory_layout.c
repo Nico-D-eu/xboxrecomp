@@ -784,6 +784,11 @@ static void frame_counters_tick(void)
     }
 }
 
+/* The last fence the pushbuffer walk executed (NV097 0x1D70), once one has
+ * been seen. */
+volatile uint32_t g_nv2a_sem_released;
+volatile int g_nv2a_sem_seen;
+
 static void fence_mirrors_tick(void)
 {
     for (int i = 0; i < g_fence_mirror_count; i++) {
@@ -806,6 +811,22 @@ static void fence_mirrors_tick(void)
             uint32_t put =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
                                        + g_memory_offset);
+            /* Completed is what the walk has executed: the last semaphore
+             * release it ran. Reporting D3D's submitted count instead, before
+             * the walk had run those commands, told D3D the GPU was done with
+             * buffers it had not read yet; D3D re-patched the return jump of
+             * a reused recorded buffer, and the walk then followed the new
+             * jump into data (index pairs, floats) and ran garbage state. The
+             * submitted count only until the first release is seen, and
+             * whenever the executor is off.
+             *
+             * Opt-in (RECOMP_FENCE_EXACT) for now: in Amped 2 boot stalls at
+             * frame 306 with it, D3D waiting on a fence the walk never runs. */
+            static int exact = -1;
+            if (exact < 0)
+                exact = getenv("RECOMP_PB_EXEC") && getenv("RECOMP_FENCE_EXACT");
+            if (g_nv2a_sem_seen && exact)
+                put = g_nv2a_sem_released;
             if (*fence != put)
                 *fence = put;
         }
@@ -1009,7 +1030,6 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             if (put != last_put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {
-                    extern void nv2a_pb_scan(uint32_t, uint32_t);
                     extern void nv2a_pb_scan_report(void);
                     static DWORD last_report;
 
@@ -1052,19 +1072,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         nv2a_pb_scan_set_ring(XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
                                               XBOX_CONTIG_BASE | (put_hi & 0x0FFFFFFFu));
                     }
-                    if (last_put && put > last_put) {
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
+                    {
+                        extern void nv2a_pb_run(uint32_t);
+                        nv2a_pb_run(XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu));
+                        if (getenv("RECOMP_PB_WRAP_TRACE") && last_put && put < last_put) {
                             static unsigned wraps;
                             if (wraps++ < 8)
                                 fprintf(stderr, "  [NV2A] pushbuffer wrapped "
@@ -1086,6 +1097,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                               + NV2A_USER_DMA_GET);
                     *get = put;
                 }
+                fence_mirrors_tick();          /* what that run released */
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET

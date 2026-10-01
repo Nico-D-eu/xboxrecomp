@@ -201,7 +201,7 @@ void nv2a_pb_scan_report(void)
 /* Time spent walking and executing, for the per-frame report. */
 volatile long long g_nv2a_scan_ticks;
 
-static void pb_scan_body(uint32_t start_va, uint32_t end_va);
+static void pb_run_body(uint32_t put_va);
 
 /* The method header being executed and where the walk was (0 ring,
  * 1 followed jump, 2 followed call, with that target), for reports. */
@@ -212,12 +212,20 @@ uint32_t g_pb_entry_src, g_pb_entry_word, g_pb_entry_target;
 uint32_t g_pb_hist[32][2], g_pb_hist_pos;
 uint32_t g_pb_entry_hist[32][2], g_pb_entry_hist_pos;   /* as it was at the entry */
 static uint32_t g_pb_jump_target, g_pb_call_target;
+/* The last 16 segments walked: start, end asked for, where the walk stopped
+ * and why (0 end, 1 ring jump, 2 bad jump target, 3 word cap, 4 pending
+ * carried, 5 pending finished first). */
+uint32_t g_pb_seg[16][4], g_pb_seg_pos;
+/* Where the ring jump that ended the last segment went, or 0. */
+uint32_t g_pb_wrap_target;
 
-void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+/* Run the ring up to PUT, from wherever the last run stopped -- the GPU's
+ * GET. */
+void nv2a_pb_run(uint32_t put_va)
 {
     LARGE_INTEGER a, b;
     QueryPerformanceCounter(&a);
-    pb_scan_body(start_va, end_va);
+    pb_run_body(put_va);
     QueryPerformanceCounter(&b);
     g_nv2a_scan_ticks += b.QuadPart - a.QuadPart;
 }
@@ -239,37 +247,68 @@ static struct {
     uint32_t subch, method, remaining, resume_va;
 } s_pend;
 
-static void pb_scan_body(uint32_t start_va, uint32_t end_va)
+/* Where the walk has got to: the GPU's GET, as a guest VA. 0 before the
+ * first PUT. */
+static uint32_t s_get;
+/* The walk stopped past PUT: a jump back into the ring landed beyond the PUT
+ * sampled, so there is nothing to run until PUT gets there. */
+static int s_get_ahead;
+
+/* The ring, run the way the GPU runs it.
+ *
+ * This used to walk segments: [old PUT, new PUT) going forward, and on a wrap
+ * [old PUT, highest PUT seen) then [lowest PUT seen, new PUT). Neither bound
+ * is where the title wraps. Amped 2 writes on past the old PUT and jumps back
+ * to the ring's start wherever it runs out, often beyond the highest PUT
+ * seen, so the commands in between were dropped; and the jump back can come
+ * from a recorded buffer (RunPushBuffer) the walk had followed out of the
+ * ring, which the segment walk treated as a return and ran on from the ring's
+ * start up to the 1 MB bound, a lap of old commands. Both showed in game as
+ * lost or garbage state.
+ *
+ * Now there is one position, GET. A run starts there, follows every jump --
+ * the wrap included, from the ring or from a followed buffer -- and stops at
+ * PUT once it has wrapped if it needed to. The next run resumes where it
+ * stopped. */
+static void pb_run_body(uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t va = start_va;
+    uint32_t start_va, va;
     uint32_t words = 0, jumps = 0, unknown = 0;
+    int outside = 0, in_call = 0, need_wrap, stop = 0;
+    uint32_t call_ret = 0, followed = 0, left_ring = 0;
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
     if (s_scan_on < 0)
         s_scan_on = getenv("RECOMP_PB_SCAN") != NULL;
-    if (!(s_scan_on || s_exec_enabled) || end_va <= start_va)
+    if (!(s_scan_on || s_exec_enabled))
         return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
-        end_va = start_va + 0x400000u;
+    if (!s_get) {                             /* the first PUT: start there */
+        s_get = end_va;
+        return;
+    }
+    if (s_get == end_va)
+        return;
+    if (s_get_ahead) {
+        if (end_va < s_get && s_get - end_va < 0x400000u)
+            return;                           /* PUT not there yet */
+        s_get_ahead = 0;
+    }
+    start_va = va = s_get;
+    /* GET past PUT: the title has wrapped, and the walk has to as well
+     * before PUT means anything. */
+    need_wrap = start_va > end_va;
 
-    /* Jumps and calls. A jump inside the ring is its wrap, which the caller
-     * handles from PUT, so it ends the segment as it always did. A jump out
-     * of the ring is D3D running another pushbuffer (RunPushBuffer, a
-     * recorded buffer); that has to be followed until it jumps back, or
-     * everything in it -- draws, constant uploads -- is never executed. It
-     * was not: a rider's skinning palette, uploaded correctly by the CPU,
-     * never reached the vertex program. Calls (one level, as on NV2A) the
-     * same. */
-    int outside = 0, in_call = 0;
-    uint32_t call_ret = 0, followed = 0;
-
+    g_pb_wrap_target = 0;
+    g_pb_seg[g_pb_seg_pos % 16][0] = start_va;
+    g_pb_seg[g_pb_seg_pos % 16][1] = end_va;
+    g_pb_seg[g_pb_seg_pos % 16][3] = 0;
     if (s_pend.active) {
-        /* Only where it stopped; a segment starting anywhere else (a reset
-         * of the ring, a lost PUT) cannot be the rest of that method. */
+        /* Only where it stopped; a run starting anywhere else cannot be the
+         * rest of that method. */
         if (s_pend.resume_va == va) {
-            while (s_pend.remaining && va < end_va) {
+            while (s_pend.remaining && (need_wrap || va < end_va)) {
                 if (s_scan_on)
                     note(s_pend.subch, s_pend.method);
                 if (s_exec_enabled)
@@ -282,8 +321,13 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
                 words++;
             }
             s_pend.resume_va = va;
+            g_pb_seg[g_pb_seg_pos % 16][3] = 5;
             if (s_pend.remaining) {           /* still more to come */
                 s_tot_words += words;
+                s_get = va;
+                g_pb_seg[g_pb_seg_pos % 16][2] = va;
+                g_pb_seg[g_pb_seg_pos % 16][3] = 4;
+                g_pb_seg_pos++;
                 return;
             }
         }
@@ -291,13 +335,24 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
     }
 
     for (;;) {
-        uint32_t limit = (outside || in_call) ? XBOX_CONTIG_BASE + 0x04000000u : end_va;
+        int ring = !outside && !in_call;
+        uint32_t limit = (ring && !need_wrap) ? end_va : XBOX_CONTIG_BASE + 0x04000000u;
         uint32_t w;
 
-        if (va >= limit || words >= 0x100000u)
+        if (va >= limit)
             break;
-        s_cur_in_ring = !outside && !in_call;
-        if (s_cur_in_ring) {
+        /* Bounds on one run: a word budget (the rest waits for the next
+         * run), and a wrap that never comes within 4 MB. */
+        if (ring && words >= 0x100000u) {
+            stop = 3;
+            break;
+        }
+        if (ring && need_wrap && va - start_va > 0x400000u) {
+            stop = 2;
+            break;
+        }
+        s_cur_in_ring = ring;
+        if (ring) {
             s_cur_va = va;                    /* everything before is consumed */
             if ((words & 1023u) == 0)
                 pb_scan_get(0);
@@ -315,17 +370,43 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
             target = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
             /* The ring's bounds are learned from PUT, and its wrap lands on
              * the ring's true start, which can sit below the lowest PUT
-             * seen -- so the ring is taken generously. Treating a wrap as a
-             * jump out of it re-executed stale commands up to garbage. */
-            in_ring = s_ring_hi && target + 0x10000u >= s_ring_lo
-                   && target <= s_ring_hi + 0x10000u;
+             * seen -- so the ring is taken generously. */
+            in_ring = !s_ring_hi || (target + 0x10000u >= s_ring_lo
+                                     && target <= s_ring_hi + 0x10000u);
             jumps++;
-            if (!outside) {
-                if (in_ring || !s_ring_hi)
-                    break;                    /* the ring's own wrap */
-                if (target >= XBOX_CONTIG_BASE + 0x04000000u || ++followed > 256)
-                    break;                    /* not memory, or runaway */
+            /* A jump to itself is where the title parks the GPU until it
+             * writes the real command over it; the GPU spins re-reading it.
+             * So wait there, and read it again next run. */
+            if (target == va - 4 && !outside && !in_call) {
+                va -= 4;
+                stop = 4;
+                break;
+            }
+            /* The follow budget is per trip out of the ring: a frame runs
+             * hundreds of recorded buffers, and counting them all against
+             * one budget called a long run a runaway. Jumps within the ring
+             * are bounded by the word budget instead. */
+            if (target >= XBOX_CONTIG_BASE + 0x04000000u
+                    || ((outside || in_call || !in_ring) && ++followed > 256)) {
+                stop = 2;                     /* not memory, or runaway */
+                break;
+            }
+            if (!outside && !in_call) {
+                if (in_ring) {
+                    /* Within the ring: its wrap when backwards. */
+                    if (target < va - 4) {
+                        g_pb_wrap_target = target;
+                        need_wrap = 0;
+                    }
+                    va = target;
+                    continue;
+                }
+                /* Out of the ring: D3D running another pushbuffer
+                 * (RunPushBuffer, a recorded buffer). Followed until it
+                 * jumps back, or everything in it -- draws, constant uploads,
+                 * a rider's skinning palette -- is never executed. */
                 outside = 1;
+                left_ring = va - 4;
                 s_tot_followed++;
                 g_pb_jump_target = target;
                 g_pb_entry_src = va - 4; g_pb_entry_word = w; g_pb_entry_target = target;
@@ -334,15 +415,52 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
                 va = target;
                 continue;
             }
-            if (in_ring)
-                outside = 0;                  /* back into the ring */
-            else if (target >= XBOX_CONTIG_BASE + 0x04000000u || ++followed > 256)
-                break;
+            if (outside && in_ring) {
+                /* Back into the ring; behind where it left, that is the
+                 * wrap as well. */
+                {
+                    static uint32_t n_next, n_other;
+                    static int tr = -1;
+                    if (tr < 0)
+                        tr = getenv("RECOMP_PB_RET_TRACE") != NULL;
+                    if (target == left_ring + 4) n_next++; else n_other++;
+                    if (tr && n_other && target != left_ring + 4 && n_other <= 12)
+                        fprintf(stderr, "  [NV2A] return from %08X (left ring at %08X) to %08X;"
+                                " %u returns to the next word, %u elsewhere\n",
+                                g_pb_jump_target, left_ring, target, n_next, n_other);
+                }
+                outside = 0;
+                followed = 0;
+                if (target < left_ring) {
+                    g_pb_wrap_target = target;
+                    need_wrap = 0;
+                }
+            }
             va = target;
             continue;
         }
-        if ((w & 3u) == 2u) {                 /* call */
+        if ((w & 3u) == 2u) {                 /* call, one level as on NV2A */
             uint32_t target = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+            {
+                static unsigned ncall;
+                static int tr = -1;
+                if (tr < 0)
+                    tr = getenv("RECOMP_PB_RET_TRACE") != NULL;
+                if (tr && ncall++ < 16)
+                    fprintf(stderr, "  [NV2A] call %08X at %08X (%s)\n", w, va - 4,
+                            outside ? "in a followed buffer" : in_call ? "in a call" : "in the ring");
+            }
+            /* D3D does not use calls (every one seen in Amped 2 was a pair
+             * of 16-bit indices read as a command), so one means the walk
+             * is reading data: stop rather than execute it.
+             * RECOMP_PB_CALLS=1 follows them as before. */
+            static int calls_ok = -1;
+            if (calls_ok < 0)
+                calls_ok = getenv("RECOMP_PB_CALLS") != NULL;
+            if (!calls_ok) {
+                stop = 5;
+                break;
+            }
             if (!in_call && target < XBOX_CONTIG_BASE + 0x04000000u && ++followed <= 256) {
                 in_call = 1;
                 call_ret = va;
@@ -361,6 +479,8 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
             if (in_call) {
                 in_call = 0;
                 va = call_ret;
+                if (!outside)
+                    followed = 0;
             }
             continue;
         }
@@ -402,9 +522,68 @@ static void pb_scan_body(uint32_t start_va, uint32_t end_va)
             }
             continue;
         }
+        /* Low bits 3 is no command at all: the walk is in data. */
         unknown++;
+        stop = 5;
+        break;
     }
 
+    if (stop == 4) {
+        /* Parked. Two seconds on one word is not the title about to patch
+         * it; log it and go on from PUT rather than stall for good. */
+        static uint32_t park_va;
+        static ULONGLONG park_t0;
+        ULONGLONG now = GetTickCount64();
+        if (va != park_va) {
+            park_va = va;
+            park_t0 = now;
+        }
+        if (now - park_t0 > 2000) {
+            static unsigned said;
+            if (said++ < 8)
+                fprintf(stderr, "  [NV2A] ring walk parked on the jump-to-self at %08X"
+                        " for 2 s; resuming at PUT %08X\n", va, end_va);
+            park_va = 0;
+            s_get = end_va;
+            s_pend.active = 0;
+        } else {
+            s_get = va;
+            s_get_ahead = !need_wrap && va > end_va;
+        }
+    } else if (stop == 3) {
+        s_get = va;                           /* budget: carry on next run */
+        s_get_ahead = !need_wrap && va > end_va;
+    } else if (stop || outside || in_call || need_wrap) {
+        /* Lost: a runaway, or no wrap where one had to be. Start again at
+         * PUT rather than walk on through whatever is there. */
+        static unsigned said;
+        if (said++ < 8) {
+            uint32_t k;
+            fprintf(stderr, "  [NV2A] ring walk %08X -> PUT %08X lost at %08X (%s);"
+                    " resuming at PUT\n", start_va, end_va, va,
+                    stop == 2 ? "runaway" : stop == 5 ? "not a command"
+                    : need_wrap ? "no wrap" : "in a followed buffer");
+            fprintf(stderr, "  [NV2A]   last words:");
+            for (k = 0; k < 12; k++) {
+                const uint32_t *h = g_pb_hist[(g_pb_hist_pos - 12 + k) % 32];
+                fprintf(stderr, " %08X:%08X", h[0], h[1]);
+            }
+            fprintf(stderr, "\n  [NV2A]   ring %08X..%08X, %u words this run\n",
+                    s_ring_lo, s_ring_hi, words);
+        }
+        s_get = end_va;
+        s_pend.active = 0;
+    } else {
+        s_get = va;
+        s_get_ahead = va > end_va;
+    }
+
+    g_pb_seg[g_pb_seg_pos % 16][2] = va;
+    if (s_pend.active && s_pend.resume_va == va && !g_pb_seg[g_pb_seg_pos % 16][3])
+        g_pb_seg[g_pb_seg_pos % 16][3] = 4;
+    if (stop)
+        g_pb_seg[g_pb_seg_pos % 16][3] = stop;
+    g_pb_seg_pos++;
     s_cur_va = 0;
     s_tot_words += words;
     s_tot_unknown += unknown;

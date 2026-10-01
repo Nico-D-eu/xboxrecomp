@@ -140,6 +140,20 @@ static const uint8_t *guest(void)
     return (const uint8_t *)xbox_GetMemoryOffset();
 }
 
+/* Is [va, va+bytes) guest memory that exists: low RAM, the contiguous window
+ * or its tiled alias? Addresses come from the title's pushbuffer, and one
+ * misread command makes a vertex array or texture point anywhere -- reading
+ * 0xEE0B0C10 took the whole process down. */
+static int guest_ok(uint32_t va, uint32_t bytes)
+{
+    uint64_t end = (uint64_t)va + bytes;
+    if (end <= 0x04000000u)
+        return 1;
+    if (va >= 0x80000000u && end <= 0x84000000ull)          /* contiguous window */
+        return 1;
+    return va >= 0xF0000000u && end <= 0xF4000000ull;
+}
+
 /* ── Shaders ─────────────────────────────────────────────────────────── */
 
 /* Compiled shaders persist in a directory (RECOMP_SHADER_CACHE, default
@@ -795,6 +809,8 @@ static uint64_t rt_mem_sig(const RtEntry *e)
     const uint8_t *g = (const uint8_t *)xbox_GetMemoryOffset();
     uint64_t h = 0xCBF29CE484222325ull;
     uint32_t bytes = e->w * e->h * 4u, step, off;
+    if (!guest_ok(e->va, bytes))
+        return 0;
     step = bytes / 256u;
     if (step < 4)
         step = 4;
@@ -1149,6 +1165,8 @@ static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w
     if (cube)
         bytes = ((bytes + 127u) & ~127u) * 6u;
 
+    if (!guest_ok(t->va, bytes))
+        return NULL;
     at = (t->va * 2654435761u ^ t->format * 40503u) & (TEX_SLOTS - 1);
     for (i = 0; i < 16; i++) {
         TexEntry *c = &s_tex[(at + i) & (TEX_SLOTS - 1)];
@@ -1603,7 +1621,8 @@ static void do_draw(const Nv2aHwDraw *d)
      * Amped 2's loading screen copies its controller picture straight into
      * the back buffer and draws only the text with the GPU. Bring those
      * pixels onto the surface before drawing over them. 32-bit only. */
-    if (rt && rt->sig_frame != s_frame && color_bpp(d->format) == 4 && d->pitch) {
+    if (rt && rt->sig_frame != s_frame && color_bpp(d->format) == 4 && d->pitch
+            && guest_ok(rt->va, d->pitch * rt->h)) {
         uint64_t sig = rt_mem_sig(rt);
         if (rt->sig_frame && sig != rt->mem_sig) {
             D3D11_BOX box = { 0, 0, 0, rt->w, rt->h, 1 };
@@ -1674,6 +1693,10 @@ static void do_draw(const Nv2aHwDraw *d)
                 span = 0;
             else
                 span = d->inline_bytes - src;
+        }
+        if (!d->inline_base && !guest_ok(src, span)) {
+            s_st.skipped++;
+            return;
         }
         dst = (uint8_t *)ring_map(s_vb, &s_vb_pos, VB_RING_BYTES, span + 16, 16);
         if (!dst) {
@@ -1833,7 +1856,8 @@ static void do_draw(const Nv2aHwDraw *d)
                     uint32_t key = t->va ^ (t->color << 24) ^ (t->width << 12) ^ t->height;
                     for (k = 0; k < nseen && seen[k] != key; k++)
                         ;
-                    if ((k == nseen && nseen < 512) || (k < nseen && seen_nz[k] == 0)) {
+                    if (((k == nseen && nseen < 512) || (k < nseen && seen_nz[k] == 0))
+                            && guest_ok(t->va, t->width * t->height * 4)) {
                         const uint8_t *g = guest() + t->va;
                         uint32_t n = t->width * t->height * 4, nz = 0, b;
                         if (n > (4u << 20)) n = 4u << 20;
@@ -2560,6 +2584,10 @@ static void queue_draw(const Nv2aHwDraw *d)
         src[i] = st[i].base + lo * st[i].stride;
         if (d->inline_base && src[i] + span[i] > d->inline_bytes)
             span[i] = src[i] >= d->inline_bytes ? 0 : d->inline_bytes - src[i];
+        if (!d->inline_base && !guest_ok(src[i], span[i])) {
+            s_st.skipped++;
+            return;
+        }
         blob_off[i] = blob;
         blob += align16(span[i] + 16);       /* the draw path reads a little past */
     }

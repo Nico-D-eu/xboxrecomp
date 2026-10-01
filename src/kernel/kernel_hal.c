@@ -698,6 +698,17 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         *Result = 0;
         break;
 
+    case 0x0F: {
+        /* The field being scanned out, alternating every vblank. D3D's vblank
+         * handler counts a vblank (device + 0x1DD8 in Amped 2) only when that
+         * count's parity matches the field, so a constant 0 let it count one
+         * and stop -- and GetOverlayUpdateStatus, which compares that count
+         * with the one UpdateOverlay saw, never said an XMV frame was shown. */
+        extern volatile long g_xbox_vblank_count;
+        *Result = (ULONG)g_xbox_vblank_count & 1u;
+        break;
+    }
+
     case AV_OPTION_BLANK_SCREEN:
     case AV_OPTION_MACROVISION_MODE:
     case AV_OPTION_FLICKER_FILTER:
