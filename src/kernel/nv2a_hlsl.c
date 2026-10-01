@@ -510,11 +510,21 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
            "Texture2D tx2 : register(t2); Texture2D tx3 : register(t3);\n"
            "TextureCube cx0 : register(t4); TextureCube cx1 : register(t5);\n"
            "TextureCube cx2 : register(t6); TextureCube cx3 : register(t7);\n"
-           /* The dot mappings (PS_DOTMAPPING): how a texel becomes a vector. */
+           /* The dot mappings (PS_DOTMAPPING): how a texel becomes a vector.
+            * MINUS1_TO_1_D3D is biased, (x - 128) / 127, so a flat normal
+            * map texel (128, 128, 255) is (0, 0, 1); MINUS1_TO_1_GL is two's
+            * complement centred on the half steps; MINUS1_TO_1 is plain two's
+            * complement. The D3D one was two's complement here, which turned
+            * a flat normal into about (-1, -1, 0) and made Amped 2's
+            * normal-mapped menu rider reflect the environment map all over:
+            * chrome instead of cloth. */
            "float3 dm_unsigned(float3 c) { return c; }\n"
            "float3 dm_d3d(float3 c) { float3 t = floor(c * 255.0 + 0.5);\n"
-           "  t = t >= 128.0 ? t - 256.0 : t; return clamp(t / 127.0, -1.0, 1.0); }\n"
-           "float3 dm_gl(float3 c) { return c * 2.0 - 1.0; }\n"
+           "  return clamp((t - 128.0) / 127.0, -1.0, 1.0); }\n"
+           "float3 dm_gl(float3 c) { float3 t = floor(c * 255.0 + 0.5);\n"
+           "  return t >= 128.0 ? (t - 255.5) / 127.5 : (t + 0.5) / 127.5; }\n"
+           "float3 dm_signed(float3 c) { float3 t = floor(c * 255.0 + 0.5);\n"
+           "  return clamp((t >= 128.0 ? t - 256.0 : t) / 127.0, -1.0, 1.0); }\n"
            "SamplerState s0 : register(s0); SamplerState s1 : register(s1);\n"
            "SamplerState s2 : register(s2); SamplerState s3 : register(s3);\n"
            "cbuffer PSC : register(b0) {\n"
@@ -550,7 +560,8 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
          * that stage's dot mapping (PS_DOTMAPPING: bits 4(n-1)). */
         uint32_t in_st = st ? (k->other_stage_input >> (16 + 4 * (st - 1))) & 0xFu : 0;
         uint32_t map = st ? (k->dot_mapping >> (4 * (st - 1))) & 0x7u : 0;
-        const char *dm = map == 0 ? "dm_unsigned" : map == 1 ? "dm_d3d" : "dm_gl";
+        const char *dm = map == 0 ? "dm_unsigned" : map == 1 ? "dm_d3d"
+                       : map == 2 ? "dm_gl" : "dm_signed";
         if (in_st >= st)
             in_st = st ? st - 1 : 0;
         if (!k->programmed && st > 0)
