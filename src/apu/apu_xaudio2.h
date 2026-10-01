@@ -21,4 +21,8 @@ int xa2_submit_samples(const int16_t *samples, int num_samples);
 /* Get the preferred buffer size in samples. */
 int xa2_get_buffer_size(void);
 
+/* Buffers queued on the source voice and not yet played, or -1 without
+ * XAudio2: the output's own clock, for the frame thread to pace by. */
+int xa2_queued(void);
+
 #endif /* APU_XAUDIO2_H */

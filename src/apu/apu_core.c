@@ -293,6 +293,14 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
+/* Time the frame thread spent handing the lock to guest writes (RECOMP_APU_STATS). */
+static int64_t g_apu_handoff_us;
+static unsigned g_apu_handoffs;
+static int64_t g_apu_frame_us, g_apu_frame_max_us;   /* in se_frame */
+static int64_t g_apu_relock_us;                      /* re-taking the lock */
+static unsigned g_apu_underruns, g_apu_overruns;     /* output queue empty / full */
+static unsigned g_apu_stalls;                        /* waits on a trapped front end */
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     if ((d->ep_frame_div + 1) % 8) {
@@ -317,6 +325,18 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                     d->regs[NV_PAPU_TVL2D] & 0xFFFF, d->regs[NV_PAPU_TVL3D] & 0xFFFF,
                     d->regs[NV_PAPU_TVLMP] & 0xFFFF);
         if (stats && n % 938 == 0) {
+            fprintf(stderr, "  [APU]   last 5 s: %.0f ms mixing (longest frame %.2f ms),"
+                    " %.0f ms re-taking the lock, %u hand-offs %.1f ms\n",
+                    (double)g_apu_frame_us / 1000.0, (double)g_apu_frame_max_us / 1000.0,
+                    (double)g_apu_relock_us / 1000.0,
+                    g_apu_handoffs, (double)g_apu_handoff_us / 1000.0);
+            g_apu_handoffs = 0;
+            g_apu_handoff_us = g_apu_frame_us = g_apu_frame_max_us = g_apu_relock_us = 0;
+            fprintf(stderr, "  [APU]   output queue ran dry %u times, was full %u times\n",
+                    g_apu_underruns, g_apu_overruns);
+            g_apu_underruns = g_apu_overruns = 0;
+            fprintf(stderr, "  [APU]   %u waits on a trapped or halted front end\n", g_apu_stalls);
+            g_apu_stalls = 0;
             /* Every voice on the three lists: bins (CFG_VBIN), format
              * (stream bit 24, persist 23), state (active 21, paused 18),
              * offsets and the first two target volumes. Then the level of
@@ -527,11 +547,29 @@ static void throttle(MCPXAPUState *d)
     }
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    int queued = xa2_queued();
 
+    /* Paced by the wall clock, kept honest by the output queue. This used
+     * to restart the schedule whenever it ran more than one frame late, so
+     * a late wake-up or a slow frame (up to 7 ms seen) was simply lost: on
+     * Amped 2's night stage the APU ran at 1360-1450 frames a second of
+     * 1500, the 85 ms queue ran dry and the sound broke up. Now only a
+     * stall of 100 ms gives up on the time; anything less is made up. And
+     * the queue has the last word, since the device's clock is the one the
+     * sound plays at: three buffers or fewer left, render now; twelve or
+     * more, wait a frame longer (a full queue drops what is submitted). */
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > 100000) {
         d->next_frame_time_us = now_us;
     }
+    if (queued >= 0 && queued <= 3 && d->next_frame_time_us > now_us)
+        d->next_frame_time_us = now_us;
+    if (queued >= 12)
+        d->next_frame_time_us += EP_FRAME_US;
+    if (queued == 0)
+        g_apu_underruns++;
+    if (queued >= 16)
+        g_apu_overruns++;
 
     while (!d->pause_requested) {
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
@@ -589,6 +627,7 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    bool stalled = false;     /* waiting out a trapped front end */
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -603,7 +642,9 @@ static void *mcpx_apu_frame_thread(void *arg)
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
-        throttle(d);
+        if (!stalled)
+            throttle(d);
+        stalled = false;
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
@@ -614,13 +655,37 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
+            int64_t f0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME), f1;
             se_frame(d);
+            f1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - f0;
+            g_apu_frame_us += f1;
+            if (f1 > g_apu_frame_max_us) g_apu_frame_max_us = f1;
             /* A voice event from the frame raises the line (xemu does this
              * in its frame thread; the port had dropped it). */
             if (d->set_irq) {
                 d->set_irq = false;
                 update_irq(d);
             }
+        } else if (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF && xa2_is_active()
+                   && !g_test_tone.active) {
+            /* Front end trapped or halted: DirectSound's idle-voice method
+             * (SE2FE_IDLE_VOICE) traps it until the title's ISR and DPC have
+             * run, a timer-thread pass or more here. This used to emit the
+             * sub-frame anyway, silent, and on Amped 2's night stage 7 of
+             * every 8 sub-frames around a trap came out as zeros -- 224-
+             * sample holes in the output, dozens a second, heard as the
+             * sound breaking up. The VP produces nothing while trapped (as
+             * xemu's frame thread does); wait for the title to release it,
+             * without moving the schedule, and the output queue's pacing
+             * makes the time up. */
+            if (d->set_irq) {
+                d->set_irq = false;
+                update_irq(d);
+            }
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+            stalled = true;
+            g_apu_stalls++;
+            continue;
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
@@ -635,12 +700,15 @@ static void *mcpx_apu_frame_thread(void *arg)
          * lock -- the whole game stopped (Amped 2 ML1, 1-4 min in, once its
          * sounds actually played). */
         if (qatomic_read(&g_apu_lock_waiters)) {
-            int64_t until = qemu_clock_get_us(QEMU_CLOCK_REALTIME) + 2000;
+            int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            int64_t until = t0 + 2000;
             qemu_mutex_unlock(&d->lock);
             while (qatomic_read(&g_apu_lock_waiters) &&
                    qemu_clock_get_us(QEMU_CLOCK_REALTIME) < until)
                 SwitchToThread();
             qemu_mutex_lock(&d->lock);
+            g_apu_handoff_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0;
+            g_apu_handoffs++;
         }
     }
 
