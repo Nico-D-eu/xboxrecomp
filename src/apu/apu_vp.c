@@ -72,9 +72,22 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * Filter helpers
  * ============================================================ */
 
+/* Per-voice resampler state (see voice_resample): source samples fetched
+ * ahead, the two either side of the read position, and how far between them
+ * it is. */
+typedef struct {
+    float buf[64][2];
+    int len, pos;
+    float s0[2], s1[2];
+    double frac;
+    int primed;
+} VoiceResampler;
+static VoiceResampler s_rs[MCPX_HW_MAX_VOICES];
+
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    memset(&s_rs[v], 0, sizeof s_rs[v]);
     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
     if (d->vp.filters[v].resampler) {
@@ -960,12 +973,80 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
  * resample. This gives us functional audio at the cost of quality.
  * ============================================================ */
 
+/* The next source sample for the resampler, from its look-ahead buffer.
+ * 0 when the voice has nothing more this frame. */
+static int rs_next(MCPXAPUState *d, uint16_t v, VoiceResampler *rs, float out[2])
+{
+    if (rs->pos >= rs->len) {
+        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+        int n;
+        if (!active)
+            return 0;
+        n = voice_get_samples(d, v, rs->buf, 64);
+        if (n <= 0)
+            return 0;
+        rs->len = n;
+        rs->pos = 0;
+    }
+    out[0] = rs->buf[rs->pos][0];
+    out[1] = rs->buf[rs->pos][1];
+    rs->pos++;
+    return 1;
+}
+
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
+    /* The voice's pitch, as a rate: output samples per source sample (the
+     * register is log2 of the source rate over 48 kHz, in 1/4096 octave).
+     * Every voice used to be played at 48 kHz whatever its pitch, so a
+     * 24 kHz music stream was read twice as fast as XACT refilled it: it ran
+     * dry part way through APU frames and the rest of each was silence -- a
+     * click on a 32-sample boundary, many a second in game -- and pitched
+     * sounds were at the wrong pitch. Linear interpolation; RECOMP_APU_NO_RESAMPLE
+     * plays at the source rate as before. */
+    static int off = -1;
+    VoiceResampler *rs = &s_rs[v];
+    double step;
+    int i;
+
+    if (off < 0)
+        off = getenv("RECOMP_APU_NO_RESAMPLE") != NULL;
+    if (!off && rate > 0.0f) {
+        step = 1.0 / (double)rate;            /* source samples per output */
+        if (step > 16.0)
+            step = 16.0;
+        if (!rs->primed) {
+            if (!rs_next(d, v, rs, rs->s0))
+                return -1;
+            if (!rs_next(d, v, rs, rs->s1)) {
+                rs->s1[0] = rs->s0[0];
+                rs->s1[1] = rs->s0[1];
+            }
+            rs->frac = 0.0;
+            rs->primed = 1;
+        }
+        for (i = 0; i < requested_num; i++) {
+            float f = (float)rs->frac;
+            samples[i][0] = rs->s0[0] + (rs->s1[0] - rs->s0[0]) * f;
+            samples[i][1] = rs->s0[1] + (rs->s1[1] - rs->s0[1]) * f;
+            rs->frac += step;
+            while (rs->frac >= 1.0) {
+                rs->frac -= 1.0;
+                rs->s0[0] = rs->s1[0];
+                rs->s0[1] = rs->s1[1];
+                if (!rs_next(d, v, rs, rs->s1)) {
+                    /* Dry: hold the last sample, and pick up from here once
+                     * there is more. */
+                    rs->primed = 0;
+                    return i + 1;
+                }
+            }
+        }
+        return requested_num;
+    }
+
     int sample_count = 0;
     while (sample_count < requested_num) {
         int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
