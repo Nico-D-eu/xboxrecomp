@@ -81,6 +81,12 @@ void nv2a_d3d11_clear(const Nv2aHwDraw *target, uint32_t flags,
 /* The title flipped to the surface at `color_va`. */
 void nv2a_d3d11_flip(uint32_t color_va);
 
+/* Visibility tests: SET_ZPASS_PIXEL_COUNT_ENABLE, and GET_REPORT's slot (va,
+ * or va_alt, the other reading of its offset), written when the GPU has the
+ * pixel count. */
+void nv2a_d3d11_zpass(int enable);
+void nv2a_d3d11_get_report(uint32_t va, uint32_t va_alt);
+
 /* Presented frames the render thread has still to show, or -1 when there is
  * no render thread (RECOMP_GPU_THREAD=0). The executor's flip waits on it. */
 int  nv2a_d3d11_frames_in_flight(void);

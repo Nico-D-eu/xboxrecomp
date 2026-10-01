@@ -1727,6 +1727,22 @@ static int bind_targets(const Nv2aHwDraw *d, uint32_t *w, uint32_t *h, RtEntry *
     return 1;
 }
 
+static int s_vis_in_test;        /* a visibility test is counting (do_zpass) */
+static int s_vis_trace = -1;
+
+static void vis_trace_draw(const Nv2aHwDraw *d, const char *what)
+{
+    static int said;
+    if (s_vis_trace < 0)
+        s_vis_trace = getenv("RECOMP_VIS_TRACE") != NULL;
+    if (!s_vis_trace || !s_vis_in_test || said >= 16)
+        return;
+    said++;
+    fprintf(stderr, "  [D3D11] in a visibility test, draw %s: prim %u, %u indices, colour %08X"
+            " mask %08X, zeta %08X, depth %u func %04X, vp %d\n", what, d->prim, d->idx_count,
+            d->color_va, d->color_mask, d->zeta_va, d->depth_test, d->depth_func, d->use_vp);
+}
+
 static void do_draw(const Nv2aHwDraw *d)
 {
     const uint8_t *mem = d->inline_base ? d->inline_base : guest();
@@ -2312,6 +2328,7 @@ static void do_draw(const Nv2aHwDraw *d)
     ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb_psc);
 
+    vis_trace_draw(d, "submitted");
     ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, ib_at / 4, 0);
     s_st.draws++;
     s_st.tris += nidx / 3;
@@ -2694,7 +2711,8 @@ static void do_flip(uint32_t color_va)
  *
  * RECOMP_GPU_THREAD=0 submits on the executor thread, as before. */
 
-enum { PKT_WRAP = 1, PKT_DRAW, PKT_CLEAR, PKT_FLIP, PKT_VP_PROG, PKT_VP_CONST, PKT_COMB };
+enum { PKT_WRAP = 1, PKT_DRAW, PKT_CLEAR, PKT_FLIP, PKT_VP_PROG, PKT_VP_CONST, PKT_COMB,
+       PKT_ZPASS, PKT_REPORT };
 
 typedef struct {
     uint32_t type, bytes;               /* bytes includes this header */
@@ -2718,6 +2736,11 @@ typedef struct {
     PktHdr   h;
     uint32_t color_va;
 } PktFlip;
+
+typedef struct {
+    PktHdr   h;
+    uint32_t a, b;      /* PKT_ZPASS: a = enable; PKT_REPORT: a, b = slot VAs */
+} PktVis;
 
 typedef struct {
     PktHdr   h;
@@ -3014,6 +3037,148 @@ static void queue_draw(const Nv2aHwDraw *d)
     ring_commit(total);
 }
 
+/* ── Visibility tests ─────────────────────────────────────────────────────
+ *
+ * D3D's BeginVisibilityTest pushes CLEAR_REPORT_VALUE and
+ * SET_ZPASS_PIXEL_COUNT_ENABLE 1; EndVisibilityTest pushes the enable 0 and
+ * GET_REPORT (0x17D0: type 1 in bits 24-27, the report's offset below),
+ * having set the 16-byte slot's last word to 0xFFFFFFFF. The NV2A then
+ * writes { 64-bit timestamp, pixels that passed the depth test, 0 }, and
+ * GetVisibilityTestResult reads it. Amped 2 draws each floodlight's glow and
+ * lens flare only when its test says the lamp is in view; with the method
+ * ignored the slot never completed, and the flares were drawn through hills,
+ * trees and the rider. Here each test is a D3D11 occlusion query, read back
+ * without a stall once the GPU has it and written to the slot then. */
+typedef struct {
+    ID3D11Query *q;
+    uint32_t va, va_alt;   /* the slot, or the other reading of the offset */
+    int state;             /* 0 free, 1 counting, 2 ended, 3 reported */
+} VisQuery;
+#define VIS_SLOTS 256
+static VisQuery s_vis[VIS_SLOTS];
+static VisQuery *s_vis_open, *s_vis_last;
+static int s_vis_pending;
+
+/* The last count for each slot, by address: what a report says at once,
+ * before its own query has come back (see nv2a_d3d11_get_report). */
+#define VIS_CACHE 1024
+static volatile uint32_t s_vis_cache_va[VIS_CACHE], s_vis_cache_n[VIS_CACHE];
+
+static uint32_t vis_cache_slot(uint32_t va)
+{
+    return ((va >> 4) * 2654435761u) & (VIS_CACHE - 1);
+}
+
+static void vis_write(VisQuery *v, UINT64 samples)
+{
+    uint8_t *g = (uint8_t *)guest();
+    uint32_t va = v->va, sc = (uint32_t)(gpu_scale() * gpu_scale());
+    if (!guest_ok(va, 16))
+        return;
+    {
+        LARGE_INTEGER now;
+        uint32_t *s = (uint32_t *)(g + va), k = vis_cache_slot(va);
+        QueryPerformanceCounter(&now);
+        s[0] = (uint32_t)now.QuadPart;
+        s[1] = (uint32_t)(now.QuadPart >> 32);
+        s[2] = (uint32_t)(samples / (sc ? sc : 1));
+        MemoryBarrier();
+        s[3] = 0;                                  /* done */
+        s_vis_cache_va[k] = va;
+        s_vis_cache_n[k] = s[2];
+        {   /* RECOMP_VIS_TRACE: the first few, then a tally every 2000 */
+            static int said, trace = -1;
+            static unsigned n, nz, maxv;
+            if (trace < 0)
+                trace = getenv("RECOMP_VIS_TRACE") != NULL;
+            if (trace) {
+                if (said < 6) {
+                    said++;
+                    fprintf(stderr, "  [D3D11] visibility report at %08X: %u pixels\n",
+                            va, s[2]);
+                }
+                n++;
+                if (s[2]) nz++;
+                if (s[2] > maxv) maxv = s[2];
+                if (n == 2000) {
+                    fprintf(stderr, "  [D3D11] visibility: %u of 2000 reports saw pixels (max %u)\n",
+                            nz, maxv);
+                    n = nz = maxv = 0;
+                }
+            }
+        }
+    }
+}
+
+static void vis_poll(void)
+{
+    int i;
+    if (!s_vis_pending)
+        return;
+    for (i = 0; i < VIS_SLOTS; i++) {
+        VisQuery *v = &s_vis[i];
+        UINT64 n;
+        if (v->state < 2)
+            continue;
+        if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)v->q, &n, sizeof n,
+                                        D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            continue;
+        if (v->state == 3)
+            vis_write(v, n);
+        v->state = 0;
+        s_vis_pending--;
+    }
+}
+
+static void do_zpass(int on)
+{
+    int i;
+    if (s_vis_open) {                              /* close a test left open */
+        ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_vis_open->q);
+        s_vis_open->state = 2;
+        s_vis_pending++;
+        s_vis_last = s_vis_open;
+        s_vis_open = NULL;
+        s_vis_in_test = 0;
+    }
+    if (!on)
+        return;
+    vis_poll();
+    for (i = 0; i < VIS_SLOTS && s_vis[i].state; i++)
+        ;
+    if (i == VIS_SLOTS) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [D3D11] more than %d visibility tests in flight\n", VIS_SLOTS);
+        return;
+    }
+    if (!s_vis[i].q) {
+        D3D11_QUERY_DESC qd = { D3D11_QUERY_OCCLUSION, 0 };
+        if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &s_vis[i].q)))
+            return;
+    }
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)s_vis[i].q);
+    s_vis[i].state = 1;
+    s_vis_in_test = 1;
+    s_vis_open = &s_vis[i];
+    s_vis_last = NULL;
+}
+
+static void do_get_report(uint32_t va, uint32_t va_alt)
+{
+    VisQuery *v = s_vis_last;
+    s_vis_last = NULL;
+    if (!v || v->state != 2) {
+        /* A report with no test behind it: say nothing passed. */
+        VisQuery tmp = { NULL, va, va_alt, 3 };
+        vis_write(&tmp, 0);
+        return;
+    }
+    v->va = va;
+    v->va_alt = va_alt;
+    v->state = 3;
+}
+
 static DWORD WINAPI render_thread(LPVOID unused)
 {
     (void)unused;
@@ -3024,6 +3189,10 @@ static DWORD WINAPI render_thread(LPVOID unused)
 
         if (tail == s_ring_head) {
             LARGE_INTEGER a, b;
+            if (s_vis_pending) {         /* a title may be waiting on one */
+                ID3D11DeviceContext_Flush(s_ctx);
+                vis_poll();
+            }
             QueryPerformanceCounter(&a);
             InterlockedExchange(&s_consumer_idle, 1);
             if (tail == s_ring_head)
@@ -3063,6 +3232,7 @@ static DWORD WINAPI render_thread(LPVOID unused)
             p->d.cur_attr = (const float (*)[4])p->cur;
             p->d.vp = &s_rvp;
             p->d.comb = &s_rcomb;
+            vis_trace_draw(&p->d, "received");
             do_draw(&p->d);
             break;
         }
@@ -3075,6 +3245,13 @@ static DWORD WINAPI render_thread(LPVOID unused)
             pace_display();
             do_flip(((const PktFlip *)h)->color_va);
             InterlockedIncrement(&s_flips_done);
+            vis_poll();
+            break;
+        case PKT_ZPASS:
+            do_zpass((int)((const PktVis *)h)->a);
+            break;
+        case PKT_REPORT:
+            do_get_report(((const PktVis *)h)->a, ((const PktVis *)h)->b);
             break;
         default:
             break;
@@ -3140,6 +3317,7 @@ void nv2a_d3d11_flip(uint32_t color_va)
 
     if (!s_threaded) {
         do_flip(color_va);
+        vis_poll();
         return;
     }
     InterlockedIncrement(&s_flips_queued);
@@ -3148,6 +3326,60 @@ void nv2a_d3d11_flip(uint32_t color_va)
     p->h.bytes = align16(sizeof *p);
     p->color_va = color_va;
     ring_commit(p->h.bytes);
+}
+
+static void queue_vis(uint32_t type, uint32_t a, uint32_t b)
+{
+    PktVis *p = (PktVis *)ring_reserve(align16(sizeof *p));
+    p->h.type = type;
+    p->h.bytes = align16(sizeof *p);
+    p->a = a;
+    p->b = b;
+    ring_commit(p->h.bytes);
+}
+
+void nv2a_d3d11_zpass(int enable)
+{
+    if (!s_threaded) {
+        do_zpass(enable);
+        return;
+    }
+    queue_vis(PKT_ZPASS, (uint32_t)enable, 0);
+}
+
+void nv2a_d3d11_get_report(uint32_t va, uint32_t va_alt)
+{
+    uint8_t *g = (uint8_t *)guest();
+    uint32_t slot = 0;
+
+    /* The slot is the reading D3D marked pending (last word 0xFFFFFFFF):
+     * the offset's bit 24 is shared with the report type. */
+    if (guest_ok(va, 16) && *(volatile uint32_t *)(g + va + 12) == 0xFFFFFFFFu)
+        slot = va;
+    else if (guest_ok(va_alt, 16) && *(volatile uint32_t *)(g + va_alt + 12) == 0xFFFFFFFFu)
+        slot = va_alt;
+    else if (guest_ok(va, 16))
+        slot = va;
+    if (!slot)
+        return;
+    /* Complete it now with the slot's last count. The query behind it comes
+     * back frames later -- the render thread and the GPU run behind the
+     * walk -- and the title reads its results a frame on: a slot still
+     * pending then counts as not visible, so every floodlight's glow went
+     * out. The real count replaces this when it arrives. */
+    {
+        uint32_t *s = (uint32_t *)(g + slot), k = vis_cache_slot(slot);
+        s[0] = s[1] = 0;
+        s[2] = s_vis_cache_va[k] == slot ? s_vis_cache_n[k] : 0;
+        MemoryBarrier();
+        s[3] = 0;
+    }
+    if (!s_threaded) {
+        do_get_report(slot, slot);
+        vis_poll();
+        return;
+    }
+    queue_vis(PKT_REPORT, slot, slot);
 }
 
 void nv2a_d3d11_report(void)
@@ -3196,5 +3428,7 @@ void nv2a_d3d11_clear(const Nv2aHwDraw *d, uint32_t f, uint32_t c, uint32_t z)
 void nv2a_d3d11_flip(uint32_t va) { (void)va; }
 int  nv2a_d3d11_frames_in_flight(void) { return -1; }
 void nv2a_d3d11_report(void) {}
+void nv2a_d3d11_zpass(int enable) { (void)enable; }
+void nv2a_d3d11_get_report(uint32_t va, uint32_t va_alt) { (void)va; (void)va_alt; }
 
 #endif

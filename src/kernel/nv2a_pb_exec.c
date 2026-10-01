@@ -3029,6 +3029,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
     }
+    if (method >= 0x17C8 && method <= 0x17D0) {   /* RECOMP_VIS_TRACE: the first few */
+        static int said = -1;
+        if (said < 0)
+            said = getenv("RECOMP_VIS_TRACE") ? 0 : 1000;
+        if (said < 24) {
+            said++;
+            fprintf(stderr, "  [GPU] visibility method %u:0x%04X = 0x%08X (frame %u)\n",
+                    subch, method, param, (unsigned)s_frames_seen);
+        }
+    }
     /* The last methods, so a state write that makes no sense can be shown in
      * context: a depth function outside 0x200..0x207 (seen in play as
      * 0xBC2F3242 -- a float) means the stream was misread before it. */
@@ -3235,6 +3245,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x02A4: s_gpu.fog_enable = param; break;         /* SET_FOG_ENABLE */
     case 0x029C: s_gpu.fog_mode = param; break;           /* SET_FOG_MODE */
     case 0x1E6C: s_gpu.shadow_func = param & 7u; break;   /* SET_SHADOW_DEPTH_FUNC */
+    case 0x17C8:                                          /* CLEAR_REPORT_VALUE */
+        break;
+    case 0x17CC:                                          /* SET_ZPASS_PIXEL_COUNT_ENABLE */
+        if (nv2a_d3d11_active())
+            nv2a_d3d11_zpass((int)(param & 1u));
+        break;
+    case 0x17D0:                                          /* GET_REPORT */
+        /* Type 1 (pixel count) in bits 24+, the offset below. D3D builds
+         * it as (slot & 0x0EFFFFFF) | 0x01000000, which assumes a slot under
+         * 16 MB; ours can be higher, so bits 24-27 hold address bits too.
+         * Both readings go down; the slot is the one D3D marked pending. */
+        if (nv2a_d3d11_active())
+            nv2a_d3d11_get_report(dma_resolve(param & 0x0FFFFFFFu),
+                                  dma_resolve(param & 0x0EFFFFFFu));
+        break;
     case 0x09C0: case 0x09C4: case 0x09C8: {              /* SET_FOG_PARAMS */
         union { uint32_t u; float f; } fv;
         fv.u = param;
