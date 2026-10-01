@@ -332,6 +332,18 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
         if (v & PORT_W_PPS_SET_POWER)    *ps |= PORT_PPS;
         if (v & PORT_W_CLEAR_POWER)      *ps &= ~PORT_PPS;
         if (v & PORT_W_PRS_SET_RESET) {
+            /* A port reset after the first enumeration means the driver is
+             * starting over with the device: worth a line every time. */
+            {
+                static unsigned resets;
+                resets++;
+                if (resets > 2 && resets < 40) {
+                    fprintf(stderr, "  [OHCI%d] port %u reset again (#%u, %lu ms) --"
+                            " the driver is re-enumerating the device\n", hc->index,
+                            port + 1, resets, (unsigned long)GetTickCount());
+                    fflush(stderr);
+                }
+            }
             /* Reset completes immediately -- there is no wire to settle -- so
              * PRS is never observed set. What matters is what the driver
              * checks afterwards: a present device comes back enabled, and the

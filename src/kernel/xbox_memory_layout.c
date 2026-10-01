@@ -3531,16 +3531,23 @@ void xbox_HeapFreeDeferred(uint32_t xbox_va)
 /* Under the heap lock: release every held block. 1 if there were any. */
 static int heap_release_deferred_locked(void)
 {
-    int i, n = g_heap_deferred_count;
-    for (i = 0; i < n; i++)
-        heap_free_locked(g_heap_deferred[i]);
-    g_heap_deferred_count = 0;
-    if (n) {
-        fprintf(stderr, "  [HEAP] out of space: released %d held NtFreeVirtualMemory"
-                " region(s)\n", n);
+    /* The oldest one only; the caller retries and comes back for the next
+     * until the request fits. Releasing all of them at once handed back
+     * regions freed moments before and still being read: the competition
+     * stage's sound turned to noise on its third run. */
+    static unsigned said;
+    if (!g_heap_deferred_count)
+        return 0;
+    heap_free_locked(g_heap_deferred[0]);
+    memmove(&g_heap_deferred[0], &g_heap_deferred[1],
+            (size_t)(g_heap_deferred_count - 1) * sizeof g_heap_deferred[0]);
+    g_heap_deferred_count--;
+    if (said++ < 16) {
+        fprintf(stderr, "  [HEAP] out of space: released the oldest held"
+                " NtFreeVirtualMemory region (%d still held)\n", g_heap_deferred_count);
         fflush(stderr);
     }
-    return n != 0;
+    return 1;
 }
 
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
