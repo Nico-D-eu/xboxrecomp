@@ -311,8 +311,7 @@ static unsigned synthetic_buttons(void)
      * RECOMP_PAD_PRESS's pulses are held off for it. Outside the script's
      * entries the pulses run as usual, so a run can be walked to a menu by
      * the pulses, steered there by the script, and carried on after. Bits
-     * 16-19 push the left stick fully down, up, left and right (Amped 2's
-     * menus move with the stick, not the d-pad). */
+     * 16-19 push the left stick fully down, up, left and right. */
     {
         static int nscript = -1;
         static struct { unsigned long at, hold; unsigned mask; } script[64];
