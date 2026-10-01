@@ -3128,6 +3128,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+        /* RECOMP_PB_SUBCH=<n>: the first n methods sent to the 2D classes. */
+        static int subch_left = -1;
+        if (subch_left < 0) {
+            const char *e = getenv("RECOMP_PB_SUBCH");
+            subch_left = e ? atoi(e) : 0;
+        }
+        if (subch_left > 0 && !(subch == 5 && method == 0x0310)) {
+            subch_left--;
+            fprintf(stderr, "  [GPU] 2D subch %u method 0x%04X = 0x%08X (frame %u)\n",
+                    subch, method, param, (unsigned)s_frames_seen);
+        }
         note_unhandled(method, param);
         return;
     }

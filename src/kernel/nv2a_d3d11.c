@@ -82,7 +82,7 @@ static ID3DBlob *s_sig_blob;             /* bytecode with the shared input signa
 
 static struct {
     uint32_t draws, tris, skipped, vs_compiled, ps_compiled, compile_failed;
-    uint32_t tex_uploads, tex_bad, rt_created, ds_created, readbacks;
+    uint32_t tex_uploads, tex_bad, rt_created, ds_created, readbacks, cpu_frames;
     uint32_t vs_const_writes, fallback_attrs, points_lines;
     uint64_t vb_bytes, ib_bytes, tex_hash_bytes;
     uint64_t draw_ticks;              /* QPC ticks inside nv2a_d3d11_draw */
@@ -1597,6 +1597,23 @@ static void do_draw(const Nv2aHwDraw *d)
         s_st.skipped++;
         return;
     }
+    /* Pixels the CPU wrote into this surface's memory. Rendering here never
+     * writes guest memory, so if the memory under a surface changed since
+     * its last frame of drawing, the title put an image there itself --
+     * Amped 2's loading screen copies its controller picture straight into
+     * the back buffer and draws only the text with the GPU. Bring those
+     * pixels onto the surface before drawing over them. 32-bit only. */
+    if (rt && rt->sig_frame != s_frame && color_bpp(d->format) == 4 && d->pitch) {
+        uint64_t sig = rt_mem_sig(rt);
+        if (rt->sig_frame && sig != rt->mem_sig) {
+            D3D11_BOX box = { 0, 0, 0, rt->w, rt->h, 1 };
+            ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)rt->tex, 0,
+                                                  &box, guest() + rt->va, d->pitch, 0);
+            s_st.cpu_frames++;
+        }
+        rt->sig_frame = s_frame;
+        rt->mem_sig = sig;
+    }
 
     /* Vertices: one stream per interleaved buffer, copied whole across the
      * index range the batch uses, then described as raw bits. */
@@ -1801,6 +1818,44 @@ static void do_draw(const Nv2aHwDraw *d)
                 }
                 psd.tsc[i][0] = norm ? 1.0f : 1.0f / (float)tw;
                 psd.tsc[i][1] = norm ? 1.0f : 1.0f / (float)th;
+            }
+            /* RECOMP_TEX_LOG=<n>: the first n distinct textures drawn with,
+             * where they come from and how much of their memory is set. */
+            {
+                static int left = -1, nseen;
+                static uint32_t seen[512], seen_nz[512];
+                int k;
+                if (left < 0) {
+                    const char *e = getenv("RECOMP_TEX_LOG");
+                    left = e ? atoi(e) : 0;
+                }
+                if (left > 0) {
+                    uint32_t key = t->va ^ (t->color << 24) ^ (t->width << 12) ^ t->height;
+                    for (k = 0; k < nseen && seen[k] != key; k++)
+                        ;
+                    if ((k == nseen && nseen < 512) || (k < nseen && seen_nz[k] == 0)) {
+                        const uint8_t *g = guest() + t->va;
+                        uint32_t n = t->width * t->height * 4, nz = 0, b;
+                        if (n > (4u << 20)) n = 4u << 20;
+                        for (b = 0; b < n; b += 64)
+                            nz += g[b] != 0;
+                        if (k == nseen) {
+                            seen[nseen++] = key;
+                            seen_nz[k] = nz;
+                        } else if (nz == 0) {
+                            goto tex_log_done;     /* still empty */
+                        } else {
+                            seen_nz[k] = nz;
+                        }
+                        left--;
+                        fprintf(stderr, "  [D3D11] tex%u %08X %ux%u fmt %02X pitch %u %s, "
+                                "%u/%u sampled bytes set (frame %u)\n", i, t->va, t->width,
+                                t->height, t->color, t->pitch,
+                                srv[i] == (src_rt ? src_rt->srv : NULL) && src_rt ? "from surface" : "from memory",
+                                nz, n / 64, s_frame);
+                    }
+                }
+            tex_log_done:;
             }
             /* X8 formats carry no alpha: read it as opaque. */
             psd.tsc[i][2] = (t->color == 0x07 || t->color == 0x1E || t->color == 0x03
@@ -2143,6 +2198,25 @@ static void gpu_shot(RtEntry *rt)
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
     }
     ID3D11Texture2D_Release(st);
+    /* RECOMP_GPU_SHOT_MEM: the guest memory under the surface as well, to
+     * see what the CPU put there. */
+    if (getenv("RECOMP_GPU_SHOT_MEM")
+            && (snprintf(path, sizeof path, "%s%04u_mem.bmp", prefix, seq - 1),
+                f = fopen(path, "wb")) != NULL) {
+        const uint8_t *g = guest() + rt->va;
+        uint8_t hdr[54] = { 'B', 'M' };
+        uint32_t size = 54 + (row + pad) * h;
+        memcpy(hdr + 2, &size, 4); hdr[10] = 54; hdr[14] = 40;
+        memcpy(hdr + 18, &w, 4); memcpy(hdr + 22, &h, 4); hdr[26] = 1; hdr[28] = 24;
+        fwrite(hdr, 1, 54, f);
+        for (y = h; y-- > 0; ) {
+            uint8_t zero[3] = { 0 };
+            for (x = 0; x < w; x++)
+                fwrite(g + (size_t)y * w * 4 + x * 4, 1, 3, f);
+            fwrite(zero, 1, pad, f);
+        }
+        fclose(f);
+    }
 }
 
 static void do_flip(uint32_t color_va)
@@ -2689,12 +2763,12 @@ void nv2a_d3d11_report(void)
     last_scan = g_nv2a_scan_ticks;
     fprintf(stderr, "  [D3D11] %u draws, %u triangles, %u skipped, %u points/lines;"
             " shaders %u VS + %u PS (%u failed); %u texture uploads (%u bad);"
-            " %u colour + %u depth targets; %u frames read back;"
+            " %u colour + %u depth targets; %u frames read back, %u CPU-written frames shown;"
             " %u programs writing constants, %u unaligned attributes\n",
             s_st.draws, s_st.tris, s_st.skipped, s_st.points_lines,
             s_st.vs_compiled, s_st.ps_compiled, s_st.compile_failed,
             s_st.tex_uploads, s_st.tex_bad, s_st.rt_created, s_st.ds_created,
-            s_st.readbacks, s_st.vs_const_writes, s_st.fallback_attrs);
+            s_st.readbacks, s_st.cpu_frames, s_st.vs_const_writes, s_st.fallback_attrs);
     fflush(stderr);
 }
 
