@@ -80,19 +80,40 @@ static void dsp_ack_init(void)
                 s_dsp_ack_count, s_dsp_ack[0]);
 }
 
-/* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
+/* MIX DOWN EVERY BIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
  *
- * Default ON. RECOMP_APU_MIXDOWN_ALL=0 restores the previous two-bin read,
- * because this changes audible output for every title and an escape hatch
- * costs one branch. */
-static int mcpx_apu_mixdown_all(void)
+ * This changes audible output for every title, so the earlier mixdowns stay
+ * a switch away (one branch each). */
+enum { MIXDOWN_FRONT, MIXDOWN_SUM, MIXDOWN_STEREO };
+
+/* RECOMP_APU_MIXDOWN: "stereo" (default, a speaker downmix -- see the frame
+ * loop), "sum" (every bin, even left and odd right: the previous default),
+ * "front" (bins 0 and 1 only). RECOMP_APU_MIXDOWN_ALL=0 still means front. */
+static int mcpx_apu_mixdown_mode(void)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
-        on = (e && *e) ? (atoi(e) != 0) : 1;
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_APU_MIXDOWN");
+        const char *all = getenv("RECOMP_APU_MIXDOWN_ALL");
+        if (e && _stricmp(e, "sum") == 0)
+            mode = MIXDOWN_SUM;
+        else if ((e && _stricmp(e, "front") == 0) || (all && *all && atoi(all) == 0))
+            mode = MIXDOWN_FRONT;
+        else
+            mode = MIXDOWN_STEREO;
     }
-    return on;
+    return mode;
+}
+
+static float mcpx_apu_reverb_send(void)
+{
+    static float g = -1.0f;
+    if (g < 0.0f) {
+        const char *e = getenv("RECOMP_APU_REVERB_SEND");
+        g = e ? (float)atof(e) : 0.0f;
+        if (g < 0.0f) g = 0.0f;
+    }
+    return g;
 }
 
 static void dsp_ack_frame(MCPXAPUState *d)
@@ -215,7 +236,26 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * counts. This is not what a real EP does; it is the cheapest
              * mixdown that stops discarding audio. */
             float left, right;
-            if (mcpx_apu_mixdown_all()) {
+            int mode = mcpx_apu_mixdown_mode();
+            if (mode == MIXDOWN_STEREO) {
+                /* A stereo downmix of DirectSound's bins: 0/1 front L/R,
+                 * 2 centre, 3 LFE, 4/5 back L/R, 6-9 the crosstalk-cancelled
+                 * 3D pairs (front L/R, back L/R), 10 the I3DL2 reverb send,
+                 * 11+ FX sends. The even/odd sum put centre and the reverb
+                 * send on the left only and LFE on the right at full level.
+                 * Amped 2's music goes to LFE as loud as to the fronts, and
+                 * its night competition stage feeds the reverb send hard,
+                 * so that mix was doubled, lopsided and pressed into the
+                 * limiter -- "messy and distorted". Centre and back at -3 dB
+                 * as ITU-R BS.775 does. LFE and the sends have no place in
+                 * a stereo fold without the GP's effects, so they are left
+                 * out; RECOMP_APU_REVERB_SEND=<gain> adds bin 10 back to
+                 * both sides, dry. */
+                const float k = 0.7071f;
+                float c = mixbins[2][i] * k + mixbins[10][i] * mcpx_apu_reverb_send();
+                left  = mixbins[0][i] + c + mixbins[4][i] * k + mixbins[6][i] + mixbins[8][i];
+                right = mixbins[1][i] + c + mixbins[5][i] * k + mixbins[7][i] + mixbins[9][i];
+            } else if (mode == MIXDOWN_SUM) {
                 left = 0.0f;
                 right = 0.0f;
                 for (int b = 0; b < NUM_MIXBINS; ++b) {
