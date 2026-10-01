@@ -454,6 +454,8 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).
  */
 void xbox_HeapFree(uint32_t xbox_va);
+/* Free when the heap next runs out of space (NtFreeVirtualMemory). */
+void xbox_HeapFreeDeferred(uint32_t xbox_va);
 
 /**
  * Bytes remaining in the heap block containing this guest address, or 0 if the

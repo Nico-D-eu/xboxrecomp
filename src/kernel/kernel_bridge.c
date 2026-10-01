@@ -850,6 +850,43 @@ static void bridge_MmFreeContiguousMemory(void)
  * NTSTATUS NtAllocateVirtualMemory(PVOID *BaseAddress, ULONG ZeroBits,
  *     PULONG AllocationSize, ULONG AllocationType, ULONG Protect)
  */
+/* The regions NtAllocateVirtualMemory handed out, so NtFreeVirtualMemory
+ * releases only those. Every allocator here shares one heap; on the console
+ * a stale or repeated NtFreeVirtualMemory fails, while here it found
+ * whatever block now sits at that address -- a sound buffer, say -- and
+ * freed it under its owner, whose data the next allocation then overwrote.
+ * Amped 2's audio turned to noise a couple of minutes into play that way. */
+#define VM_REGIONS_MAX 4096
+static uint32_t g_vm_regions[VM_REGIONS_MAX];
+static int g_vm_region_count;
+static volatile LONG g_vm_lock;
+
+static void vm_region_add(uint32_t va)
+{
+    while (InterlockedCompareExchange(&g_vm_lock, 1, 0) != 0)
+        Sleep(0);
+    if (g_vm_region_count < VM_REGIONS_MAX)
+        g_vm_regions[g_vm_region_count++] = va;
+    InterlockedExchange(&g_vm_lock, 0);
+}
+
+/* 1 if va was one of NtAllocateVirtualMemory's regions (and forget it). */
+static int vm_region_take(uint32_t va)
+{
+    int i, found = 0;
+    while (InterlockedCompareExchange(&g_vm_lock, 1, 0) != 0)
+        Sleep(0);
+    for (i = 0; i < g_vm_region_count; i++) {
+        if (g_vm_regions[i] == va) {
+            g_vm_regions[i] = g_vm_regions[--g_vm_region_count];
+            found = 1;
+            break;
+        }
+    }
+    InterlockedExchange(&g_vm_lock, 0);
+    return found;
+}
+
 static void bridge_NtAllocateVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);  /* PVOID* in Xbox VA */
@@ -993,6 +1030,7 @@ static void bridge_NtAllocateVirtualMemory(void)
     /* Write back the allocated address and actual size */
     if (base_ptr) BRIDGE_MEM32(base_ptr) = xbox_va;
     if (size_ptr) BRIDGE_MEM32(size_ptr) = size;
+    vm_region_add(xbox_va);
 
     g_eax = 0; /* STATUS_SUCCESS */
 }
@@ -1095,9 +1133,18 @@ static void bridge_NtFreeVirtualMemory(void)
         return;
     }
     if (free_type & 0x8000u) {
-        uint32_t size = xbox_HeapBlockSize(base);
-        if (size)
-            xbox_HeapFree(base);
+        uint32_t size;
+        if (!vm_region_take(base)) {
+            static unsigned said;
+            if (said++ < 8)
+                fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory(0x%08X): not a region"
+                        " NtAllocateVirtualMemory handed out; refused\n", base);
+            g_eax = 0xC00000A0u;              /* STATUS_MEMORY_NOT_ALLOCATED */
+            return;
+        }
+        size = xbox_HeapBlockSize(base);
+        if (size && !getenv("RECOMP_NTFREE_KEEP"))
+            xbox_HeapFreeDeferred(base);
         BRIDGE_MEM32(base_ptr) = 0;
         if (size_ptr)
             BRIDGE_MEM32(size_ptr) = size;

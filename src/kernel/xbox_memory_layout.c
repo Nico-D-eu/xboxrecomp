@@ -3461,6 +3461,7 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
  * at once are both handed the same block. */
 static volatile LONG g_heap_lock;
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
+static int heap_release_deferred_locked(void);
 
 /* Insert a block record at index i (the table is in address order). 0 when
  * the table is full -- the caller then simply does not split. */
@@ -3503,6 +3504,45 @@ void xbox_HeapFree(uint32_t xbox_va)
     InterlockedExchange(&g_heap_lock, 0);
 }
 
+/* A free that only takes effect when the heap would otherwise run out.
+ *
+ * NtFreeVirtualMemory goes through here. Freeing those regions at once and
+ * letting the next allocation have them turned Amped 2's audio to noise a
+ * couple of minutes into a level: something still reads a released region
+ * for a while, and an eager allocator overwrote it. Not freeing them at all
+ * ran the 48 MB heap out on the second level load. So they are held, and
+ * released together the first time an allocation does not fit -- which is
+ * a level load, when the previous level's data really is finished with. */
+#define HEAP_DEFERRED_MAX 1024
+static uint32_t g_heap_deferred[HEAP_DEFERRED_MAX];
+static int g_heap_deferred_count;
+
+void xbox_HeapFreeDeferred(uint32_t xbox_va)
+{
+    while (InterlockedCompareExchange(&g_heap_lock, 1, 0) != 0)
+        Sleep(0);
+    if (g_heap_deferred_count < HEAP_DEFERRED_MAX)
+        g_heap_deferred[g_heap_deferred_count++] = xbox_va;
+    else
+        heap_free_locked(xbox_va);
+    InterlockedExchange(&g_heap_lock, 0);
+}
+
+/* Under the heap lock: release every held block. 1 if there were any. */
+static int heap_release_deferred_locked(void)
+{
+    int i, n = g_heap_deferred_count;
+    for (i = 0; i < n; i++)
+        heap_free_locked(g_heap_deferred[i]);
+    g_heap_deferred_count = 0;
+    if (n) {
+        fprintf(stderr, "  [HEAP] out of space: released %d held NtFreeVirtualMemory"
+                " region(s)\n", n);
+        fflush(stderr);
+    }
+    return n != 0;
+}
+
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
@@ -3529,7 +3569,21 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
      * block to any request that fit, first fit, so a 100 KB request could take
      * a freed 6 MB level pool and waste the rest. Amped 2 ran out of its 48 MB
      * loading its second level after the first, with the old level's freed
-     * pools tied up that way. */
+     * pools tied up that way.
+     *
+     * Fresh space first, though: freed blocks are reused only once the bump
+     * region cannot take the request. Handing a freed block straight back
+     * overwrote memory that was still being read after it was freed -- in
+     * Amped 2 a level's sound data, which turned to noise a couple of
+     * minutes into play once NtFreeVirtualMemory really freed. The console's
+     * allocator does not recycle that eagerly either. RECOMP_HEAP_REUSE_FIRST=1
+     * restores immediate reuse. */
+    static int reuse_first = -1;
+    if (reuse_first < 0)
+        reuse_first = getenv("RECOMP_HEAP_REUSE_FIRST") != NULL;
+    if (!reuse_first
+            && ((g_heap_next + alignment - 1) & ~(alignment - 1)) + (uint64_t)size <= XBOX_HEAP_TOP)
+        goto no_reuse;
     {
         int best = -1;
         uint32_t best_size = 0;
@@ -3573,6 +3627,8 @@ no_reuse:
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
+    if (result + size > XBOX_HEAP_TOP && heap_release_deferred_locked())
+        return heap_alloc_locked(size, alignment);
     if (result + size > XBOX_HEAP_TOP) {
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
                 size, g_heap_next - XBOX_HEAP_BASE,
@@ -3703,8 +3759,11 @@ static void heap_free_locked(uint32_t xbox_va)
             heap_remove(i);
             i--;
         }
-        /* A free block at the top is unallocated space again. */
-        if (i == g_heap_block_count - 1
+        /* A free block at the top is unallocated space again -- only with
+         * RECOMP_HEAP_REUSE_FIRST: otherwise the bump pointer never moves
+         * down, so "fresh space first" does not hand the freed top straight
+         * back (see heap_alloc_locked). */
+        if (getenv("RECOMP_HEAP_REUSE_FIRST") && i == g_heap_block_count - 1
                 && g_heap_blocks[i].addr + g_heap_blocks[i].size >= g_heap_next) {
             g_heap_next = g_heap_blocks[i].addr;
             heap_remove(i);
