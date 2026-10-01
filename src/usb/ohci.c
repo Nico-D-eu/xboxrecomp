@@ -266,7 +266,15 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
                 wr32(hcca + HCCA_DONE_HEAD, 0);
             hc->reg[HcDoneHead / 4] = 0;
         }
-        *r &= ~v;                       /* write 1 to clear                 */
+        /* Atomic, as every write to this register is: the controller thread
+         * sets bits (WDH, SF, RHSC) while the driver clears others, and a
+         * plain read-modify-write on both sides could drop a WDH the
+         * controller had just set. The done list it announced was then never
+         * collected, the next tick published over it, and the pad's
+         * interrupt descriptor was lost: input froze on the last report (a
+         * trigger held, the rider circling), and once a DPC walked a
+         * descriptor that had already been reused. */
+        InterlockedAnd((volatile LONG *)r, (LONG)~v);   /* write 1 to clear */
         hc->ack_seq++;
         return;
 
@@ -337,7 +345,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
             if (*ps & PORT_CCS)
                 *ps |= PORT_PES;
             *ps |= PORT_PRSC;
-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+            InterlockedOr((volatile LONG *)&hc->reg[HcInterruptStatus / 4], (LONG)(INTR_RHSC));
         }
         return;
     }
@@ -683,7 +691,7 @@ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
     if (hcca)
         wr32(hcca + HCCA_DONE_HEAD, done_head);
     hc->reg[HcDoneHead / 4] = done_head;
-    hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
+    InterlockedOr((volatile LONG *)&hc->reg[HcInterruptStatus / 4], (LONG)(INTR_WDH));
 }
 
 /* The list walkers add what they finish to *done_head and leave publishing
@@ -817,7 +825,7 @@ static void ohci_raise(OhciController *hc, uint32_t source)
     uint32_t enable = hc->reg[HcInterruptEnable / 4];
     int claimed;
 
-    hc->reg[HcInterruptStatus / 4] |= source;
+    InterlockedOr((volatile LONG *)&hc->reg[HcInterruptStatus / 4], (LONG)(source));
 
     if (!(enable & INTR_MIE) || !(enable & source))
         return;
@@ -1026,7 +1034,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
             if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+            InterlockedOr((volatile LONG *)&hc->reg[HcInterruptStatus / 4], (LONG)(INTR_RHSC));
             plugged = 1;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
                             "arriving on port 1\n", waited * 20);
@@ -1056,7 +1064,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * controller zeroes, so a dword write is what hardware does. */
             if (hcca)
                 wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
-            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
+            InterlockedOr((volatile LONG *)&hc->reg[HcInterruptStatus / 4], (LONG)(INTR_SF));
         }
 
         /* Be the bus master. ControlListEnable in HcControl says the driver
