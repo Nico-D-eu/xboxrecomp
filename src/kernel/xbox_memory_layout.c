@@ -825,8 +825,17 @@ static void fence_mirrors_tick(void)
             static int exact = -1;
             if (exact < 0)
                 exact = getenv("RECOMP_PB_EXEC") && getenv("RECOMP_FENCE_EXACT");
-            if (g_nv2a_sem_seen && exact)
+            if (g_nv2a_sem_seen && exact) {
                 put = g_nv2a_sem_released;
+                /* PGRAPH 0x400B10 echoes the semaphore: D3D's wait-for-idle
+                 * (Amped 2 sub_0031E780, taken when the ring is short of
+                 * space) spins until its low five bits match the fence word.
+                 * Nothing set it, so with honest fences that path -- never
+                 * reached while every fence read as complete -- hung boot at
+                 * frame 306. */
+                if (g_nv2a_memory)
+                    *(volatile uint32_t *)((uint8_t *)g_nv2a_memory + 0x400B10) = put;
+            }
             if (*fence != put)
                 *fence = put;
         }

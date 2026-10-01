@@ -486,6 +486,18 @@ static void pb_run_body(uint32_t end_va)
         }
         if ((w & 0x00030003u) == 0u) {
             uint32_t count  = (w >> 18) & 0x7FFu;
+            /* Only two header types exist: incrementing (top bits 000) and
+             * non-incrementing (010); 001 was the old jump, handled above.
+             * Anything else, or binding an object (method 0) more than once
+             * in a row, is the walk reading data -- 0xC8C40000 read as a
+             * 561-word method from 0 is how Amped 2's second level got a
+             * depth function of 0 that stayed until the menus. */
+            if (((w & 0xE0000000u) != 0u && (w & 0xE0000000u) != 0x40000000u)
+                    || ((w & 0x1FFCu) == 0u && count > 1u)) {
+                unknown++;
+                stop = 5;
+                break;
+            }
             g_pb_hdr_va = va - 4;             /* for the executor's reports */
             g_pb_hdr = w;
             g_pb_hdr_where = in_call ? 2 : outside ? 1 : 0;
