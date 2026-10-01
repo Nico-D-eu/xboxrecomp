@@ -634,6 +634,12 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
     sb(&s, "  float4 fog = float4(fogc.rgb, saturate(i.fog));\n"
            "  if (atest.w == 4u) fog.a = 1.0;   /* RECOMP_GPU_PS_DEBUG=4: no fog */\n"
            "  if (atest.w == 5u) return float4(saturate(i.fog).xxx, 1.0); /* =5: fog factor */\n"
+           "  if (atest.w == 6u) return float4(t1.rgb, 1.0);   /* =6..8: texture stage 1..3 */\n"
+           "  if (atest.w == 7u) return float4(t2.rgb, 1.0);\n"
+           "  if (atest.w == 8u) return float4(t3.rgb, 1.0);\n"
+           "  if (atest.w == 9u) return float4(i.d1.rgb, 1.0); /* =9: specular colour */\n"
+           "  if (atest.w == 10u) { float q1 = i.t1.w != 0.0 ? i.t1.w : 1.0;   /* =10: stage-1 coords */\n"
+           "    return float4(frac(i.t1.xy / q1), i.t1.w == 0.0 ? 1.0 : 0.0, 1.0); }\n"
            "  float4 r0 = float4(0, 0, 0, t0.a), r1 = 0;\n"
            "  float4 outc;\n");
 
