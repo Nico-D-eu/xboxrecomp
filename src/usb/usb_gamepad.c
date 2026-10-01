@@ -306,6 +306,47 @@ static unsigned synthetic_buttons(void)
             }
         }
     }
+    /* RECOMP_PAD_SCRIPT="ms:mask[:hold],...": at ms after the first poll,
+     * hold mask for hold ms (default 200). A mask of 0 is a quiet spell:
+     * RECOMP_PAD_PRESS's pulses are held off for it. Outside the script's
+     * entries the pulses run as usual, so a run can be walked to a menu by
+     * the pulses, steered there by the script, and carried on after. Bits
+     * 16-19 push the left stick fully down, up, left and right (Amped 2's
+     * menus move with the stick, not the d-pad). */
+    {
+        static int nscript = -1;
+        static struct { unsigned long at, hold; unsigned mask; } script[64];
+        static unsigned long s0;
+        int i;
+        if (nscript < 0) {
+            const char *p = getenv("RECOMP_PAD_SCRIPT");
+            nscript = 0;
+            while (p && *p && nscript < 64) {
+                char *end;
+                script[nscript].at = strtoul(p, &end, 0);
+                if (*end != ':')
+                    break;
+                script[nscript].mask = (unsigned)strtoul(end + 1, &end, 0) & 0xFFFFFu;
+                script[nscript].hold = (*end == ':') ? strtoul(end + 1, &end, 0) : 200u;
+                nscript++;
+                p = (*end == ',') ? end + 1 : NULL;
+            }
+            s0 = (unsigned long)GetTickCount();
+            if (nscript)
+                fprintf(stderr, "  PAD: script of %d steps\n", nscript);
+        }
+        int quiet = 0;
+        now = (unsigned long)GetTickCount();
+        for (i = 0; i < nscript; i++) {
+            if (now - s0 >= script[i].at && now - s0 < script[i].at + script[i].hold) {
+                if (script[i].mask)
+                    return script[i].mask;     /* a press wins over a quiet spell */
+                quiet = 1;
+            }
+        }
+        if (quiet)
+            return 0;
+    }
     if (!configured)
         return 0;
     now = (unsigned long)GetTickCount();
@@ -375,7 +416,8 @@ int usb_gamepad_report(uint8_t *out, int max)
         for (i = 0; i < 8; i++)
             if (synth_all & (0x100u << i))
                 out[4 + i] = 0xFF;
-        return 20;
+        state.Gamepad.sThumbLX = state.Gamepad.sThumbLY = 0;
+        goto stick;
     }
 
     g = &state.Gamepad;
@@ -383,13 +425,22 @@ int usb_gamepad_report(uint8_t *out, int max)
     out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
     for (i = 0; i < 8; i++)
         out[4 + i] = (synth_all & (0x100u << i)) ? 0xFF : g->bAnalogButtons[i];
-    out[12] = (uint8_t)(g->sThumbLX & 0xFF);
-    out[13] = (uint8_t)((g->sThumbLX >> 8) & 0xFF);
-    out[14] = (uint8_t)(g->sThumbLY & 0xFF);
-    out[15] = (uint8_t)((g->sThumbLY >> 8) & 0xFF);
     out[16] = (uint8_t)(g->sThumbRX & 0xFF);
     out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+stick:
+    {
+        int lx = state.Gamepad.sThumbLX, ly = state.Gamepad.sThumbLY;
+        if (synth_all & 0x10000u) ly = -32767;
+        if (synth_all & 0x20000u) ly = 32767;
+        if (synth_all & 0x40000u) lx = -32767;
+        if (synth_all & 0x80000u) lx = 32767;
+        out[12] = (uint8_t)(lx & 0xFF);
+        out[13] = (uint8_t)((lx >> 8) & 0xFF);
+        out[14] = (uint8_t)(ly & 0xFF);
+        out[15] = (uint8_t)((ly >> 8) & 0xFF);
+    }
     return 20;
 }
+
