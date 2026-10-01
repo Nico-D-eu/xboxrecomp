@@ -370,6 +370,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             {
                 /* The six voices that produced the most, with their DC and
                  * Nyquist content relative to their level. */
+                extern float g_apu_voice_rate[256];
                 extern double g_apu_voice_dc[256], g_apu_voice_nyq[256], g_apu_voice_sq[256];
                 extern unsigned long g_apu_voice_n[256];
                 int shown[6] = { -1, -1, -1, -1, -1, -1 }, k, j;
@@ -384,13 +385,13 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                     }
                     shown[k] = best;
                 }
-                fprintf(stderr, "  [APU]   voices by output (rms, dc, nyquist):");
+                fprintf(stderr, "  [APU]   voices by output (rms, dc, nyquist @rate):");
                 for (k = 0; k < 6 && shown[k] >= 0; k++) {
                     j = shown[k];
-                    fprintf(stderr, " %02X:%.3f/%.3f/%.3f", j,
+                    fprintf(stderr, " %02X:%.3f/%.3f/%.3f@%.2f", j,
                             sqrt(g_apu_voice_sq[j] / g_apu_voice_n[j]),
                             g_apu_voice_dc[j] / g_apu_voice_n[j],
-                            g_apu_voice_nyq[j] / g_apu_voice_n[j]);
+                            g_apu_voice_nyq[j] / g_apu_voice_n[j], g_apu_voice_rate[j]);
                 }
                 fprintf(stderr, "\n");
                 memset(g_apu_voice_dc, 0, sizeof g_apu_voice_dc);

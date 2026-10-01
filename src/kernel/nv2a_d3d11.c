@@ -1909,6 +1909,41 @@ static void do_draw(const Nv2aHwDraw *d)
         }
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srv);
         ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
+        /* RECOMP_TEXVS=<va>: the first draw sampling that texture on stage 1
+         * prints its vertex shader and the program's constants -- to see how
+         * a stage's coordinates are made. */
+        {
+            static int done = -1;
+            static uint32_t want;
+            if (done < 0) {
+                const char *e = getenv("RECOMP_TEXVS");
+                want = e ? (uint32_t)strtoul(e, NULL, 0) : 0;
+                done = want ? 0 : 1;
+            }
+            if (!done && d->tex[1].enabled && d->tex[1].va == want && d->use_vp && d->vp) {
+                static char vsrc[256 * 1024];
+                int wc = 0, c;
+                size_t n = nv2a_hlsl_vs(d->vp, vsrc, sizeof vsrc, &wc);
+                done = 1;
+                fprintf(stderr, "  [TEXVS] draw with texture %08X on stage 1: vertex shader"
+                        " (%u bytes) follows\n", want, (unsigned)n);
+                fwrite(vsrc, 1, n, stderr);
+                fprintf(stderr, "\n  [TEXVS] attributes:");
+                for (c = 0; c < 16; c++)
+                    if (d->attr[c].size)
+                        fprintf(stderr, " %d:type %u size %u stride %u off %08X", c,
+                                d->attr[c].type, d->attr[c].size, d->attr[c].stride,
+                                d->attr[c].offset);
+                fprintf(stderr, "\n  [TEXVS] constants (non-zero):\n");
+                for (c = 0; c < NV2A_VP_CONSTANTS; c++) {
+                    const float *k = d->vp->constants[c];
+                    if (k[0] || k[1] || k[2] || k[3])
+                        fprintf(stderr, "  [TEXVS] c[%d] = %g %g %g %g\n", c - 96 >= 0 ? c - 96 : c,
+                                k[0], k[1], k[2], k[3]);
+                }
+                fflush(stderr);
+            }
+        }
     }
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_psc, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {

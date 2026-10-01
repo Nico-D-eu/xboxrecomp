@@ -1108,6 +1108,10 @@ static void voice_process(MCPXAPUState *d,
                                         NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
     float rate = 1.0f / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
     dbg->rate = rate;
+    {
+        extern float g_apu_voice_rate[256];
+        g_apu_voice_rate[v & 255] = rate;
+    }
 
     /* Step amplitude envelope */
     float ea_value = voice_step_envelope(

@@ -154,6 +154,7 @@ static inline float apu_soft_limit(float x)
 }
 float g_apu_mix_peak;
 double g_apu_voice_dc[256], g_apu_voice_nyq[256], g_apu_voice_sq[256];
+float g_apu_voice_rate[256];
 unsigned long g_apu_voice_n[256];
 unsigned long g_apu_bin_n;
 
