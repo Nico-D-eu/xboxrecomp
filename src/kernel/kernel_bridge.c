@@ -1071,14 +1071,38 @@ static void bridge_NtQueryVirtualMemory(void)
     g_eax = 0;                                          /* STATUS_SUCCESS */
 }
 
+/* NtFreeVirtualMemory(PVOID *BaseAddress, SIZE_T *RegionSize, ULONG FreeType)
+ *
+ * The memory came from bridge_NtAllocateVirtualMemory, so it is a guest heap
+ * block (or a reservation above RAM, which costs nothing to keep). This used
+ * to hand the guest's pointer-to-address to the host's VirtualFree through
+ * xbox_NtFreeVirtualMemory, which read it as a 64-bit native pointer and
+ * failed every time, so nothing allocated this way was ever released. Amped 2
+ * allocates its level pools so (6 MB, 4.5 MB, 2.7 MB, ...): leaving a level
+ * kept them, and the next level load ran the 48 MB heap out and crashed.
+ *
+ * MEM_RELEASE (0x8000) frees the block; MEM_DECOMMIT (0x4000) keeps it --
+ * the heap commits everything, and a commit later is a no-op on it. */
 static void bridge_NtFreeVirtualMemory(void)
 {
     uint32_t base_ptr = STACK_ARG(0);
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
+    uint32_t base;
 
-    g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
-        XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
+    if (!base_ptr || !(base = BRIDGE_MEM32(base_ptr))) {
+        g_eax = 0xC000000Du;                  /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    if (free_type & 0x8000u) {
+        uint32_t size = xbox_HeapBlockSize(base);
+        if (size)
+            xbox_HeapFree(base);
+        BRIDGE_MEM32(base_ptr) = 0;
+        if (size_ptr)
+            BRIDGE_MEM32(size_ptr) = size;
+    }
+    g_eax = 0;                                /* STATUS_SUCCESS */
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─

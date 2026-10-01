@@ -3436,6 +3436,28 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
  * at once are both handed the same block. */
 static volatile LONG g_heap_lock;
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
+
+/* Insert a block record at index i (the table is in address order). 0 when
+ * the table is full -- the caller then simply does not split. */
+static int heap_insert(int i, uint32_t addr, uint32_t size, int free)
+{
+    if (g_heap_block_count >= XBOX_HEAP_MAX_BLOCKS)
+        return 0;
+    memmove(&g_heap_blocks[i + 1], &g_heap_blocks[i],
+            (size_t)(g_heap_block_count - i) * sizeof g_heap_blocks[0]);
+    g_heap_blocks[i].addr = addr;
+    g_heap_blocks[i].size = size;
+    g_heap_blocks[i].free = (uint8_t)free;
+    g_heap_block_count++;
+    return 1;
+}
+
+static void heap_remove(int i)
+{
+    memmove(&g_heap_blocks[i], &g_heap_blocks[i + 1],
+            (size_t)(g_heap_block_count - i - 1) * sizeof g_heap_blocks[0]);
+    g_heap_block_count--;
+}
 static void heap_free_locked(uint32_t xbox_va);
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
@@ -3469,24 +3491,59 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
      * return the same address, causing overlapping structures. Enforce a
      * minimum of 4096 bytes so each allocation gets its own memory. */
     if (size < 16) size = 16;
+    size = (size + 15u) & ~15u;               /* every block starts 16-aligned */
+    if (alignment < 16) alignment = 16;
 
     /* Reuse a freed block first. Without this the heap only ever grows: Halo's
      * debug build allocates and releases heavily through init, exhausted all
      * 48 MB in 4,726 allocations, and its second D3D CreateDevice then failed
      * with E_OUTOFMEMORY -- which the title reports by clearing
-     * global_d3d_device, so the rasterizer asserts and startup stops. */
-    for (int i = 0; i < g_heap_block_count; i++) {
-        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size) {
-            continue;
+     * global_d3d_device, so the rasterizer asserts and startup stops.
+     *
+     * Best fit, and the block is split: the reuse used to hand a whole freed
+     * block to any request that fit, first fit, so a 100 KB request could take
+     * a freed 6 MB level pool and waste the rest. Amped 2 ran out of its 48 MB
+     * loading its second level after the first, with the old level's freed
+     * pools tied up that way. */
+    {
+        int best = -1;
+        uint32_t best_size = 0;
+        for (int i = 0; i < g_heap_block_count; i++) {
+            uint32_t a, pad;
+            if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size)
+                continue;
+            a = (g_heap_blocks[i].addr + alignment - 1) & ~(alignment - 1);
+            pad = a - g_heap_blocks[i].addr;
+            if ((uint64_t)pad + size > g_heap_blocks[i].size)
+                continue;
+            if (best < 0 || g_heap_blocks[i].size < best_size) {
+                best = i;
+                best_size = g_heap_blocks[i].size;
+                if (best_size == size && !pad)
+                    break;
+            }
         }
-        if (g_heap_blocks[i].addr & (alignment - 1)) {
-            continue;   /* wrong alignment for this request */
+        if (best >= 0) {
+            int i = best;
+            uint32_t a = (g_heap_blocks[i].addr + alignment - 1) & ~(alignment - 1);
+            uint32_t pad = a - g_heap_blocks[i].addr;
+            if (pad) {                        /* the alignment gap stays free */
+                if (!heap_insert(i, g_heap_blocks[i].addr, pad, 1))
+                    goto no_reuse;
+                i++;
+                g_heap_blocks[i].addr = a;
+                g_heap_blocks[i].size -= pad;
+            }
+            if (g_heap_blocks[i].size - size >= 64
+                    && heap_insert(i + 1, a + size, g_heap_blocks[i].size - size, 1))
+                g_heap_blocks[i].size = size;
+            g_heap_blocks[i].free = 0;
+            result = a;
+            memset((void *)((uintptr_t)result + g_memory_offset), 0, g_heap_blocks[i].size);
+            return result;
         }
-        g_heap_blocks[i].free = 0;
-        result = g_heap_blocks[i].addr;
-        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
-        return result;
     }
+no_reuse:
 
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
@@ -3605,21 +3662,27 @@ static void heap_free_locked(uint32_t xbox_va)
             fflush(stderr);
         }
 
-        /* Coalesce with neighbours. Blocks are recorded in bump order, so
-         * index order is address order and adjacency is a simple end==start
-         * test. Keeps large contiguous requests satisfiable after a lot of
-         * small churn. */
+        /* Coalesce with neighbours. Index order is address order, so
+         * adjacency is an end==start test. A merged neighbour is removed from
+         * the table: it used to stay as a zero-size record, and the next
+         * neighbour along was then never adjacent in the table, so after
+         * one merge a run of freed blocks stopped coalescing at all. */
         if (i + 1 < g_heap_block_count && g_heap_blocks[i + 1].free &&
             g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[i + 1].addr) {
             g_heap_blocks[i].size += g_heap_blocks[i + 1].size;
-            g_heap_blocks[i + 1].size = 0;
-            g_heap_blocks[i + 1].addr = 0;
+            heap_remove(i + 1);
         }
         if (i > 0 && g_heap_blocks[i - 1].free &&
             g_heap_blocks[i - 1].addr + g_heap_blocks[i - 1].size == g_heap_blocks[i].addr) {
             g_heap_blocks[i - 1].size += g_heap_blocks[i].size;
-            g_heap_blocks[i].size = 0;
-            g_heap_blocks[i].addr = 0;
+            heap_remove(i);
+            i--;
+        }
+        /* A free block at the top is unallocated space again. */
+        if (i == g_heap_block_count - 1
+                && g_heap_blocks[i].addr + g_heap_blocks[i].size >= g_heap_next) {
+            g_heap_next = g_heap_blocks[i].addr;
+            heap_remove(i);
         }
         return;
     }
