@@ -852,6 +852,25 @@ static void rt_release(RtEntry *e)
     memset(e, 0, sizeof *e);
 }
 
+/* RECOMP_GPU_SCALE=<n>: every colour and depth surface is n times the
+ * guest's size in each direction (2 = 1280x960 for a 640x480 title, 3 =
+ * 1920x1440, 4 = 2560x1920), with viewports, scissors and clear rectangles
+ * scaled to match. Surfaces keep their guest size in RtEntry/DsEntry --
+ * texture coordinates and the presenter's aspect work in it -- and only
+ * the D3D11 textures are larger. The guest never reads the pixels back
+ * (it cannot: they stay on the GPU), so it cannot tell. 1 (default) to 8. */
+static int gpu_scale(void)
+{
+    static int sc = 0;
+    if (!sc) {
+        const char *e = getenv("RECOMP_GPU_SCALE");
+        sc = e ? atoi(e) : 1;
+        if (sc < 1) sc = 1;
+        if (sc > 8) sc = 8;
+    }
+    return sc;
+}
+
 static RtEntry *rt_find(uint32_t va)
 {
     int i;
@@ -877,8 +896,8 @@ static RtEntry *rt_get(uint32_t va, uint32_t w, uint32_t h)
     n.w = e && e->w > w ? e->w : w;
     n.h = e && e->h > h ? e->h : h;
     memset(&td, 0, sizeof td);
-    td.Width = n.w;
-    td.Height = n.h;
+    td.Width = n.w * (UINT)gpu_scale();
+    td.Height = n.h * (UINT)gpu_scale();
     td.MipLevels = 1;
     td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -895,7 +914,7 @@ static RtEntry *rt_get(uint32_t va, uint32_t w, uint32_t h)
     }
     s_st.rt_created++;
     if (e) {
-        D3D11_BOX box = { 0, 0, 0, e->w, e->h, 1 };
+        D3D11_BOX box = { 0, 0, 0, e->w * (UINT)gpu_scale(), e->h * (UINT)gpu_scale(), 1 };
         ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)n.tex, 0,
                 0, 0, 0, (ID3D11Resource *)e->tex, 0, &box);
         n.drawn_frame = e->drawn_frame;
@@ -932,8 +951,8 @@ static DsEntry *ds_get(uint32_t va, uint32_t w, uint32_t h)
     memset(&n, 0, sizeof n);
     n.va = va; n.w = w; n.h = h; n.used_frame = s_frame;
     memset(&td, 0, sizeof td);
-    td.Width = w;
-    td.Height = h;
+    td.Width = w * (UINT)gpu_scale();
+    td.Height = h * (UINT)gpu_scale();
     td.MipLevels = 1;
     td.ArraySize = 1;
     td.Format = DXGI_FORMAT_R24G8_TYPELESS;
@@ -1622,7 +1641,7 @@ static void do_draw(const Nv2aHwDraw *d)
      * the back buffer and draws only the text with the GPU. Bring those
      * pixels onto the surface before drawing over them. 32-bit only. */
     if (rt && rt->sig_frame != s_frame && color_bpp(d->format) == 4 && d->pitch
-            && guest_ok(rt->va, d->pitch * rt->h)) {
+            && gpu_scale() == 1 && guest_ok(rt->va, d->pitch * rt->h)) {
         uint64_t sig = rt_mem_sig(rt);
         if (rt->sig_frame && sig != rt->mem_sig) {
             D3D11_BOX box = { 0, 0, 0, rt->w, rt->h, 1 };
@@ -1899,13 +1918,14 @@ static void do_draw(const Nv2aHwDraw *d)
 
     /* Fixed-function state. */
     {
-        D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+        const int S = gpu_scale();
+        D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)(w * S), (float)(h * S), 0.0f, 1.0f };
         D3D11_RECT sc;
         float bf[4];
-        sc.left = (LONG)d->clip_x;
-        sc.top = (LONG)d->clip_y;
-        sc.right = (LONG)(d->clip_x + d->clip_w);
-        sc.bottom = (LONG)(d->clip_y + d->clip_h);
+        sc.left = (LONG)(d->clip_x * S);
+        sc.top = (LONG)(d->clip_y * S);
+        sc.right = (LONG)((d->clip_x + d->clip_w) * S);
+        sc.bottom = (LONG)((d->clip_y + d->clip_h) * S);
         ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
         ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
         ID3D11DeviceContext_RSSetState(s_ctx, raster_state(d));
@@ -1960,10 +1980,10 @@ static void do_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color,
             float c[4];
             D3D11_RECT r;
             unpack_argb(color, c);
-            r.left = (LONG)d->clip_x;
-            r.top = (LONG)d->clip_y;
-            r.right = (LONG)(d->clip_x + d->clip_w);
-            r.bottom = (LONG)(d->clip_y + d->clip_h);
+            r.left = (LONG)(d->clip_x * gpu_scale());
+            r.top = (LONG)(d->clip_y * gpu_scale());
+            r.right = (LONG)((d->clip_x + d->clip_w) * gpu_scale());
+            r.bottom = (LONG)((d->clip_y + d->clip_h) * gpu_scale());
             if (s_ctx1)
                 ID3D11DeviceContext1_ClearView(s_ctx1, (ID3D11View *)rt->rtv, c, &r, 1);
             else
@@ -2186,7 +2206,8 @@ static void gpu_shot(RtEntry *rt)
     ID3D11Texture2D *st = NULL;
     char path[300];
     FILE *f;
-    uint32_t x, y, w = rt->w, h = rt->h, row = w * 3, pad = (4 - row % 4) % 4;
+    uint32_t x, y, w = rt->w * (uint32_t)gpu_scale(), h = rt->h * (uint32_t)gpu_scale();
+    uint32_t row = w * 3, pad = (4 - row % 4) % 4;
 
     if (prefix == (const char *)1) {
         const char *e = getenv("RECOMP_GPU_SHOT_MS");
@@ -2224,7 +2245,7 @@ static void gpu_shot(RtEntry *rt)
     ID3D11Texture2D_Release(st);
     /* RECOMP_GPU_SHOT_MEM: the guest memory under the surface as well, to
      * see what the CPU put there. */
-    if (getenv("RECOMP_GPU_SHOT_MEM")
+    if (getenv("RECOMP_GPU_SHOT_MEM") && gpu_scale() == 1
             && (snprintf(path, sizeof path, "%s%04u_mem.bmp", prefix, seq - 1),
                 f = fopen(path, "wb")) != NULL) {
         const uint8_t *g = guest() + rt->va;
@@ -2258,6 +2279,10 @@ static void do_flip(uint32_t color_va)
             dumps = getenv("RECOMP_FB_DUMP") != NULL;
         /* On the window already, and nobody wants the pixels on the CPU. */
         if (present_frame(rt, rt->w, rt->h) && !dumps)
+            return;
+        /* A scaled surface is not the guest's size, so there is nothing
+         * to read back into guest memory. */
+        if (gpu_scale() > 1)
             return;
     }
     /* The oldest copy first, then reuse its staging texture for this frame.
