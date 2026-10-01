@@ -3358,8 +3358,8 @@ void nv2a_d3d11_get_report(uint32_t va, uint32_t va_alt)
         slot = va;
     else if (guest_ok(va_alt, 16) && *(volatile uint32_t *)(g + va_alt + 12) == 0xFFFFFFFFu)
         slot = va_alt;
-    else if (guest_ok(va, 16))
-        slot = va;
+    /* Nothing marked pending: not a report D3D asked for -- a misread
+     * stream, say. Write nowhere rather than 16 bytes at a guess. */
     if (!slot)
         return;
     /* Complete it now with the slot's last count. The query behind it comes
