@@ -2075,7 +2075,15 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    {   /* Synchronised with the ISR: the ISRs run under the dispatch lock. */
+        extern int  xbox_DispatchLockAcquire(unsigned timeout_ms);
+        extern void xbox_DispatchLockRelease(void);
+        extern int  xbox_DispatchLockEnabled(void);
+        int got = xbox_DispatchLockEnabled() && xbox_DispatchLockAcquire(250);
+        fn();
+        if (got)
+            xbox_DispatchLockRelease();
+    }
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -2525,6 +2533,10 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+extern int  xbox_DispatchLockAcquire(unsigned timeout_ms);
+extern void xbox_DispatchLockRelease(void);
+extern int  xbox_DispatchLockEnabled(void);
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -2562,7 +2574,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
     for (;;) {
         long long now;
-        int i;
+        int i, disp = 0;
         static unsigned held_off;
 
         Sleep(1);
@@ -2613,6 +2625,12 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 }
             }
         }
+        /* DPCs and timer DPCs run holding the dispatch lock (kernel_hal.c):
+         * no guest thread is at DISPATCH while they run, and none can
+         * raise until they are done -- not just "none was raised when we
+         * looked", which left a window. ISRs above keep the bounded gate:
+         * on the console they preempt DISPATCH code. */
+        disp = xbox_DispatchLockEnabled() ? xbox_DispatchLockAcquire(50) : 0;
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
@@ -2645,6 +2663,10 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                     BRIDGE_MEM32(fired_va + 4) = 1;   /* SignalState */
                 }
             }
+        }
+        if (disp) {
+            disp = 0;
+            xbox_DispatchLockRelease();
         }
     }
 }

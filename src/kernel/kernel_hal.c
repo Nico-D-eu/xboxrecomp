@@ -140,6 +140,103 @@ void xbox_IrqlDumpHolders(void)
     fflush(stderr);
 }
 
+/* ── The dispatch lock ──────────────────────────────────────────────────
+ *
+ * The console has one CPU, and its kernel is built for one: there are no
+ * spinlocks, only raising IRQL to DISPATCH_LEVEL, and that is enough --
+ * nothing else runs on the processor until the raiser lowers. XAPI's USB
+ * code, DirectSound and D3D all rely on it. Here guest threads run on
+ * several host cores at once, and the device threads run ISRs and DPCs
+ * beside them, so a raise excluded nobody.
+ *
+ * The count above made device threads hold back while any thread was
+ * raised, but they checked it and then ran, and a raise landing between
+ * the two still overlapped. Amped 2 lost its pad that way: XPP built a
+ * device slot at one address while the handle it returned pointed ten
+ * bytes on (diag/xinput_page0.bin, 2026-10-01), so the handle's device
+ * field stayed 0xCCCCCCCC and XInputGetState and the USB DPC then read
+ * through it -- an intermittent crash, 2 runs in 25.
+ *
+ * So raising to DISPATCH takes this lock and lowering releases it, and the
+ * threads that run ISRs and DPCs hold it while they do: one "processor" at
+ * DISPATCH at a time, as on the console. Recursive for its owner. Bounded,
+ * so that a leaked raise, which used to cost a delay, does not now cost a
+ * hang: past the timeout the caller goes on without it, as before. */
+static volatile LONG s_disp_owner;           /* thread id, 0 = free */
+static LONG s_disp_depth;                    /* owner only */
+static XBOX_THREAD_LOCAL int s_disp_held;    /* this thread's raise took it */
+static volatile LONG s_disp_timeouts;
+
+int xbox_DispatchLockAcquire(unsigned timeout_ms)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    ULONGLONG t0 = 0;
+    unsigned spins = 0;
+
+    if (s_disp_owner == me) {
+        s_disp_depth++;
+        return 1;
+    }
+    for (;;) {
+        if (InterlockedCompareExchange(&s_disp_owner, me, 0) == 0) {
+            s_disp_depth = 1;
+            return 1;
+        }
+        if (++spins < 200) {
+            YieldProcessor();
+            continue;
+        }
+        if (!t0)
+            t0 = GetTickCount64();
+        else if (GetTickCount64() - t0 >= timeout_ms) {
+            if (InterlockedIncrement(&s_disp_timeouts) <= 8) {
+                LONG owner = s_disp_owner;
+                void *ra = NULL;
+                int k;
+                for (k = 0; k < IRQL_HOLDERS; k++)
+                    if (s_holders[k].tid == owner)
+                        ra = s_holders[k].ra;
+                fprintf(stderr, "  [IRQL] dispatch lock held by tid %ld for %u ms"
+                        " (raised from exe+0x%llX); tid %ld goes on without it\n",
+                        (long)owner, timeout_ms,
+                        ra ? (unsigned long long)((uintptr_t)ra
+                                                  - (uintptr_t)GetModuleHandleA(NULL)) : 0ull,
+                        (long)me);
+                fflush(stderr);
+            }
+            return 0;
+        }
+        SwitchToThread();
+    }
+}
+
+void xbox_DispatchLockRelease(void)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    if (s_disp_owner == me && --s_disp_depth == 0)
+        InterlockedExchange(&s_disp_owner, 0);
+}
+
+/* Opt-in, RECOMP_DISPATCH_LOCK=1. On by default it gave a player lag spikes
+ * often enough to spoil a level (2026-10-02): the timer thread, holding the
+ * lock for a DPC pass, ran into something that only a thread queued on the
+ * lock could provide, and the two waited each other out to the 250 ms
+ * timeout ("held by tid ... raised from exe+0x0" is the timer thread). */
+static int dispatch_lock_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_DISPATCH_LOCK");
+        on = e && *e == '1';
+    }
+    return on;
+}
+
+int xbox_DispatchLockEnabled(void)
+{
+    return dispatch_lock_on();
+}
+
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
     int was = (old_level >= DISPATCH_LEVEL);
@@ -149,8 +246,14 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     if (now == was)
         return;
 
+    if (now && dispatch_lock_on())
+        s_disp_held = xbox_DispatchLockAcquire(250);
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
+    if (!now && s_disp_held) {
+        s_disp_held = 0;
+        xbox_DispatchLockRelease();
+    }
     InterlockedIncrement(&s_transitions);
     if (now)
         irql_holder_add(ra);
