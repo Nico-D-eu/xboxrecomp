@@ -48,6 +48,7 @@ typedef struct {
     uint32_t cull_enable, cull_face, front_face;
     uint32_t fog_enable, fog_mode;
     float    fog_param[3];
+    uint32_t shadow_func;          /* SET_SHADOW_DEPTH_FUNC, 0 never .. 7 always */
 
     /* Geometry. */
     uint32_t prim;

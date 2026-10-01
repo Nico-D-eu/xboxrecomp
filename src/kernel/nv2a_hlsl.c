@@ -500,6 +500,16 @@ static void comb_stage(Sb *s, const Nv2aHlslPsKey *k, uint32_t i)
     sb(s, "  }\n");
 }
 
+uint32_t nv2a_hlsl_ps_tag(const Nv2aHlslPsKey *k)
+{
+    const uint8_t *p = (const uint8_t *)k;
+    uint32_t h = 2166136261u, i;
+    for (i = 0; i < sizeof *k; i++)
+        h = (h ^ p[i]) * 16777619u;
+    h ^= h >> 15;
+    return (h | 0x404040u) & 0xFFFFFFu;     /* never too dark to see */
+}
+
 size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
 {
     Sb s = { buf, size, 0, 0 };
@@ -510,6 +520,20 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
            "Texture2D tx2 : register(t2); Texture2D tx3 : register(t3);\n"
            "TextureCube cx0 : register(t4); TextureCube cx1 : register(t5);\n"
            "TextureCube cx2 : register(t6); TextureCube cx3 : register(t7);\n"
+           "Texture3D tv0 : register(t8); Texture3D tv1 : register(t9);\n"
+           "Texture3D tv2 : register(t10); Texture3D tv3 : register(t11);\n"
+           "Texture2D tz0 : register(t12); Texture2D tz1 : register(t13);\n"
+           "Texture2D tz2 : register(t14); Texture2D tz3 : register(t15);\n"
+           /* A depth texture is a shadow map: the texel against the
+            * coordinate's r/q, by SET_SHADOW_DEPTH_FUNC, 1 where it holds. */
+           "float shadow_cmp(float f, float z, float r) {\n"
+           "  switch ((uint)f) {\n"
+           "  case 1: return z < r ? 1.0 : 0.0;  case 2: return z == r ? 1.0 : 0.0;\n"
+           "  case 3: return z <= r ? 1.0 : 0.0; case 4: return z > r ? 1.0 : 0.0;\n"
+           "  case 5: return z != r ? 1.0 : 0.0; case 6: return z >= r ? 1.0 : 0.0;\n"
+           "  case 7: return 1.0; default: return 0.0;\n"
+           "  }\n"
+           "}\n"
            /* The dot mappings (PS_DOTMAPPING): how a texel becomes a vector.
             * MINUS1_TO_1_D3D is biased, (x - 128) / 127, so a flat normal
             * map texel (128, 128, 255) is (0, 0, 1); MINUS1_TO_1_GL is two's
@@ -529,7 +553,7 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
            "SamplerState s2 : register(s2); SamplerState s3 : register(s3);\n"
            "cbuffer PSC : register(b0) {\n"
            "  float4 cf0[8]; float4 cf1[8]; float4 ff0; float4 ff1; float4 fogc;\n"
-           "  float4 tsc[4]; uint4 atest;\n"
+           "  float4 tsc[4]; uint4 atest; float4 tdz[4];\n"
            "};\n"
            "struct PSIn {\n"
            "  float4 pos : SV_Position; float4 d0 : COLOR0; float4 d1 : COLOR1;\n"
@@ -614,9 +638,20 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
                 sb(&s, "    float q = (tc.w != 0.0) ? tc.w : 1.0;\n");
             else
                 sb(&s, "    float q = 1.0;\n");
-            sb(&s, "    t%d = tx%d.Sample(s%d, tc.xy / q * tsc[%d].xy);\n"
+            /* tsc.w: 0 nothing bound, 1 a 2D texture, 2 a 3D one (sampled
+             * with all three coordinates from tv<n>), 3 a depth surface
+             * (tz<n>, compared), 4 a depth texture with no surface drawn
+             * behind it (read as passing, nothing in shadow). */
+            sb(&s, "    if (tsc[%d].w == 2.0) t%d = tv%d.Sample(s%d, tc.xyz / q);\n"
+                   "    else if (tsc[%d].w == 3.0) t%d = shadow_cmp(tdz[%d].y,\n"
+                   "        tz%d.SampleLevel(s%d, tc.xy / q * tsc[%d].xy, 0).r, tc.z / q * tdz[%d].x).xxxx;\n"
+                   "    else if (tsc[%d].w == 4.0) t%d = 1.0;\n"
+                   "    else t%d = tx%d.Sample(s%d, tc.xy / q * tsc[%d].xy);\n"
                    "    if (tsc[%d].z > 0.0) t%d.a = 1.0;\n"
                    "    if (tsc[%d].w == 0.0) t%d = 0;\n  }\n",
+               st, st, st, st,
+               st, st, st, st, st, st, st,
+               st, st,
                st, st, st, st, st, st, st, st);
             break;
         }
@@ -631,7 +666,13 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
             break;
         }
     }
-    sb(&s, "  if (atest.w == 11u) t1 = 1.0;   /* RECOMP_GPU_PS_DEBUG=11: stage 1 white */\n"
+    sb(&s, "  if (atest.w == 11u) t1 = 1.0;   /* RECOMP_GPU_PS_DEBUG=11: stage 1 white */\n");
+    {   /* =18: each program in its own colour (the DRAWDUMP tag) */
+        uint32_t tag = nv2a_hlsl_ps_tag(k);
+        sb(&s, "  if (atest.w == 18u) return float4(%u, %u, %u, 255) / 255.0;\n",
+           (tag >> 16) & 0xFFu, (tag >> 8) & 0xFFu, tag & 0xFFu);
+    }
+    sb(&s,
            "  float4 fog = float4(fogc.rgb, saturate(i.fog));\n"
            "  if (atest.w == 4u) fog.a = 1.0;   /* RECOMP_GPU_PS_DEBUG=4: no fog */\n"
            "  if (atest.w == 5u) return float4(saturate(i.fog).xxx, 1.0); /* =5: fog factor */\n"
@@ -639,6 +680,8 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
            "  if (atest.w == 7u) return float4(t2.rgb, 1.0);\n"
            "  if (atest.w == 8u) return float4(t3.rgb, 1.0);\n"
            "  if (atest.w == 9u) return float4(i.d1.rgb, 1.0); /* =9: specular colour */\n"
+           "  if (atest.w == 12u) return float4(saturate(i.t1.xyz * 0.5 + 0.5), 1.0); /* =12: t1 raw */\n"
+           "  if (atest.w == 13u) return float4(tsc[0].w, tsc[1].w, tsc[2].w, 2.0) * 0.5; /* =13: what stages 0-2 have bound (tsc.w / 2) */\n"
            "  if (atest.w == 10u) { float q1 = i.t1.w != 0.0 ? i.t1.w : 1.0;   /* =10: stage-1 coords */\n"
            "    return float4(frac(i.t1.xy / q1), i.t1.w == 0.0 ? 1.0 : 0.0, 1.0); }\n"
            "  float4 r0 = float4(0, 0, 0, t0.a), r1 = 0;\n"

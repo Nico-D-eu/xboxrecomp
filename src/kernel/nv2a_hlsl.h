@@ -53,6 +53,8 @@ typedef struct {
     float    fogc[4];                /* fog colour                       */
     float    tsc[4][4];              /* per stage: uv scale x,y; z alpha=1; w bound */
     uint32_t atest[4];               /* alpha test: enable, func, ref   */
+    float    tdz[4][4];              /* per stage, a depth texture: x 1/zmax
+                                        of its format, y SET_SHADOW_DEPTH_FUNC */
 } Nv2aHlslPsParams;
 
 /* The combiner state a pixel shader is compiled from: everything that
@@ -80,5 +82,9 @@ size_t nv2a_hlsl_vs_passthrough(char *buf, size_t size);
 
 /* The pixel shader for a combiner setup. */
 size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *key, char *buf, size_t size);
+
+/* A colour (0xRRGGBB) that tells pixel shaders apart: RECOMP_GPU_PS_DEBUG=18
+ * paints each program with its own. */
+uint32_t nv2a_hlsl_ps_tag(const Nv2aHlslPsKey *key);
 
 #endif

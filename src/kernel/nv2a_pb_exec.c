@@ -326,7 +326,7 @@ static struct {
     uint32_t color_mask;
     /* State only the D3D11 backend acts on so far. */
     uint32_t zpitch, blend_eq, blend_color;
-    uint32_t fog_enable, fog_mode;
+    uint32_t fog_enable, fog_mode, shadow_func;
     float    fog_param[3];
     uint32_t cull_enable, cull_face, front_face;
     uint32_t stencil_test, stencil_mask, stencil_func, stencil_ref,
@@ -2276,6 +2276,7 @@ static void hw_fill_targets(Nv2aHwDraw *d)
     d->front_face = s_gpu.front_face;
     d->fog_enable = s_gpu.fog_enable;
     d->fog_mode = s_gpu.fog_mode;
+    d->shadow_func = s_gpu.shadow_func;
     memcpy(d->fog_param, s_gpu.fog_param, sizeof d->fog_param);
     d->vp = &s_vp;
     d->comb = &s_comb;
@@ -3233,6 +3234,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case 0x02A4: s_gpu.fog_enable = param; break;         /* SET_FOG_ENABLE */
     case 0x029C: s_gpu.fog_mode = param; break;           /* SET_FOG_MODE */
+    case 0x1E6C: s_gpu.shadow_func = param & 7u; break;   /* SET_SHADOW_DEPTH_FUNC */
     case 0x09C0: case 0x09C4: case 0x09C8: {              /* SET_FOG_PARAMS */
         union { uint32_t u; float f; } fv;
         fv.u = param;

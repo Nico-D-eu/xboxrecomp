@@ -1145,6 +1145,113 @@ static int tex_upload(TexEntry *e, const Nv2aHwTexture *t, int create)
     return 1;
 }
 
+/* ── Volume textures ─────────────────────────────────────────────────────
+ *
+ * SET_TEXTURE_FORMAT bits 4-7 are the dimensionality and 28-31 log2 of the
+ * depth. A 3D texture was uploaded as its first 2D slice. Amped 2's night
+ * level (BR1) lights its trees and some slopes through a 32x64x32 X8R8G8B8
+ * volume (stage 1, coordinates from the vertex's packed attribute), which
+ * then read only the slice at w = 0. (The level's overall darkness was the
+ * shadow map instead -- see tex_depth_max.) Level 0 only, 32-bit swizzled formats
+ * only -- what the title uses; anything else keeps the old 2D path. A small
+ * cache of its own, hashed sparsely once a frame like the 2D one. */
+typedef struct {
+    uint32_t va, format;
+    uint64_t shash;
+    uint32_t hashed_frame, used_frame;
+    ID3D11Texture3D *tex;
+    ID3D11ShaderResourceView *srv;
+} VolEntry;
+#define VOL_SLOTS 16
+static VolEntry s_vol[VOL_SLOTS];
+
+static int tex_is_volume(const Nv2aHwTexture *t)
+{
+    return ((t->format >> 4) & 0xFu) == 3u && !(t->format & 4u)
+        && d3d8_format_is_swizzled(t->color) && !dxt_block(t->color)
+        && nv2a_pb_texel_bytes(t->color) == 4;
+}
+
+static ID3D11ShaderResourceView *vol_srv(const Nv2aHwTexture *t)
+{
+    uint32_t w = t->width, h = t->height, dp = 1u << ((t->format >> 28) & 0xFu);
+    uint32_t bytes = w * h * dp * 4u, i;
+    VolEntry *e = NULL, *victim = NULL;
+    const uint8_t *src;
+    uint64_t sh;
+
+    if (!w || !h || w > 512 || h > 512 || dp > 512 || !guest_ok(t->va, bytes)) {
+        static int said;
+        if (said++ < 16)
+            fprintf(stderr, "[GPU] volume texture %08X refused: %ux%ux%u format %08X\n",
+                    t->va, w, h, dp, t->format);
+        return NULL;
+    }
+    src = guest() + t->va;
+    for (i = 0; i < VOL_SLOTS; i++) {
+        if (s_vol[i].tex && s_vol[i].va == t->va && s_vol[i].format == t->format) {
+            e = &s_vol[i];
+            break;
+        }
+        if (!victim || !s_vol[i].tex || (victim->tex && s_vol[i].used_frame < victim->used_frame))
+            victim = &s_vol[i];
+    }
+    if (e && e->hashed_frame == s_frame) {
+        e->used_frame = s_frame;
+        return e->srv;
+    }
+    sh = hash_sparse(src, bytes);
+    if (e && sh == e->shash) {
+        e->hashed_frame = e->used_frame = s_frame;
+        return e->srv;
+    }
+    if (!e) {
+        D3D11_TEXTURE3D_DESC td;
+        e = victim;
+        if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+        if (e->tex) ID3D11Texture3D_Release(e->tex);
+        memset(e, 0, sizeof *e);
+        memset(&td, 0, sizeof td);
+        td.Width = w; td.Height = h; td.Depth = dp; td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture3D(s_dev, &td, NULL, &e->tex)))
+            return NULL;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex, NULL, &e->srv);
+        e->va = t->va;
+        e->format = t->format;
+        fprintf(stderr, "[GPU] volume texture %08X: %ux%ux%u fmt %02X\n", t->va, w, h, dp, t->color);
+    }
+    {
+        static uint8_t *lin;
+        static size_t lin_n;
+        if (bytes > lin_n) {
+            free(lin);
+            lin = (uint8_t *)malloc(bytes);
+            lin_n = lin ? bytes : 0;
+            if (!lin)
+                return NULL;
+        }
+        xbox_unswizzle_box(lin, src, w, h, dp, 4);
+        if (getenv("RECOMP_VOL_DUMP")) {   /* diag/vol_<va>.bin, linear BGRA */
+            char path[64];
+            FILE *f;
+            snprintf(path, sizeof path, "diag/vol_%08X.bin", t->va);
+            if ((f = fopen(path, "wb")) != NULL) {
+                fwrite(lin, 1, bytes, f);
+                fclose(f);
+            }
+        }
+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex, 0, NULL,
+                                              lin, w * 4, w * h * 4);
+        s_st.tex_uploads++;
+    }
+    e->shash = sh;
+    e->hashed_frame = e->used_frame = s_frame;
+    return e->srv;
+}
+
 static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w,
                                          uint32_t *out_h, uint32_t *out_levels)
 {
@@ -1552,6 +1659,41 @@ static ID3D11InputLayout *input_layout(const D3D11_INPUT_ELEMENT_DESC *el)
     return il;
 }
 
+/* The depth surface last drawn at `va`, whatever its size, or NULL. */
+static DsEntry *ds_find(uint32_t va)
+{
+    DsEntry *best = NULL;
+    int i;
+    for (i = 0; i < DS_SLOTS; i++)
+        if (s_ds[i].tex && s_ds[i].va == va
+                && (!best || s_ds[i].used_frame > best->used_frame))
+            best = &s_ds[i];
+    return best;
+}
+
+/* A depth texture format's largest value (0 for a colour format): X8_Y24
+ * 0x2A/0x2B swizzled and 0x2E/0x2F linear, Y16 0x2C/0x2D and 0x30/0x31.
+ *
+ * The NV2A samples a depth texture as a shadow map: the texel against the
+ * coordinate's r/q (in the format's depth units), by SET_SHADOW_DEPTH_FUNC,
+ * 1 or 0 in every channel. Amped 2's night level (BR1) blends each terrain
+ * pixel between its lit colour and a dark-blue "in shadow" one (the
+ * specular colour) by that result, from a 512x512 Y16 map at 0x80D20000
+ * that it draws the rider and props into from above. It was read as a
+ * colour texture from guest memory, which our depth pass never writes (the
+ * depth stays on the GPU), so stage 1 read 0 -- the whole level in shadow,
+ * the flat dark blue the player saw. So the map is our own depth surface
+ * at that address, sampled through its SRV; a depth texture with no
+ * surface drawn behind it reads as lit. */
+static float tex_depth_max(uint32_t color)
+{
+    switch (color) {
+    case 0x2A: case 0x2B: case 0x2E: case 0x2F: return 16777215.0f;
+    case 0x2C: case 0x2D: case 0x30: case 0x31: return 65535.0f;
+    default: return 0.0f;
+    }
+}
+
 /* Bind colour and depth targets for `d`. Returns the surface size in *w, *h
  * and the colour entry (NULL for a depth-only pass); 0 if there is nothing
  * to draw into. */
@@ -1626,6 +1768,36 @@ static void do_draw(const Nv2aHwDraw *d)
 
     vs = d->use_vp ? vs_for(d->vp) : s_vs_pass;
     ps = ps_for(d->comb);
+    {   /* RECOMP_SKIP_PS=<hash>[,<hash>]: leave out draws with these pixel
+         * shaders (the DRAWDUMP key), to see what a pass contributes. */
+        static int init;
+        static uint64_t skip[4];
+        static int nskip;
+        if (!init) {
+            const char *e = getenv("RECOMP_SKIP_PS");
+            init = 1;
+            while (e && *e && nskip < 4) {
+                char *end;
+                skip[nskip++] = _strtoui64(e, &end, 16);
+                e = *end ? end + 1 : end;
+            }
+        }
+        static int skip_blend = -1;      /* RECOMP_SKIP_BLEND: every blended draw */
+        if (skip_blend < 0)
+            skip_blend = getenv("RECOMP_SKIP_BLEND") != NULL;
+        if (skip_blend && d->blend_enable)
+            return;
+        if (nskip && d->comb) {
+            Nv2aHlslPsKey pk;
+            uint64_t hk;
+            int k;
+            nv2a_hlsl_ps_key(d->comb, &pk);
+            hk = hash64(&pk, sizeof pk, 3);
+            for (k = 0; k < nskip; k++)
+                if (skip[k] == hk)
+                    return;
+        }
+    }
     if (!vs || !ps) {
         s_st.skipped++;
         return;
@@ -1817,7 +1989,7 @@ static void do_draw(const Nv2aHwDraw *d)
         psd.atest[3] = (uint32_t)dbg;
     }
     {
-        ID3D11ShaderResourceView *srv[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+        ID3D11ShaderResourceView *srv[16] = { NULL };
         ID3D11SamplerState *smp[4] = { NULL, NULL, NULL, NULL };
         for (i = 0; i < 4; i++) {
             const Nv2aHwTexture *t = &d->tex[i];
@@ -1827,6 +1999,37 @@ static void do_draw(const Nv2aHwDraw *d)
 
             if (!t->enabled)
                 continue;
+            /* A depth texture -- a shadow map: the depth surface drawn at
+             * that address, at t12+i, compared in the shader (tsc.w 3); with
+             * no such surface, everything passes (tsc.w 4). */
+            if (tex_depth_max(t->color) > 0.0f) {
+                DsEntry *z = ds_find(t->va);
+                int swz = t->color == 0x2A || t->color == 0x2B
+                       || t->color == 0x2C || t->color == 0x2D;
+                psd.tdz[i][0] = 1.0f / tex_depth_max(t->color);
+                psd.tdz[i][1] = (float)d->shadow_func;
+                psd.tsc[i][2] = 0.0f;
+                psd.tsc[i][3] = 4.0f;
+                if (z && z->srv) {
+                    srv[12 + i] = z->srv;
+                    psd.tsc[i][0] = swz ? 1.0f : 1.0f / (float)z->w;
+                    psd.tsc[i][1] = swz ? 1.0f : 1.0f / (float)z->h;
+                    psd.tsc[i][3] = 3.0f;
+                    smp[i] = sampler(t, 1);
+                }
+                continue;
+            }
+            /* A volume texture: Texture3D tv<i> at t8+i, flagged by tsc.w 2. */
+            if (tex_is_volume(t)) {
+                srv[8 + i] = vol_srv(t);
+                if (srv[8 + i]) {
+                    psd.tsc[i][0] = psd.tsc[i][1] = 1.0f;
+                    psd.tsc[i][2] = (t->color == 0x07 || t->color == 0x1E) ? 1.0f : 0.0f;
+                    psd.tsc[i][3] = 2.0f;
+                    smp[i] = sampler(t, 1);
+                }
+                continue;
+            }
             /* A surface drawn this frame or the last, at this address: the
              * title is sampling what it rendered. */
             src_rt = rt_find(t->va);
@@ -1907,7 +2110,7 @@ static void do_draw(const Nv2aHwDraw *d)
             psd.tsc[i][3] = 1.0f;
             smp[i] = sampler(t, lv);
         }
-        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 8, srv);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 16, srv);
         ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
         /* RECOMP_TEXVS=<va>: the first draw sampling that texture on stage 1
          * prints its vertex shader and the program's constants -- to see how
@@ -1920,13 +2123,23 @@ static void do_draw(const Nv2aHwDraw *d)
                 want = e ? (uint32_t)strtoul(e, NULL, 0) : 0;
                 done = want ? 0 : 1;
             }
+            static uint64_t seen_vs[6];
+            static int nseen_vs;
             if (!done && d->tex[1].enabled && d->tex[1].va == want && d->use_vp && d->vp) {
                 static char vsrc[256 * 1024];
-                int wc = 0, c;
+                int wc = 0, c, k2;
                 size_t n = nv2a_hlsl_vs(d->vp, vsrc, sizeof vsrc, &wc);
-                done = 1;
-                fprintf(stderr, "  [TEXVS] draw with texture %08X on stage 1: vertex shader"
-                        " (%u bytes) follows\n", want, (unsigned)n);
+                uint64_t hv = hash64(vsrc, (uint32_t)n, 7);
+                for (k2 = 0; k2 < nseen_vs && seen_vs[k2] != hv; k2++)
+                    ;
+                if (k2 < nseen_vs)
+                    goto texvs_done;           /* this program already shown */
+                seen_vs[nseen_vs++] = hv;
+                if (nseen_vs >= 6)
+                    done = 1;
+                fprintf(stderr, "  [TEXVS] draw with texture %08X on stage 1 (%u indices,"
+                        " program %d): vertex shader (%u bytes) follows\n", want,
+                        d->idx_count, nseen_vs, (unsigned)n);
                 fwrite(vsrc, 1, n, stderr);
                 fprintf(stderr, "\n  [TEXVS] attributes:");
                 for (c = 0; c < 16; c++)
@@ -1934,14 +2147,128 @@ static void do_draw(const Nv2aHwDraw *d)
                         fprintf(stderr, " %d:type %u size %u stride %u off %08X", c,
                                 d->attr[c].type, d->attr[c].size, d->attr[c].stride,
                                 d->attr[c].offset);
+                fprintf(stderr, "\n  [TEXVS] attr1 offset %08X, inline %d, %u indices, idx0 %u",
+                        d->attr[1].offset, d->inline_base != NULL, d->idx_count,
+                        d->idx_count ? d->idx[0] : 0);
+                {
+                    uint32_t tb = d->tex[1].width * d->tex[1].height * 4u;
+                    FILE *tf = guest_ok(want, tb) ? fopen("diag/texvs_stage1.bin", "wb") : NULL;
+                    if (tf) {
+                        fwrite(guest() + want, 1, tb, tf);
+                        fclose(tf);
+                        fprintf(stderr, "\n  [TEXVS] stage-1 texture %ux%u fmt %02X (format word %08X)"
+                                " written to diag/texvs_stage1.bin", d->tex[1].width,
+                                d->tex[1].height, d->tex[1].color, d->tex[1].format);
+                    }
+                }
+                if (d->inline_base && d->attr[1].size && d->idx_count) {
+                    int vi;
+                    for (vi = 0; vi < 4 && vi < (int)d->idx_count; vi++) {
+                        uint32_t off = d->attr[1].offset + d->idx[vi] * d->attr[1].stride;
+                        if (off + 4 <= d->inline_bytes) {
+                            uint32_t u = *(const uint32_t *)(d->inline_base + off);
+                            fprintf(stderr, "\n  [TEXVS] inline vertex %u attr1 = %08X -> CMP"
+                                    " %.3f %.3f %.3f; as bytes %u %u %u %u", d->idx[vi], u,
+                                    (float)((int32_t)(u << 21) >> 21) / 1023.0f,
+                                    (float)((int32_t)(u << 10) >> 21) / 1023.0f,
+                                    (float)((int32_t)u >> 22) / 511.0f,
+                                    u & 0xFF, (u >> 8) & 0xFF, (u >> 16) & 0xFF, u >> 24);
+                        }
+                    }
+                }
+                if (!d->inline_base && d->attr[1].size && d->idx_count) {
+                    int vi;
+                    for (vi = 0; vi < 4 && vi < (int)d->idx_count; vi++) {
+                        uint32_t va = d->attr[1].offset + d->idx[vi] * d->attr[1].stride;
+                        if (guest_ok(va, 4)) {
+                            uint32_t u = *(const uint32_t *)(guest() + va);
+                            fprintf(stderr, "\n  [TEXVS] vertex %u attr1 @%08X = %08X -> CMP"
+                                    " %.3f %.3f %.3f", d->idx[vi], va, u,
+                                    (float)((int32_t)(u << 21) >> 21) / 1023.0f,
+                                    (float)((int32_t)(u << 10) >> 21) / 1023.0f,
+                                    (float)((int32_t)u >> 22) / 511.0f);
+                        }
+                    }
+                }
                 fprintf(stderr, "\n  [TEXVS] constants (non-zero):\n");
                 for (c = 0; c < NV2A_VP_CONSTANTS; c++) {
                     const float *k = d->vp->constants[c];
                     if (k[0] || k[1] || k[2] || k[3])
-                        fprintf(stderr, "  [TEXVS] c[%d] = %g %g %g %g\n", c - 96 >= 0 ? c - 96 : c,
+                        fprintf(stderr, "  [TEXVS] c[%d] = %g %g %g %g\n", c,
                                 k[0], k[1], k[2], k[3]);
                 }
+                if (d->comb) {                 /* and the pixel shader */
+                    Nv2aHlslPsKey pk;
+                    nv2a_hlsl_ps_key(d->comb, &pk);
+                    n = nv2a_hlsl_ps(&pk, vsrc, sizeof vsrc);
+                    fprintf(stderr, "  [TEXVS] pixel shader (%u bytes) follows\n", (unsigned)n);
+                    fwrite(vsrc, 1, n, stderr);
+                    fprintf(stderr, "\n");
+                }
                 fflush(stderr);
+            }
+        texvs_done:;
+        }
+        /* RECOMP_DRAW_DUMP=<min indices>: each distinct pixel shader used by
+         * a draw that large (after frame 600) prints its four stages' state
+         * and its source -- once each, up to 24. */
+        {
+            static int min_idx = -1, nkeys;
+            static uint64_t keys[24];
+            if (min_idx < 0) {
+                const char *e = getenv("RECOMP_DRAW_DUMP");
+                min_idx = e ? atoi(e) : 0;
+            }
+            if (min_idx > 0 && nkeys < 24 && d->comb && s_frame > 600
+                    && d->idx_count >= (uint32_t)min_idx) {
+                static char psrc[64 * 1024];
+                Nv2aHlslPsKey pk;
+                uint64_t hk;
+                int k2;
+                size_t n;
+                nv2a_hlsl_ps_key(d->comb, &pk);
+                hk = hash64(&pk, sizeof pk, 3);
+                for (k2 = 0; k2 < nkeys && keys[k2] != hk; k2++)
+                    ;
+                if (k2 == nkeys) {
+                    keys[nkeys++] = hk;
+                    fprintf(stderr, "  [DRAWDUMP] frame %u, %u indices, shader %016llx tag %06X:\n",
+                            s_frame, d->idx_count, (unsigned long long)hk,
+                            nv2a_hlsl_ps_tag(&pk));
+                    fprintf(stderr, "  [DRAWDUMP]   blend %u src %04X dst %04X eq %04X color %08X"
+                            " mask %08X depth %u func %04X zmask %u fog %u\n", d->blend_enable,
+                            d->blend_sfactor, d->blend_dfactor, d->blend_eq, d->blend_color,
+                            d->color_mask, d->depth_test, d->depth_func, d->depth_mask,
+                            d->fog_enable);
+                    fprintf(stderr, "  [DRAWDUMP]   factor0 %08X %08X factor1 %08X %08X final %08X %08X"
+                            " fog %08X\n", d->comb->factor0[0], d->comb->factor0[1],
+                            d->comb->factor1[0], d->comb->factor1[1], d->comb->final_factor0,
+                            d->comb->final_factor1, d->comb->fog_color);
+                    for (k2 = 0; k2 < 4; k2++) {
+                        const Nv2aHwTexture *t = &d->tex[k2];
+                        uint32_t tb = dxt_block(t->color)
+                            ? t->width * t->height / (t->color == 0x0C ? 2u : 1u)
+                            : t->width * t->height * nv2a_pb_texel_bytes(t->color);
+                        fprintf(stderr, "  [DRAWDUMP]   stage %d: en %d va %08X format %08X"
+                                " color %02X %ux%u addr %08X filter %08X\n", k2, t->enabled,
+                                t->va, t->format, t->color, t->width, t->height,
+                                t->address, t->filter);
+                        tb *= 2;                /* with room for the mip chain */
+                        if (t->va && tb && tb <= (1u << 21) && guest_ok(t->va, tb)) {
+                            char path[64];      /* raw, diag/tex_<va>.bin */
+                            FILE *f;
+                            snprintf(path, sizeof path, "diag/tex_%08X.bin", t->va);
+                            if ((f = fopen(path, "wb")) != NULL) {
+                                fwrite(guest() + t->va, 1, tb, f);
+                                fclose(f);
+                            }
+                        }
+                    }
+                    n = nv2a_hlsl_ps(&pk, psrc, sizeof psrc);
+                    fwrite(psrc, 1, n, stderr);
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
+                }
             }
         }
     }
