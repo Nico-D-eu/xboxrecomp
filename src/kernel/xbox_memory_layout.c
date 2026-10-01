@@ -3304,6 +3304,20 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     return r;
 }
 
+/* Reused contiguous memory is handed out as it is, as
+ * MmAllocateContiguousMemory does on the console (never-used memory is zero
+ * anyway). Zeroing it wiped data a title still drew from after freeing it:
+ * Amped 2 frees its loading-screen package while that screen is up, and the
+ * level's allocations zeroed the picture -- the loading screen showed only
+ * its text. RECOMP_CONTIG_ZERO=1 zeroes as before. */
+static int contig_nozero(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = getenv("RECOMP_CONTIG_ZERO") == NULL;
+    return v;
+}
+
 static uint32_t contig_alloc_locked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
@@ -3335,7 +3349,8 @@ static uint32_t contig_alloc_locked(uint32_t size, uint32_t alignment)
         g_contig_blocks[i].base = a;
         g_contig_blocks[i].size = size;
         g_contig_blocks[i].free = 0;
-        memset((void *)((uintptr_t)a + g_memory_offset), 0, size);
+        if (!contig_nozero())
+            memset((void *)((uintptr_t)a + g_memory_offset), 0, size);
         /* Reuse at the very bottom of the window is where a driver's DMA
          * blocks and a title's render targets can meet; name the first few,
          * with the guest return address of whoever asked. */
@@ -3380,7 +3395,8 @@ static uint32_t contig_alloc_locked(uint32_t size, uint32_t alignment)
     g_contig_next = result + size;
     if (g_contig_next > g_contig_high)
         g_contig_high = g_contig_next;
-    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    if (!contig_nozero())
+        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
 }
 
