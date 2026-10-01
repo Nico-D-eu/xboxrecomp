@@ -1064,7 +1064,14 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * controller zeroes, so a dword write is what hardware does. */
             if (hcca)
                 wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
-            InterlockedOr((volatile LONG *)&hc->reg[HcInterruptStatus / 4], (LONG)(INTR_SF));
+            /* StartOfFrame is raised after this tick's lists are walked (see
+             * below), not here. A driver removing an endpoint sets its skip
+             * bit and frees the descriptors after the next SOF, trusting that
+             * the controller has finished with them; raised before the walk,
+             * an SOF could follow a skip set during the walk, and the
+             * descriptor completed in that walk was freed under its done-list
+             * entry -- a DPC then walked a TD pointer of 0xFFFFFFFF
+             * (sub_00335680, Amped 2 level 3). */
         }
 
         /* Be the bus master. ControlListEnable in HcControl says the driver
@@ -1084,8 +1091,11 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * gamepad's reports starting. Leaving the descriptors on their
          * endpoints for another pass costs a few milliseconds of latency
          * and is what the controller is specified to do. */
-        if (hc->reg[HcInterruptStatus / 4] & INTR_WDH)
+        if (hc->reg[HcInterruptStatus / 4] & INTR_WDH) {
+            /* No list walked this tick, so the frame can start now. */
+            InterlockedOr((volatile LONG *)&hc->reg[HcInterruptStatus / 4], (LONG)(INTR_SF));
             goto deliver;
+        }
 
         /* One done list per acknowledgement, across all three lists.
          *
@@ -1136,6 +1146,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
 
         if (done_any)
             ohci_publish_done(hc, done_all);
+        InterlockedOr((volatile LONG *)&hc->reg[HcInterruptStatus / 4], (LONG)(INTR_SF));
 
         /* Level-triggered, which is what OHCI is: while an enabled source is
          * set, the line is asserted. The handler clears the status bit, so
