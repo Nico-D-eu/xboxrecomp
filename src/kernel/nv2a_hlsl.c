@@ -632,6 +632,8 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
         }
     }
     sb(&s, "  float4 fog = float4(fogc.rgb, saturate(i.fog));\n"
+           "  if (atest.w == 4u) fog.a = 1.0;   /* RECOMP_GPU_PS_DEBUG=4: no fog */\n"
+           "  if (atest.w == 5u) return float4(saturate(i.fog).xxx, 1.0); /* =5: fog factor */\n"
            "  float4 r0 = float4(0, 0, 0, t0.a), r1 = 0;\n"
            "  float4 outc;\n");
 
