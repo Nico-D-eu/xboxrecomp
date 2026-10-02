@@ -101,7 +101,8 @@ int xbox_IrqlTransitions(void)
  * name: these are host addresses inside the recompiled image, so nm resolves
  * them to the generated function, which is the guest function. */
 #define IRQL_HOLDERS 8
-static struct { volatile LONG tid; void *ra; } s_holders[IRQL_HOLDERS];
+static struct { volatile LONG tid; void *ra; uint32_t guest; } s_holders[IRQL_HOLDERS];
+extern XBOX_THREAD_LOCAL uint32_t g_xbox_kernel_caller;   /* kernel_bridge.c (RECOMP_TLS) */
 
 static void irql_holder_add(void *ra)
 {
@@ -111,6 +112,7 @@ static void irql_holder_add(void *ra)
     for (i = 0; i < IRQL_HOLDERS; i++)
         if (InterlockedCompareExchange(&s_holders[i].tid, me, 0) == 0) {
             s_holders[i].ra = ra;
+            s_holders[i].guest = g_xbox_kernel_caller;
             return;
         }
 }
@@ -164,6 +166,8 @@ void xbox_IrqlDumpHolders(void)
  * hang: past the timeout the caller goes on without it, as before. */
 static volatile LONG s_disp_owner;           /* thread id, 0 = free */
 static LONG s_disp_depth;                    /* owner only */
+static LARGE_INTEGER s_disp_t0;              /* when the owner took it */
+static uint32_t s_disp_site;                 /* the owner's guest caller */
 static XBOX_THREAD_LOCAL int s_disp_held;    /* this thread's raise took it */
 static volatile LONG s_disp_timeouts;
 
@@ -180,6 +184,8 @@ int xbox_DispatchLockAcquire(unsigned timeout_ms)
     for (;;) {
         if (InterlockedCompareExchange(&s_disp_owner, me, 0) == 0) {
             s_disp_depth = 1;
+            QueryPerformanceCounter(&s_disp_t0);
+            s_disp_site = g_xbox_kernel_caller;
             return 1;
         }
         if (++spins < 200) {
@@ -191,17 +197,15 @@ int xbox_DispatchLockAcquire(unsigned timeout_ms)
         else if (GetTickCount64() - t0 >= timeout_ms) {
             if (InterlockedIncrement(&s_disp_timeouts) <= 8) {
                 LONG owner = s_disp_owner;
-                void *ra = NULL;
+                uint32_t guest = 0;
                 int k;
                 for (k = 0; k < IRQL_HOLDERS; k++)
                     if (s_holders[k].tid == owner)
-                        ra = s_holders[k].ra;
+                        guest = s_holders[k].guest;
                 fprintf(stderr, "  [IRQL] dispatch lock held by tid %ld for %u ms"
-                        " (raised from exe+0x%llX); tid %ld goes on without it\n",
-                        (long)owner, timeout_ms,
-                        ra ? (unsigned long long)((uintptr_t)ra
-                                                  - (uintptr_t)GetModuleHandleA(NULL)) : 0ull,
-                        (long)me);
+                        " (raised from guest 0x%08X); tid %ld (guest 0x%08X) goes on"
+                        " without it\n", (long)owner, timeout_ms, guest, (long)me,
+                        g_xbox_kernel_caller);
                 fflush(stderr);
             }
             return 0;
@@ -213,28 +217,58 @@ int xbox_DispatchLockAcquire(unsigned timeout_ms)
 void xbox_DispatchLockRelease(void)
 {
     LONG me = (LONG)GetCurrentThreadId();
-    if (s_disp_owner == me && --s_disp_depth == 0)
+    if (s_disp_owner == me && --s_disp_depth == 0) {
+        /* RECOMP_DISPATCH_TRACE: holds of 10 ms or more, with where the
+         * holder raised (the first 64). */
+        static int trace = -1;
+        if (trace < 0)
+            trace = getenv("RECOMP_DISPATCH_TRACE") != NULL;
+        if (trace) {
+            static LARGE_INTEGER f;
+            static volatile LONG said;
+            LARGE_INTEGER now;
+            double ms;
+            if (!f.QuadPart) QueryPerformanceFrequency(&f);
+            QueryPerformanceCounter(&now);
+            ms = (double)(now.QuadPart - s_disp_t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+            if (ms >= 10.0 && InterlockedIncrement(&said) <= 64) {
+                fprintf(stderr, "  [IRQL] tid %ld held DISPATCH %.1f ms, raised at guest 0x%08X\n",
+                        (long)me, ms, s_disp_site);
+                fflush(stderr);
+            }
+        }
         InterlockedExchange(&s_disp_owner, 0);
+    }
 }
 
-/* Opt-in, RECOMP_DISPATCH_LOCK=1. On by default it gave a player lag spikes
+/* RECOMP_DISPATCH_LOCK: 0 off; 1 (default) guest raises, so two guest
+ * threads are never at DISPATCH together -- which is what DirectSound's and
+ * XAPI's critical sections assume; 2 also holds it across the timer thread's
+ * DPC passes. 2 was the first default, and it gave a player lag spikes
  * often enough to spoil a level (2026-10-02): the timer thread, holding the
- * lock for a DPC pass, ran into something that only a thread queued on the
+ * lock for a whole DPC pass, ran into something only a thread queued on the
  * lock could provide, and the two waited each other out to the 250 ms
- * timeout ("held by tid ... raised from exe+0x0" is the timer thread). */
+ * timeout ("held by tid ... raised from exe+0x0" is the timer thread). At 1,
+ * a DPC takes it only where its own code raises, as on the console. */
+static int dispatch_lock_level(void)
+{
+    static int lvl = -1;
+    if (lvl < 0) {
+        const char *e = getenv("RECOMP_DISPATCH_LOCK");
+        lvl = e && *e ? atoi(e) : 1;
+    }
+    return lvl;
+}
+
 static int dispatch_lock_on(void)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_DISPATCH_LOCK");
-        on = e && *e == '1';
-    }
-    return on;
+    return dispatch_lock_level() >= 1;
 }
 
+/* The level (see dispatch_lock_level): callers test >= 1 or >= 2. */
 int xbox_DispatchLockEnabled(void)
 {
-    return dispatch_lock_on();
+    return dispatch_lock_level();
 }
 
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)

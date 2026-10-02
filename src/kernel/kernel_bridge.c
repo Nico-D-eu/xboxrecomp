@@ -2625,12 +2625,12 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 }
             }
         }
-        /* DPCs and timer DPCs run holding the dispatch lock (kernel_hal.c):
+        /* RECOMP_DISPATCH_LOCK=2: DPCs and timer DPCs run holding the dispatch lock (kernel_hal.c):
          * no guest thread is at DISPATCH while they run, and none can
          * raise until they are done -- not just "none was raised when we
          * looked", which left a window. ISRs above keep the bounded gate:
          * on the console they preempt DISPATCH code. */
-        disp = xbox_DispatchLockEnabled() ? xbox_DispatchLockAcquire(50) : 0;
+        disp = xbox_DispatchLockEnabled() >= 2 ? xbox_DispatchLockAcquire(50) : 0;
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
@@ -3526,6 +3526,54 @@ static int bridge_async_io_enabled(void)
     return on;
 }
 
+/* RECOMP_READ_VERIFY=1: read the same bytes again through a handle of our
+ * own and compare -- whether what a title's decoder chokes on is what is on
+ * disk. Logs a mismatch with the file's path, the offset and the first
+ * differing byte (the first 32 mismatches), and a tally every 2000 reads. */
+static void bridge_verify_read(HANDLE h, long long at, const uint8_t *got, uint32_t n)
+{
+    static int on = -1;
+    static volatile LONG reads, bad;
+    WCHAR path[MAX_PATH];
+    HANDLE h2;
+    uint8_t *mine;
+    DWORD r = 0;
+    OVERLAPPED ov;
+    uint32_t i;
+
+    if (on < 0)
+        on = getenv("RECOMP_READ_VERIFY") != NULL;
+    if (!on || !n || !got)
+        return;
+    if (!GetFinalPathNameByHandleW(h, path, MAX_PATH, 0))
+        return;
+    h2 = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     NULL, OPEN_EXISTING, 0, NULL);
+    if (h2 == INVALID_HANDLE_VALUE)
+        return;
+    mine = (uint8_t *)malloc(n);
+    memset(&ov, 0, sizeof ov);
+    ov.Offset = (DWORD)at;
+    ov.OffsetHigh = (DWORD)(at >> 32);
+    if (mine && ReadFile(h2, mine, n, &r, &ov)) {
+        for (i = 0; i < n && i < r && mine[i] == got[i]; i++)
+            ;
+        if (i < n && i < r) {
+            if (InterlockedIncrement(&bad) <= 32)
+                fprintf(stderr, "  [READ] MISMATCH %S @%lld len %u: byte %u is %02X, disk has %02X\n",
+                        path, at, n, i, got[i], mine[i]);
+        } else if (r < n) {
+            if (InterlockedIncrement(&bad) <= 32)
+                fprintf(stderr, "  [READ] SHORT %S @%lld: delivered %u, disk has %u\n",
+                        path, at, n, (unsigned)r);
+        }
+    }
+    if (InterlockedIncrement(&reads) % 2000 == 0)
+        fprintf(stderr, "  [READ] verified %ld reads, %ld mismatched\n", (long)reads, (long)bad);
+    free(mine);
+    CloseHandle(h2);
+}
+
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
@@ -3549,8 +3597,19 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
+    {   /* RECOMP_READ_VERIFY: where a sequential read starts, for the check below. */
+        static int verify = -1;
+        if (verify < 0)
+            verify = getenv("RECOMP_READ_VERIFY") != NULL;
+        if (verify && !poff) {
+            LARGE_INTEGER z = {0};
+            SetFilePointerEx(handle, z, &off, FILE_CURRENT);
+        }
+    }
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+    bridge_verify_read(handle, poff ? off.QuadPart : off.QuadPart,
+                       (const uint8_t *)XBOX_TO_NATIVE(buffer_va), (uint32_t)ios.Information);
 
     /* RECOMP_DVD_SPEED=<KB/s>: take as long as a disc would -- a millisecond
      * of seek plus the transfer at that rate. A host SSD delivers a level in
