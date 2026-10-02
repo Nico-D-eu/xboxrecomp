@@ -1166,3 +1166,43 @@ uint64_t xbox_ReadTimeStampCounter(void)
              + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
     }
 }
+/* ============================================================================
+ * Port I/O
+ *
+ * The lifter turns `in`/`out` into these. Titles reach very few ports: the
+ * kernel owns the SMBus and PCI configuration, so what is left is what the
+ * D3D library reads directly.
+ *
+ * 0x80C0 is in the ACPI block's GPIO range, and bit 5 there is the TV
+ * encoder's field pin. D3D's vblank handler (0x00322390 in Amped 2) and its
+ * ISR read it to know which field is being scanned, and GetDisplayFieldStatus
+ * reports that field. XMV starts a movie only on an even field, so a pin that
+ * never moves keeps every movie at its first frame. It alternates with the
+ * vblank count here, as AvSendTVEncoderOption's field does, so the two agree.
+ * ========================================================================= */
+uint32_t xbox_PortIn(uint16_t port, int size)
+{
+    extern volatile long g_xbox_vblank_count;
+    static volatile long logged;
+
+    if (port == 0x80C0)
+        return (g_xbox_vblank_count & 1) ? 0x20u : 0u;
+    if (InterlockedIncrement(&logged) <= 8) {
+        fprintf(stderr, "  [PORT] in %d byte(s) from 0x%04X: unmodelled, reads 0\n",
+                size, port);
+        fflush(stderr);
+    }
+    return 0;
+}
+
+void xbox_PortOut(uint16_t port, uint32_t value, int size)
+{
+    static volatile long logged;
+
+    if (InterlockedIncrement(&logged) <= 8) {
+        fprintf(stderr, "  [PORT] out %d byte(s) 0x%X to 0x%04X: ignored\n",
+                size, value, port);
+        fflush(stderr);
+    }
+}
+

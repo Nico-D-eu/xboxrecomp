@@ -1737,6 +1737,31 @@ class Lifter:
         # The runtime scales the host's counter to the console's clock rate
         # rather than returning the host TSC, so the guest's own division by
         # its hardcoded frequency yields real seconds.
+        # ── Port I/O ──
+        # in/out with a register or immediate port go to the runtime's port
+        # model (xbox_PortIn/xbox_PortOut). Untranslated, `in` left its
+        # destination holding whatever was there: D3D's vblank handler reads
+        # the TV encoder's field pin at 0x80C0 that way, so the field it
+        # reported never changed, and XMV -- which starts a movie only on an
+        # even field -- waited for good. The string forms (ins/outs) are
+        # still unimplemented; everything that reaches them is data.
+        if m in ("in", "out") and len(ops) == 2:
+            port_op, data_op = (ops[1], ops[0]) if m == "in" else (ops[0], ops[1])
+            sizes = {"al": 1, "ax": 2, "eax": 4}
+            if data_op.type == "reg" and data_op.reg in sizes and (
+                    (port_op.type == "reg" and port_op.reg == "dx")
+                    or port_op.type == "imm"):
+                size = sizes[data_op.reg]
+                port = ("(uint16_t)LO16(edx)" if port_op.type == "reg"
+                        else f"(uint16_t){_fmt_imm(port_op.imm)}")
+                if m == "in":
+                    return [_fmt_set_reg(data_op.reg,
+                                         f"xbox_PortIn({port}, {size})")
+                            + f" /* in {insn.op_str} */"]
+                return [f"xbox_PortOut({port}, {_fmt_operand_read(data_op)}, {size});"
+                        f" /* out {insn.op_str} */"]
+            return self._unimplemented(insn, m)
+
         if m == "rdtsc":
             return [
                 "{ uint64_t _tsc = xbox_ReadTimeStampCounter();",
