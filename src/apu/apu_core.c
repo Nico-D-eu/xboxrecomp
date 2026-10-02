@@ -363,6 +363,27 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                             ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_PAR_NEXT),
                             ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_TAR_VOLA),
                             ldl_le_phys(address_space_memory, vb + NV_PAVS_VOICE_TAR_PITCH_LINK));
+                    if ((fmt & (1u << 24)) && v < MCPX_HW_MAX_VOICES) {
+                        /* A stream voice: its current segment (SSL entry),
+                         * what the APU reads there, and what the other store
+                         * holds at the same number. */
+                        int si = d->vp.ssl[v].ssl_index;
+                        uint32_t pg = d->vp.ssl[v].base[si] + d->vp.ssl[v].ssl_seg;
+                        uint32_t so = ldl_le_phys(address_space_memory,
+                                                  d->regs[NV_PAPU_VPSSLADDR] + pg * 8);
+                        uint32_t sl = ldl_le_phys(address_space_memory,
+                                                  d->regs[NV_PAPU_VPSSLADDR] + pg * 8 + 4);
+                        extern void *xbox_GetMemoryBase(void);
+                        const uint8_t *a = apu_phys(so);
+                        const uint8_t *c = g_apu_ram_ptr + (so & 0x03FFFFFF);
+                        const uint8_t *lo = (const uint8_t *)xbox_GetMemoryBase() + (so & 0x03FFFFFF);
+                        fprintf(stderr, "  [APU]     stream ssl %d seg %d count %d -> phys %08X len %08X;"
+                                " read %02X%02X%02X%02X%02X%02X%02X%02X window %02X%02X%02X%02X"
+                                " low RAM %02X%02X%02X%02X\n", si, d->vp.ssl[v].ssl_seg,
+                                d->vp.ssl[v].count[si], so, sl,
+                                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                                c[0], c[1], c[2], c[3], lo[0], lo[1], lo[2], lo[3]);
+                    }
                     if (!(fmt & (1u << 24)) && !(fmt & (1u << 21))) {
                         /* A buffer voice: where its data is, and what each of
                          * the two stores holds there. Physical addresses are
@@ -628,6 +649,7 @@ static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
     bool stalled = false;     /* waiting out a trapped front end */
+    int64_t trap_since_us = 0;  /* when the current trap began (0: none) */
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -653,6 +675,8 @@ static void *mcpx_apu_frame_thread(void *arg)
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
+        if (apu_active)
+            trap_since_us = 0;
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             int64_t f0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME), f1;
@@ -667,7 +691,9 @@ static void *mcpx_apu_frame_thread(void *arg)
                 update_irq(d);
             }
         } else if (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF && xa2_is_active()
-                   && !g_test_tone.active) {
+                   && !g_test_tone.active
+                   && (!trap_since_us
+                       || qemu_clock_get_us(QEMU_CLOCK_REALTIME) - trap_since_us < 5000)) {
             /* Front end trapped or halted: DirectSound's idle-voice method
              * (SE2FE_IDLE_VOICE) traps it until the title's ISR and DPC have
              * run, a timer-thread pass or more here. This used to emit the
@@ -678,6 +704,12 @@ static void *mcpx_apu_frame_thread(void *arg)
              * xemu's frame thread does); wait for the title to release it,
              * without moving the schedule, and the output queue's pacing
              * makes the time up. */
+            /* Bounded: a front end held for 5 ms on end (once, 1 run in 12,
+             * the title left it trapped through most of a level and the APU
+             * ran at a third of real time) gets the old treatment below --
+             * silent sub-frames on schedule -- until it is released. */
+            if (!trap_since_us)
+                trap_since_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
             if (d->set_irq) {
                 d->set_irq = false;
                 update_irq(d);

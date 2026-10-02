@@ -146,6 +146,12 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
     g_apu_stat_off++;
+    {
+        const char *e = getenv("RECOMP_APU_VOICE_TRACE");
+        if (e && (int)strtol(e, NULL, 0) == (int)v)
+            fprintf(stderr, "  [APUV] voice %02X off (fmt %08X)\n", v,
+                    voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF));
+    }
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -210,6 +216,32 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     d->regs[NV_PAPU_FEDECMETH] = method;
     d->regs[NV_PAPU_FEDECPARAM] = argument;
     unsigned int selected_handle, list;
+
+    {   /* RECOMP_APU_VOICE_TRACE=<handle>: every method that names that voice,
+         * directly (on/off/release/pause) or as the current voice. */
+        static int tv = -2;
+        static unsigned said;
+        if (tv == -2) {
+            const char *e = getenv("RECOMP_APU_VOICE_TRACE");
+            tv = e ? (int)strtol(e, NULL, 0) : -1;
+        }
+        if (tv >= 0 && said < 20000 && method != NV1BA0_PIO_SET_CURRENT_VOICE) {
+            int direct = (method == NV1BA0_PIO_VOICE_ON || method == NV1BA0_PIO_VOICE_OFF
+                          || method == NV1BA0_PIO_VOICE_RELEASE
+                          || method == NV1BA0_PIO_VOICE_PAUSE)
+                         && (int)(argument & 0xFFFF) == tv;
+            int current = method >= 0x300 && method < 0x400
+                          && (int)(d->regs[NV_PAPU_FECV] & 0xFFFF) == tv;
+            if (direct || current || (method == NV1BA0_PIO_SET_CURRENT_VOICE
+                                      && (int)(argument & 0xFFFF) == tv)) {
+                said++;
+                fprintf(stderr, "  [APUV] voice %02X method %04X arg %08X (fmt %08X state %08X)\n",
+                        tv, method, argument,
+                        voice_get_mask(d, (uint16_t)tv, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
+                        voice_get_mask(d, (uint16_t)tv, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFF));
+            }
+        }
+    }
 
     switch (method) {
     case NV1BA0_PIO_VOICE_LOCK:
@@ -1074,6 +1106,34 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
  * Voice processing (main per-voice function)
  * ============================================================ */
 
+/* A buffer voice that loops exactly one VP frame (32 samples) reads back
+ * DSP output: DirectSound points such voices at a buffer the GP rewrites
+ * every frame, to put its effect returns into the mix. Our GP is a stub
+ * and never writes it, so the voice repeats whatever the memory held --
+ * in Amped 2, after a few level loads, 32 samples of the DSP's own program
+ * image (voices 0x40-0x43, BA 0x22C): a constant ~1.5 kHz whistle under
+ * everything. What the GP would have put there is its effects, which we
+ * do not have; silence is the faithful stub. RECOMP_APU_GP_READBACK=1
+ * plays them anyway. */
+static bool gp_readback_voice(MCPXAPUState *d, uint16_t v)
+{
+    static int play = -1;
+    uint32_t ebo, lbo;
+
+    if (play < 0) {
+        const char *e = getenv("RECOMP_APU_GP_READBACK");
+        play = e && *e == '1';
+    }
+    if (play)
+        return false;
+    if (voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_DATA_TYPE)
+            || !voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_LOOP))
+        return false;
+    ebo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO);
+    lbo = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSH_SAMPLE, NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO);
+    return ebo >= lbo && ebo - lbo + 1 == NUM_SAMPLES_PER_FRAME;
+}
+
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
                           float sample_buf[NUM_SAMPLES_PER_FRAME][2],
@@ -1143,6 +1203,8 @@ static void voice_process(MCPXAPUState *d,
         if (clear_mix) {
             memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
         }
+    } else if (gp_readback_voice(d, v)) {
+        /* Silent: see gp_readback_voice. */
     } else {
         for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
