@@ -197,6 +197,21 @@ static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
     { 0x600100, 0xFFFFFFFFu },  /* PCRTC_INTR_0  */
 };
 
+/* A vblank raised and not yet serviced. The vblank tick (kernel_bridge.c)
+ * writes this to PCRTC_INTR_0 and sets PMC_INTR_0's PCRTC bit; the title
+ * acknowledges by writing 1, which leaves bit 0 and drops the marker bit --
+ * no title reads this register back, so the extra bit is never seen.
+ *
+ * Until then both stay pending. D3D's ISR only masks and queues a DPC, and
+ * the DPC, run later on the timer thread, is what counts the vblank; zeroed
+ * at once, as the other interrupt registers are, the bits were gone by the
+ * time it looked, so the count stood still -- and that count is XMV's clock,
+ * so no movie got past its first frame. */
+#define NV2A_PMC_INTR_0            0x000100u
+#define NV2A_PMC_INTR_PCRTC        (1u << 24)
+#define NV2A_PCRTC_INTR_0          0x600100u
+#define NV2A_PCRTC_VBLANK_UNACKED  0x80000001u
+
 /*
  * Bits that must always read as SET. The mirror image of the table above:
  * where an interrupt-pending bit is false because nothing raises interrupts,
@@ -980,13 +995,36 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
 
+    /* When the pending vblank was first seen: one nobody services (the ISR
+     * masked, the DPC never ran) is dropped after 100 ms rather than held. */
+    LARGE_INTEGER ack_freq, vblank_since = {0};
+    QueryPerformanceFrequency(&ack_freq);
+
     xbox_PinHostThread();   /* emulated hardware: off the guest CPU */
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        volatile uint32_t *pcrtc =
+            (volatile uint32_t *)((char *)regs + NV2A_PCRTC_INTR_0);
+        int vblank_pending = 0;
+        if (*pcrtc == NV2A_PCRTC_VBLANK_UNACKED) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            if (!vblank_since.QuadPart)
+                vblank_since = now;
+            vblank_pending =
+                (now.QuadPart - vblank_since.QuadPart) * 10 < ack_freq.QuadPart;
+        } else {
+            vblank_since.QuadPart = 0;
+        }
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
+            uint32_t keep = 0;
+            if (vblank_pending && NV2A_ACK[i].offset == NV2A_PCRTC_INTR_0)
+                keep = 0xFFFFFFFFu;
+            else if (vblank_pending && NV2A_ACK[i].offset == NV2A_PMC_INTR_0)
+                keep = NV2A_PMC_INTR_PCRTC;
+            if (*r & NV2A_ACK[i].busy_mask & ~keep) {
+                *r &= ~(NV2A_ACK[i].busy_mask & ~keep);
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
@@ -1250,6 +1288,70 @@ void xbox_PinHostThread(void)
         SetThreadAffinityMask(GetCurrentThread(), g_host_cpu_mask);
 }
 
+/* The vblank acknowledge, on its own thread.
+ *
+ * D3D's vblank handler (0x00322390 in Amped 2) acknowledges by writing 1 to
+ * PCRTC_INTR_0 and then spins until PMC_INTR_0 no longer shows PCRTC. Left to
+ * nv2a_ack_thread, which also walks the pushbuffer, that spin lasted as long
+ * as an executor pass -- 1.4 s once during boot, inside D3D's DPC, with the
+ * dispatch lock held and every interrupt behind it. The vblank tick wakes
+ * this thread (xbox_Nv2aVblankRaised); it watches for the acknowledge and
+ * clears both bits at once, then sleeps again. */
+static HANDLE s_vblank_ack_event;
+
+/* PVIDEO_STOP: writing it stops the video overlay, and the hardware clears
+ * PVIDEO_BUFFER (as xemu's model does) -- D3D's EnableOverlay(FALSE)
+ * (0x003293B0 in Amped 2) writes STOP and then spins until BUFFER reads 0.
+ * In plain memory nothing cleared it, so the first movie played to its end
+ * and the game never got past it. STOP is cleared too, or the next movie's
+ * UpdateOverlay would be stopped as soon as it started. Polled by the vblank
+ * ack thread below, every vblank and at least every 100 ms. */
+static void pvideo_stop_tick(volatile uint32_t *regs)
+{
+    volatile uint32_t *stop = (volatile uint32_t *)((char *)regs + 0x8704);
+    if (*stop) {
+        *(volatile uint32_t *)((char *)regs + 0x8700) = 0;
+        *stop = 0;
+    }
+}
+
+void xbox_Nv2aVblankRaised(void)
+{
+    if (s_vblank_ack_event)
+        SetEvent(s_vblank_ack_event);
+}
+
+static DWORD WINAPI nv2a_vblank_ack_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    volatile uint32_t *pcrtc = (volatile uint32_t *)((char *)regs + NV2A_PCRTC_INTR_0);
+    volatile uint32_t *pmc = (volatile uint32_t *)((char *)regs + NV2A_PMC_INTR_0);
+
+    xbox_PinHostThread();
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        ULONGLONG t0;
+        unsigned spins = 0;
+        DWORD w = WaitForSingleObject(s_vblank_ack_event, 100);
+        pvideo_stop_tick(regs);
+        if (w != WAIT_OBJECT_0)
+            continue;
+        /* Until acknowledged (the marker bit gone) or 100 ms, the same bound
+         * nv2a_ack_thread holds a vblank pending for. */
+        t0 = GetTickCount64();
+        while (*pcrtc == NV2A_PCRTC_VBLANK_UNACKED && GetTickCount64() - t0 < 100) {
+            if (++spins < 4000)
+                YieldProcessor();
+            else
+                SwitchToThread();
+        }
+        if (*pcrtc != NV2A_PCRTC_VBLANK_UNACKED) {
+            *pcrtc = 0;
+            *pmc &= ~NV2A_PMC_INTR_PCRTC;
+        }
+    }
+    return 0;
+}
+
 static void xbox_Nv2aAckStart(void)
 {
     dsp_ack_init();
@@ -1257,6 +1359,10 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    s_vblank_ack_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (s_vblank_ack_event)
+        CloseHandle(CreateThread(NULL, 0, nv2a_vblank_ack_thread,
+                                 g_nv2a_memory, 0, NULL));
     /* Opt-in: RECOMP_NV2A_FAST_ACK=1. On by default it stalled Amped 2 before
      * its title screen, in D3D (sub_0031E780) waiting on PGRAPH 0x400B10 --
      * whether or not interrupt status was included. The likely reading is

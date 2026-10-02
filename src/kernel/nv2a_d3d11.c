@@ -2488,6 +2488,225 @@ static int present_init(HWND hwnd)
 }
 
 /* Returns 1 if the frame went to the window. */
+/* ── The video overlay (PVIDEO) ──────────────────────────────────────────
+ *
+ * XMV movies are not drawn: D3D's UpdateOverlay (Amped 2 0x00329240)
+ * programs the NV2A's video scaler, and the display hardware puts a YUY2
+ * surface over the picture. The registers it writes (base 0xFD008000):
+ * BUFFER 0x700 (1 = show buffer 0), STOP 0x704, BASE 0x900, OFFSET 0x920
+ * (the surface's physical address plus the source origin, 64-byte aligned;
+ * the rest is POINT_IN 0x930 in 1/16 pixel), SIZE_IN 0x928 (h << 16 | w,
+ * w counting from OFFSET), POINT_OUT 0x948 and SIZE_OUT 0x950 (the
+ * destination, y << 16 | x), FORMAT 0x958 (pitch in bits 0-12, colour 1 =
+ * YUY2 in bit 16, colour key on in bit 20) and the key at 0xB00. The
+ * aperture is plain memory here, so they are simply read. A movie player
+ * updates the overlay and waits for vblank without presenting, so while it
+ * is on the render thread presents on its own (present_overlay_tick). */
+typedef struct {
+    uint32_t va, w, h, pitch, x, y, ow, oh, key;
+    int keyed;
+    float s0;
+} Overlay;
+
+static ID3D11Texture2D *s_ov_tex;
+static ID3D11ShaderResourceView *s_ov_srv;
+static uint32_t s_ov_tw, s_ov_th;
+static ID3D11VertexShader *s_ov_vs;
+static ID3D11PixelShader *s_ov_ps;
+static ID3D11Buffer *s_ov_cb;
+static int s_ov_failed;
+static ULONGLONG s_last_present_ms;
+static uint32_t s_last_flip_va, s_last_flip_w = 640, s_last_flip_h = 480;
+
+static uint32_t pvideo(uint32_t off)
+{
+    return *(const volatile uint32_t *)(guest() + 0xFD008000u + off);
+}
+
+static int overlay_read(Overlay *o)
+{
+    uint32_t phys, sin, fmt;
+
+    if (!(pvideo(0x700) & 1u) || (pvideo(0x704) & 1u))
+        return 0;
+    fmt = pvideo(0x958);
+    if (((fmt >> 16) & 0xFu) != 1u)            /* YUY2 is all D3D asks for */
+        return 0;
+    phys = (pvideo(0x900) + pvideo(0x920)) & 0x0FFFFFFFu;
+    o->va = (phys >= 0x04000000u && phys < 0x08000000u) ? phys - 0x04000000u
+                                                        : 0x80000000u + phys;
+    sin = pvideo(0x928);
+    o->w = sin & 0xFFFFu;
+    o->h = sin >> 16;
+    o->s0 = (float)(pvideo(0x930) & 0xFFFFu) / 16.0f;
+    o->pitch = fmt & 0x1FFFu;
+    o->x = pvideo(0x948) & 0xFFFFu;
+    o->y = pvideo(0x948) >> 16;
+    o->ow = pvideo(0x950) & 0xFFFFu;
+    o->oh = pvideo(0x950) >> 16;
+    o->keyed = (fmt & 0x00100000u) != 0;
+    o->key = pvideo(0xB00);
+    if (!o->w || !o->h || o->w > 2048 || o->h > 2048 || !o->ow || !o->oh
+            || o->pitch < o->w * 2u || !guest_ok(o->va, o->pitch * o->h))
+        return 0;
+    return 1;
+}
+
+static const char s_ov_hlsl[] =
+    "cbuffer O : register(b0) { float4 src; float4 dst; float4 frm; uint4 key; };\n"
+    /* src: w, h, s0, unused (source pixels); dst: x, y, w, h (guest pixels);
+     * frm: frame w, h (guest pixels) and its uv scale; key: on, r, g, b */
+    "Texture2D<float4> yuy : register(t0); Texture2D frame : register(t1);\n"
+    "SamplerState sm : register(s0);\n"
+    "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "V vs(uint id : SV_VertexID) {\n"
+    "  V o; float2 t = float2((id << 1) & 2, id & 2);\n"
+    "  o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o;\n"
+    "}\n"
+    "float4 ps(V i) : SV_Target {\n"
+    "  float px = src.z + i.uv.x * (src.x - src.z);\n"
+    "  int2 tc = int2(min(px, src.x - 1) * 0.5, min(i.uv.y * src.y, src.y - 1));\n"
+    "  float4 q = yuy.Load(int3(tc, 0));      /* Y0 U Y1 V */\n"
+    "  float y = (frac(px * 0.5) < 0.5 ? q.r : q.b) - 16.0 / 255.0;\n"
+    "  float u = q.g - 0.5, v = q.a - 0.5;\n"
+    "  float3 rgb = saturate(float3(1.164 * y + 1.596 * v,\n"
+    "                               1.164 * y - 0.391 * u - 0.813 * v,\n"
+    "                               1.164 * y + 2.018 * u));\n"
+    "  if (key.x != 0) {\n"
+    "    float2 g = dst.xy + i.uv * dst.zw;\n"
+    "    float3 f = frame.Sample(sm, g / frm.xy * frm.zw).rgb;\n"
+    "    uint3 fb = uint3(f * 255.0 + 0.5);\n"
+    "    if (any(fb != key.yzw)) return float4(f, 1);\n"
+    "  }\n"
+    "  return float4(rgb, 1);\n"
+    "}\n";
+
+static int overlay_init(void)
+{
+    ID3DBlob *vb = NULL, *pb = NULL, *err = NULL;
+    if (s_ov_ps || s_ov_failed)
+        return s_ov_ps != NULL;
+    if (FAILED(D3DCompile(s_ov_hlsl, sizeof s_ov_hlsl - 1, NULL, NULL, NULL, "vs", "vs_5_0",
+                          0, 0, &vb, &err))
+            || FAILED(D3DCompile(s_ov_hlsl, sizeof s_ov_hlsl - 1, NULL, NULL, NULL, "ps",
+                                 "ps_5_0", 0, 0, &pb, &err))) {
+        fprintf(stderr, "  [D3D11] overlay shader: %s\n",
+                err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "compile failed");
+        if (err) ID3D10Blob_Release(err);
+        if (vb) ID3D10Blob_Release(vb);
+        s_ov_failed = 1;
+        return 0;
+    }
+    ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vb),
+                                    ID3D10Blob_GetBufferSize(vb), NULL, &s_ov_vs);
+    ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(pb),
+                                   ID3D10Blob_GetBufferSize(pb), NULL, &s_ov_ps);
+    ID3D10Blob_Release(vb);
+    ID3D10Blob_Release(pb);
+    s_ov_cb = make_buffer(64, D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DYNAMIC, NULL);
+    return s_ov_ps && s_ov_vs && s_ov_cb;
+}
+
+/* Draw the overlay into the bound back buffer, over the frame already blitted
+ * into `pic` (the letterboxed picture's viewport, in back-buffer pixels). */
+static void overlay_compose(RtEntry *rt, uint32_t fw, uint32_t fh, const D3D11_VIEWPORT *pic)
+{
+    Overlay o;
+    D3D11_VIEWPORT vp;
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t tw, y;
+    ID3D11ShaderResourceView *srvs[2];
+
+    if (!overlay_read(&o) || !overlay_init())
+        return;
+    {   /* RECOMP_PVIDEO_TRACE: each new source surface (the first 40). */
+        static uint32_t last_va;
+        static int said, trace = -1;
+        if (trace < 0)
+            trace = getenv("RECOMP_PVIDEO_TRACE") != NULL;
+        if (trace && o.va != last_va && said++ < 40)
+            fprintf(stderr, "  [PVIDEO] overlay source %08X (frame %u)\n", o.va, s_frame);
+        last_va = o.va;
+    }
+    tw = (o.w + 1) / 2;
+    if (!s_ov_tex || s_ov_tw != tw || s_ov_th != o.h) {
+        D3D11_TEXTURE2D_DESC td;
+        if (s_ov_srv) ID3D11ShaderResourceView_Release(s_ov_srv);
+        if (s_ov_tex) ID3D11Texture2D_Release(s_ov_tex);
+        s_ov_srv = NULL;
+        s_ov_tex = NULL;
+        memset(&td, 0, sizeof td);
+        td.Width = tw; td.Height = o.h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DYNAMIC;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ov_tex)))
+            return;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_ov_tex, NULL, &s_ov_srv);
+        s_ov_tw = tw;
+        s_ov_th = o.h;
+        fprintf(stderr, "  [D3D11] video overlay: %ux%u YUY2 at %08X pitch %u -> %ux%u at"
+                " %u,%u%s\n", o.w, o.h, o.va, o.pitch, o.ow, o.oh, o.x, o.y,
+                o.keyed ? " (colour keyed)" : "");
+    }
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ov_tex, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return;
+    for (y = 0; y < o.h; y++)
+        memcpy((uint8_t *)m.pData + (size_t)y * m.RowPitch,
+               guest() + o.va + (size_t)y * o.pitch, (size_t)tw * 4);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ov_tex, 0);
+
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ov_cb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float *f = (float *)m.pData;
+        uint32_t *u = (uint32_t *)m.pData;
+        f[0] = (float)o.w; f[1] = (float)o.h; f[2] = o.s0; f[3] = 0;
+        f[4] = (float)o.x; f[5] = (float)o.y; f[6] = (float)o.ow; f[7] = (float)o.oh;
+        f[8] = (float)fw; f[9] = (float)fh;
+        f[10] = rt ? (float)fw / (float)rt->w : 1.0f;
+        f[11] = rt ? (float)fh / (float)rt->h : 1.0f;
+        u[12] = (o.keyed && rt) ? 1u : 0u;
+        u[13] = (o.key >> 16) & 0xFFu; u[14] = (o.key >> 8) & 0xFFu; u[15] = o.key & 0xFFu;
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ov_cb, 0);
+    }
+    /* The destination, in guest pixels, mapped into the picture's viewport. */
+    vp.TopLeftX = pic->TopLeftX + (float)o.x * pic->Width / (float)fw;
+    vp.TopLeftY = pic->TopLeftY + (float)o.y * pic->Height / (float)fh;
+    vp.Width = (float)o.ow * pic->Width / (float)fw;
+    vp.Height = (float)o.oh * pic->Height / (float)fh;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_ov_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_ov_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_ov_cb);
+    srvs[0] = s_ov_srv;
+    srvs[1] = rt ? rt->srv : NULL;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, srvs);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    srvs[0] = srvs[1] = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, srvs);
+}
+
+static int present_frame(RtEntry *rt, uint32_t w, uint32_t h);
+static void present_shot(void);
+
+/* From the render thread's idle loop: while the overlay is on and nothing has
+ * flipped for a frame's time, show the last frame with the overlay over it. */
+static void present_overlay_tick(void)
+{
+    Overlay o;
+    ULONGLONG now = GetTickCount64();
+    if (now - s_last_present_ms < 16 || !overlay_read(&o))
+        return;
+    present_frame(s_last_flip_va ? rt_find(s_last_flip_va) : NULL,
+                  s_last_flip_w, s_last_flip_h);
+}
+
 static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
 {
     HWND hwnd;
@@ -2547,7 +2766,7 @@ static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
     vp.MaxDepth = 1.0f;
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        float uv[4] = { (float)w / (float)rt->w, (float)h / (float)rt->h, 0, 0 };
+        float uv[4] = { rt ? (float)w / (float)rt->w : 1.0f, rt ? (float)h / (float)rt->h : 1.0f, 0, 0 };
         memcpy(m.pData, uv, sizeof uv);
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
     }
@@ -2561,49 +2780,41 @@ static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
     ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
-    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
-    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
-    {
-        ID3D11ShaderResourceView *none = NULL;
-        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    if (rt) {
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
+        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
+        ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+        {
+            ID3D11ShaderResourceView *none = NULL;
+            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+        }
     }
+    overlay_compose(rt, w, h, &vp);
+    present_shot();
     IDXGISwapChain1_Present(s_swap, 0, 0);
+    s_last_present_ms = GetTickCount64();
     return 1;
 }
 
-/* RECOMP_GPU_SHOT=<prefix>: the presented frame as <prefix>NNNN.bmp every
- * RECOMP_GPU_SHOT_MS (default 1000) -- the title's own picture, whatever
- * window is in front of it. A blocking readback, so a hitch per shot. */
-static void gpu_shot(RtEntry *rt)
+/* A B8G8R8A8 texture's top-left w x h as a 24-bit BMP. A blocking readback. */
+static void shot_write(ID3D11Texture2D *tex, uint32_t w, uint32_t h, const char *path)
 {
-    static const char *prefix = (const char *)1;
-    static DWORD last, every;
-    static unsigned seq;
     D3D11_TEXTURE2D_DESC td;
     D3D11_MAPPED_SUBRESOURCE m;
     ID3D11Texture2D *st = NULL;
-    char path[300];
     FILE *f;
-    uint32_t x, y, w = rt->w * (uint32_t)gpu_scale(), h = rt->h * (uint32_t)gpu_scale();
-    uint32_t row = w * 3, pad = (4 - row % 4) % 4;
+    uint32_t x, y, row = w * 3, pad = (4 - row % 4) % 4;
 
-    if (prefix == (const char *)1) {
-        const char *e = getenv("RECOMP_GPU_SHOT_MS");
-        prefix = getenv("RECOMP_GPU_SHOT");
-        every = e ? (DWORD)atoi(e) : 1000;
-    }
-    if (!prefix || GetTickCount() - last < every)
-        return;
-    last = GetTickCount();
-    memset(&td, 0, sizeof td);
-    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+    ID3D11Texture2D_GetDesc(tex, &td);
+    if (w > td.Width) w = td.Width;
+    if (h > td.Height) h = td.Height;
+    row = w * 3; pad = (4 - row % 4) % 4;
+    td.MipLevels = 1; td.ArraySize = 1; td.SampleDesc.Count = 1; td.SampleDesc.Quality = 0;
     td.Usage = D3D11_USAGE_STAGING; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.BindFlags = 0; td.MiscFlags = 0;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
         return;
-    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)rt->tex);
-    snprintf(path, sizeof path, "%s%04u.bmp", prefix, seq++);
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)tex);
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))
             && (f = fopen(path, "wb")) != NULL) {
         uint8_t hdr[54] = { 'B', 'M' };
@@ -2622,12 +2833,36 @@ static void gpu_shot(RtEntry *rt)
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
     }
     ID3D11Texture2D_Release(st);
+}
+
+/* RECOMP_GPU_SHOT=<prefix>: the presented frame as <prefix>NNNN.bmp every
+ * RECOMP_GPU_SHOT_MS (default 1000) -- the title's own picture, whatever
+ * window is in front of it. A blocking readback, so a hitch per shot. */
+static void gpu_shot(RtEntry *rt)
+{
+    static const char *prefix = (const char *)1;
+    static DWORD last, every;
+    static unsigned seq;
+    char path[300];
+    FILE *f;
+
+    if (prefix == (const char *)1) {
+        const char *e = getenv("RECOMP_GPU_SHOT_MS");
+        prefix = getenv("RECOMP_GPU_SHOT");
+        every = e ? (DWORD)atoi(e) : 1000;
+    }
+    if (!prefix || GetTickCount() - last < every)
+        return;
+    last = GetTickCount();
+    snprintf(path, sizeof path, "%s%04u.bmp", prefix, seq++);
+    shot_write(rt->tex, rt->w * (uint32_t)gpu_scale(), rt->h * (uint32_t)gpu_scale(), path);
     /* RECOMP_GPU_SHOT_MEM: the guest memory under the surface as well, to
      * see what the CPU put there. */
     if (getenv("RECOMP_GPU_SHOT_MEM") && gpu_scale() == 1
             && (snprintf(path, sizeof path, "%s%04u_mem.bmp", prefix, seq - 1),
                 f = fopen(path, "wb")) != NULL) {
         const uint8_t *g = guest() + rt->va;
+        uint32_t x, y, w = rt->w, h = rt->h, row = w * 3, pad = (4 - row % 4) % 4;
         uint8_t hdr[54] = { 'B', 'M' };
         uint32_t size = 54 + (row + pad) * h;
         memcpy(hdr + 2, &size, 4); hdr[10] = 54; hdr[14] = 40;
@@ -2643,14 +2878,72 @@ static void gpu_shot(RtEntry *rt)
     }
 }
 
+/* RECOMP_GPU_SHOT_PRESENT=<prefix>: the window's back buffer as presented --
+ * letterboxing and the video overlay included, which RECOMP_GPU_SHOT (the
+ * title's render target) does not show. Same RECOMP_GPU_SHOT_MS interval. */
+static void present_shot(void)
+{
+    static const char *prefix = (const char *)1;
+    static DWORD last, every;
+    static unsigned seq;
+    ID3D11Texture2D *bb = NULL;
+    char path[300];
+
+    if (prefix == (const char *)1) {
+        const char *e = getenv("RECOMP_GPU_SHOT_MS");
+        prefix = getenv("RECOMP_GPU_SHOT_PRESENT");
+        every = e ? (DWORD)atoi(e) : 1000;
+    }
+    if (!prefix || GetTickCount() - last < every)
+        return;
+    last = GetTickCount();
+    IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&bb);
+    if (!bb)
+        return;
+    snprintf(path, sizeof path, "%s%04u.bmp", prefix, seq++);
+    shot_write(bb, s_bb_w, s_bb_h, path);
+    ID3D11Texture2D_Release(bb);
+}
+
 static void do_flip(uint32_t color_va)
 {
     RtEntry *rt = rt_find(color_va);
     uint32_t i = s_stage_next % STAGES;
 
     s_frame++;
+    {   /* RECOMP_PVIDEO_TRACE: the overlay registers when they change. */
+        static int trace = -1;
+        static uint32_t last[12];
+        if (trace < 0)
+            trace = getenv("RECOMP_PVIDEO_TRACE") != NULL;
+        if (trace) {      /* the NV2A aperture (0xFD000000) is mapped */
+            static const uint16_t off[12] = { 0x700, 0x704, 0x900, 0x908, 0x920, 0x928,
+                                              0x930, 0x938, 0x940, 0x948, 0x950, 0x958 };
+            const uint8_t *pv = guest() + 0xFD008000u;
+            uint32_t cur[12];
+            int k, changed = 0;
+            for (k = 0; k < 12; k++) {
+                cur[k] = *(const volatile uint32_t *)(pv + off[k]);
+                changed |= cur[k] != last[k];
+            }
+            if (changed) {
+                static int said;
+                if (said++ < 40)
+                    fprintf(stderr, "  [PVIDEO] frame %u rt %08X: buffer %X stop %X base %08X"
+                            " limit %08X offset %08X size_in %08X point_in %08X ds_dx %08X"
+                            " dt_dy %08X point_out %08X size_out %08X format %08X key %08X\n",
+                            s_frame, color_va, cur[0], cur[1], cur[2], cur[3], cur[4], cur[5],
+                            cur[6], cur[7], cur[8], cur[9], cur[10], cur[11],
+                            *(const volatile uint32_t *)(pv + 0xB00));
+                memcpy(last, cur, sizeof last);
+            }
+        }
+    }
     if (!rt)
         return;
+    s_last_flip_va = color_va;
+    s_last_flip_w = rt->w;
+    s_last_flip_h = rt->h;
     gpu_shot(rt);
     {
         static int dumps = -1;
@@ -3193,6 +3486,7 @@ static DWORD WINAPI render_thread(LPVOID unused)
                 ID3D11DeviceContext_Flush(s_ctx);
                 vis_poll();
             }
+            present_overlay_tick();      /* a movie playing over no flips */
             QueryPerformanceCounter(&a);
             InterlockedExchange(&s_consumer_idle, 1);
             if (tail == s_ring_head)

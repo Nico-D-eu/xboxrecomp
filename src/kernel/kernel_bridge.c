@@ -2266,8 +2266,16 @@ static void kernel_vblank_tick(void)
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+    /* Bit 0 plus a marker bit the title's acknowledge (a write of 1) drops:
+     * the NV2A ack thread holds both registers pending until it sees that,
+     * because the DPC that counts the vblank runs after the ISR returns. */
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) =
+        NV2A_PCRTC_INTR_VBLANK | 0x80000000u;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+    {   /* its acknowledge is watched for on a thread of its own */
+        extern void xbox_Nv2aVblankRaised(void);
+        xbox_Nv2aVblankRaised();
+    }
 
     {
         static unsigned n;
