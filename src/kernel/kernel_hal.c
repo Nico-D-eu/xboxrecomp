@@ -167,6 +167,12 @@ void xbox_IrqlDumpHolders(void)
 static volatile LONG s_disp_owner;           /* thread id, 0 = free */
 static LONG s_disp_depth;                    /* owner only */
 static LARGE_INTEGER s_disp_t0;              /* when the owner took it */
+/* For the timer thread's [HEALTH] line (kernel_bridge.c), reset as it prints:
+ * contended acquires and the time spent in them, and the longest hold with
+ * the guest site that raised. */
+volatile long g_disp_health_waits, g_disp_health_wait_us;
+volatile long g_disp_health_maxhold_us;
+volatile uint32_t g_disp_health_maxhold_site;
 static uint32_t s_disp_site;                 /* the owner's guest caller */
 static XBOX_THREAD_LOCAL int s_disp_held;    /* this thread's raise took it */
 static volatile LONG s_disp_timeouts;
@@ -176,6 +182,7 @@ int xbox_DispatchLockAcquire(unsigned timeout_ms)
     LONG me = (LONG)GetCurrentThreadId();
     ULONGLONG t0 = 0;
     unsigned spins = 0;
+    LARGE_INTEGER wait0 = {0};
 
     if (s_disp_owner == me) {
         s_disp_depth++;
@@ -185,9 +192,19 @@ int xbox_DispatchLockAcquire(unsigned timeout_ms)
         if (InterlockedCompareExchange(&s_disp_owner, me, 0) == 0) {
             s_disp_depth = 1;
             QueryPerformanceCounter(&s_disp_t0);
+            if (spins) {
+                LARGE_INTEGER f;
+                QueryPerformanceFrequency(&f);
+                InterlockedIncrement(&g_disp_health_waits);
+                if (wait0.QuadPart)
+                    InterlockedExchangeAdd(&g_disp_health_wait_us,
+                        (long)((s_disp_t0.QuadPart - wait0.QuadPart) * 1000000 / f.QuadPart));
+            }
             s_disp_site = g_xbox_kernel_caller;
             return 1;
         }
+        if (!spins)
+            QueryPerformanceCounter(&wait0);
         if (++spins < 200) {
             YieldProcessor();
             continue;
@@ -218,6 +235,18 @@ void xbox_DispatchLockRelease(void)
 {
     LONG me = (LONG)GetCurrentThreadId();
     if (s_disp_owner == me && --s_disp_depth == 0) {
+        {   /* the longest hold, for [HEALTH] */
+            static LARGE_INTEGER hf;
+            LARGE_INTEGER hn;
+            long us;
+            if (!hf.QuadPart) QueryPerformanceFrequency(&hf);
+            QueryPerformanceCounter(&hn);
+            us = (long)((hn.QuadPart - s_disp_t0.QuadPart) * 1000000 / hf.QuadPart);
+            if (us > g_disp_health_maxhold_us) {
+                g_disp_health_maxhold_us = us;
+                g_disp_health_maxhold_site = s_disp_site;
+            }
+        }
         /* RECOMP_DISPATCH_TRACE: holds of 10 ms or more, with where the
          * holder raised (the first 64). */
         static int trace = -1;

@@ -300,6 +300,16 @@ static int64_t g_apu_frame_us, g_apu_frame_max_us;   /* in se_frame */
 static int64_t g_apu_relock_us;                      /* re-taking the lock */
 static unsigned g_apu_underruns, g_apu_overruns;     /* output queue empty / full */
 static unsigned g_apu_stalls;                        /* waits on a trapped front end */
+static volatile long g_apu_health_stalls;            /* the same, for [HEALTH] */
+
+/* For the kernel's [HEALTH] line: frames a second over the last second, and
+ * trapped-front-end waits since the last call. */
+int mcpx_apu_health(long *stalls)
+{
+    if (stalls)
+        *stalls = InterlockedExchange(&g_apu_health_stalls, 0);
+    return g_dbg.frames_processed;
+}
 
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
@@ -717,6 +727,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             qemu_cond_timedwait(&d->cond, &d->lock, 1);
             stalled = true;
             g_apu_stalls++;
+            InterlockedIncrement(&g_apu_health_stalls);
             continue;
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */

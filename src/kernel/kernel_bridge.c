@@ -2537,6 +2537,50 @@ extern int  xbox_DispatchLockAcquire(unsigned timeout_ms);
 extern void xbox_DispatchLockRelease(void);
 extern int  xbox_DispatchLockEnabled(void);
 
+/* [HEALTH], every 10 s, always on: one line that says whether interrupts are
+ * getting through. ev 0 = a timer pass, 1 = a pass held off because a guest
+ * thread was raised, 2 = an APU interrupt delivered. A player's "the sound
+ * went bad and it lagged" then comes with numbers: what share of passes
+ * were held off, how long the dispatch lock was waited for and held (and
+ * where it was raised), how often DirectSound's ISR ran, and the APU's rate
+ * and trapped-front-end waits. */
+static void timer_health(int ev)
+{
+    extern volatile long g_disp_health_waits, g_disp_health_wait_us, g_disp_health_maxhold_us;
+    extern volatile uint32_t g_disp_health_maxhold_site;
+    extern int mcpx_apu_health(long *stalls);
+    extern int xbox_IrqlRaisedCount(void);
+    static unsigned passes, held, apu_isr, raised_seen;
+    static ULONGLONG t0;
+    ULONGLONG now;
+
+    if (ev == 1) { held++; return; }
+    if (ev == 2) { apu_isr++; return; }
+    passes++;
+    if (xbox_IrqlRaisedCount() > 0)
+        raised_seen++;
+    now = GetTickCount64();
+    if (!t0)
+        t0 = now;
+    if (now - t0 < 10000)
+        return;
+    {
+        long stalls = 0;
+        int rate = mcpx_apu_health(&stalls);
+        fprintf(stderr, "  [HEALTH] %u timer passes, %u%% with a guest raised, %u held off;"
+                " APU ISR %u; lock waits %ld (%ld ms), longest hold %ld ms at guest 0x%08X;"
+                " APU %d frames/s, %ld trapped-FE waits\n",
+                passes, passes ? raised_seen * 100u / passes : 0u, held, apu_isr,
+                g_disp_health_waits, g_disp_health_wait_us / 1000,
+                g_disp_health_maxhold_us / 1000, g_disp_health_maxhold_site, rate, stalls);
+        fflush(stderr);
+    }
+    passes = held = apu_isr = raised_seen = 0;
+    g_disp_health_waits = g_disp_health_wait_us = g_disp_health_maxhold_us = 0;
+    g_disp_health_maxhold_site = 0;
+    t0 = now;
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -2605,8 +2649,11 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          * main thread in the next. The OHCI thread has had the same gate for
          * the same reason; this is the timer thread catching up. Bounded like
          * OHCI's, so a leaked raise delays interrupts instead of ending them. */
-        if (xbox_IrqlBlocksInterrupts() && ++held_off <= 200u)
+        timer_health(0);
+        if (xbox_IrqlBlocksInterrupts() && ++held_off <= 200u) {
+            timer_health(1);
             continue;
+        }
         held_off = 0;
 
         kernel_vblank_tick();  /* the GPU's frame clock */
@@ -2618,6 +2665,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             if (g_xbox_apu_irq_line && xbox_GetConnectedInterrupt(5)) {
                 static unsigned n;
                 int claimed = kernel_raise_interrupt(5);
+                timer_health(2);
                 if (n++ < 3) {
                     fprintf(stderr, "  [APU] interrupt -> ISR %s\n",
                             claimed < 0 ? "not callable" : claimed ? "claimed it" : "declined it");
