@@ -3626,13 +3626,16 @@ static int bridge_handle_is_async(uint32_t token)
     return 0;
 }
 
-/* Off unless RECOMP_ASYNC_IO is set, so the two behaviours stay comparable
- * rather than one being swapped in blind. */
+/* Off unless RECOMP_ASYNC_IO is set (and not to 0), so the two behaviours
+ * stay comparable rather than one being swapped in blind. A project can make
+ * it its default; Amped 2 does, for XMV. */
 static int bridge_async_io_enabled(void)
 {
     static int on = -1;
-    if (on < 0)
-        on = getenv("RECOMP_ASYNC_IO") ? 1 : 0;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_ASYNC_IO");
+        on = e && *e && *e != '0';
+    }
     return on;
 }
 
