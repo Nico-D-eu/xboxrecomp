@@ -67,6 +67,7 @@ void mcpx_debug_end_frame(void) {}
  * heard a voice finish, XACT never freed a finished cue, and Amped 2 ran its
  * sound heap out of memory about three minutes into a level. */
 extern volatile long g_xbox_apu_irq_line;          /* kernel_bridge.c */
+extern void xbox_KernelWakeInterrupts(void);       /* kernel_bridge.c */
 extern void (*volatile g_xbox_apu_irq_poll)(void);
 
 static void update_irq(MCPXAPUState *d);
@@ -94,7 +95,10 @@ static void update_irq(MCPXAPUState *d)
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
         /* In standalone mode we don't raise a PCI IRQ; the game's kernel
          * stub will poll ISTS directly or we'll signal via a flag. */
-        g_xbox_apu_irq_line = 1;
+        if (!g_xbox_apu_irq_line) {
+            g_xbox_apu_irq_line = 1;
+            xbox_KernelWakeInterrupts();   /* service it now, not next pass */
+        }
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
         g_xbox_apu_irq_line = 0;
@@ -304,10 +308,13 @@ static volatile long g_apu_health_stalls;            /* the same, for [HEALTH] *
 
 /* For the kernel's [HEALTH] line: frames a second over the last second, and
  * trapped-front-end waits since the last call. */
-int mcpx_apu_health(long *stalls)
+int mcpx_apu_health(long *stalls, long *idle_linked)
 {
+    extern volatile long g_apu_vp_idle_linked;    /* apu_vp.c */
     if (stalls)
         *stalls = InterlockedExchange(&g_apu_health_stalls, 0);
+    if (idle_linked)
+        *idle_linked = g_apu_vp_idle_linked;
     return g_dbg.frames_processed;
 }
 

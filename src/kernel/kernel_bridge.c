@@ -2235,6 +2235,21 @@ volatile long g_xbox_vblank_count;
 /* The APU's interrupt line and the hook that folds its pending events into
  * it; src/apu sets both when it starts, so the kernel needs no APU. */
 volatile long g_xbox_apu_irq_line;
+
+/* Wakes the timer thread before its millisecond is up. A device model calls
+ * it when its interrupt line goes high, so the ISR and DPC run now rather
+ * than on the next pass. It matters for the APU: DirectSound traps the front
+ * end on every idle voice still in a list and releases it from its DPC, and
+ * the VP produces nothing in between. Released a pass later (1-2 ms), one
+ * such voice per frame held the APU to a third of real time -- 500 of 1500
+ * frames a second, sound breaking up and the game lagging behind it. */
+static HANDLE g_timer_wake;
+
+void xbox_KernelWakeInterrupts(void)
+{
+    if (g_timer_wake)
+        SetEvent(g_timer_wake);
+}
 void (*volatile g_xbox_apu_irq_poll)(void);
 
 static void kernel_vblank_tick(void)
@@ -2290,6 +2305,33 @@ static void kernel_vblank_tick(void)
 
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. */
+/* A DPC as the console runs it: at DISPATCH_LEVEL, so no guest thread is
+ * raised beside it (xbox_DispatchLockAcquireForDpc). Level 2 already holds
+ * the lock for the whole pass, and the acquire is recursive. Past 20 ms the
+ * DPC runs without it, as it used to. */
+static void kernel_run_dpc_at_dispatch(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
+{
+    extern int  xbox_DispatchLockAcquireForDpc(unsigned timeout_ms);
+    extern void xbox_DispatchLockRelease(void);
+    extern int  xbox_DispatchLockEnabled(void);
+    int got = xbox_DispatchLockEnabled() && xbox_DispatchLockAcquireForDpc(20);
+    ULONGLONG t0 = GetTickCount64(), ms;
+    kernel_run_dpc(dpc_va, arg1, arg2);
+    if (got)
+        xbox_DispatchLockRelease();
+    /* A DPC that runs long holds every raise off with it: name it. */
+    ms = GetTickCount64() - t0;
+    if (ms >= 50) {
+        static volatile LONG said;
+        if (InterlockedIncrement(&said) <= 16) {
+            fprintf(stderr, "  [DPC] routine 0x%08X (dpc 0x%08X) ran %llu ms%s\n",
+                    dpc_va ? BRIDGE_MEM32(dpc_va + 12) : 0, dpc_va, ms,
+                    got ? " holding the dispatch lock" : "");
+            fflush(stderr);
+        }
+    }
+}
+
 static void kernel_drain_dpcs(void)
 {
     for (;;) {
@@ -2305,7 +2347,7 @@ static void kernel_drain_dpcs(void)
         if (d.dpc)
             BRIDGE_MEM8(d.dpc + 2) = 0;
         ReleaseSRWLockExclusive(&g_dpc_lock);
-        kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+        kernel_run_dpc_at_dispatch(d.dpc, d.arg1, d.arg2);
     }
 }
 
@@ -2555,8 +2597,9 @@ extern int  xbox_DispatchLockEnabled(void);
 static void timer_health(int ev)
 {
     extern volatile long g_disp_health_waits, g_disp_health_wait_us, g_disp_health_maxhold_us;
+    extern volatile long g_disp_health_timeouts;
     extern volatile uint32_t g_disp_health_maxhold_site;
-    extern int mcpx_apu_health(long *stalls);
+    extern int mcpx_apu_health(long *stalls, long *idle_linked);
     extern int xbox_IrqlRaisedCount(void);
     static unsigned passes, held, apu_isr, raised_seen;
     static ULONGLONG t0;
@@ -2573,18 +2616,21 @@ static void timer_health(int ev)
     if (now - t0 < 10000)
         return;
     {
-        long stalls = 0;
-        int rate = mcpx_apu_health(&stalls);
+        long stalls = 0, idle_linked = 0;
+        int rate = mcpx_apu_health(&stalls, &idle_linked);
         fprintf(stderr, "  [HEALTH] %u timer passes, %u%% with a guest raised, %u held off;"
-                " APU ISR %u; lock waits %ld (%ld ms), longest hold %ld ms at guest 0x%08X;"
-                " APU %d frames/s, %ld trapped-FE waits\n",
+                " APU ISR %u; lock waits %ld (%ld ms, %ld gave up), longest hold %ld ms at"
+                " guest 0x%08X; APU %d frames/s, %ld trapped-FE waits, %ld idle voices"
+                " linked\n",
                 passes, passes ? raised_seen * 100u / passes : 0u, held, apu_isr,
-                g_disp_health_waits, g_disp_health_wait_us / 1000,
-                g_disp_health_maxhold_us / 1000, g_disp_health_maxhold_site, rate, stalls);
+                g_disp_health_waits, g_disp_health_wait_us / 1000, g_disp_health_timeouts,
+                g_disp_health_maxhold_us / 1000, g_disp_health_maxhold_site, rate, stalls,
+                idle_linked);
         fflush(stderr);
     }
     passes = held = apu_isr = raised_seen = 0;
     g_disp_health_waits = g_disp_health_wait_us = g_disp_health_maxhold_us = 0;
+    g_disp_health_timeouts = 0;
     g_disp_health_maxhold_site = 0;
     t0 = now;
 }
@@ -2623,13 +2669,17 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     /* A millisecond timer, so the loop below -- vblank, DPCs, timers -- wakes
      * when asked to rather than on the default 15.6 ms tick. */
     timeBeginPeriod(1);
+    g_timer_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     for (;;) {
         long long now;
         int i, disp = 0;
         static unsigned held_off;
 
-        Sleep(1);
+        if (g_timer_wake)
+            WaitForSingleObject(g_timer_wake, 1);
+        else
+            Sleep(1);
 
         /* Every routine this thread runs returns to it with the stack as it
          * was; one that does not leaves the next ISR or DPC running on a
@@ -2708,7 +2758,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
             /* Outside the lock: the routine can set or cancel timers. */
             if (dpc)
-                kernel_run_dpc(dpc, 0, 0);
+                kernel_run_dpc_at_dispatch(dpc, 0, 0);
 
             /* Wake anyone parked on the timer's shadow event; a timer with no
              * DPC is just a kernel sleep. */

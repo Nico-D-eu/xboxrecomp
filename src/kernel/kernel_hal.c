@@ -176,6 +176,15 @@ volatile uint32_t g_disp_health_maxhold_site;
 static uint32_t s_disp_site;                 /* the owner's guest caller */
 static XBOX_THREAD_LOCAL int s_disp_held;    /* this thread's raise took it */
 static volatile LONG s_disp_timeouts;
+/* Every acquire that gave up, for [HEALTH]. */
+volatile long g_disp_health_timeouts;
+/* The owner took it to run a DPC (xbox_DispatchLockAcquireForDpc). A raise
+ * queued behind a DPC waits at most XBOX_DPC_HOLD_WAIT_MS: a DPC normally
+ * takes microseconds, and the one that does not is waiting on something a
+ * guest thread provides -- the shape of the 250 ms hitches that holding the
+ * lock across a whole DPC pass gave (see dispatch_lock_level). */
+static volatile LONG s_disp_dpc;
+#define XBOX_DPC_HOLD_WAIT_MS 20u
 
 int xbox_DispatchLockAcquire(unsigned timeout_ms)
 {
@@ -211,7 +220,10 @@ int xbox_DispatchLockAcquire(unsigned timeout_ms)
         }
         if (!t0)
             t0 = GetTickCount64();
-        else if (GetTickCount64() - t0 >= timeout_ms) {
+        else if (GetTickCount64() - t0 >=
+                 (s_disp_dpc && timeout_ms > XBOX_DPC_HOLD_WAIT_MS
+                  ? XBOX_DPC_HOLD_WAIT_MS : timeout_ms)) {
+            InterlockedIncrement(&g_disp_health_timeouts);
             if (InterlockedIncrement(&s_disp_timeouts) <= 8) {
                 LONG owner = s_disp_owner;
                 uint32_t guest = 0;
@@ -219,10 +231,10 @@ int xbox_DispatchLockAcquire(unsigned timeout_ms)
                 for (k = 0; k < IRQL_HOLDERS; k++)
                     if (s_holders[k].tid == owner)
                         guest = s_holders[k].guest;
-                fprintf(stderr, "  [IRQL] dispatch lock held by tid %ld for %u ms"
+                fprintf(stderr, "  [IRQL] dispatch lock held by tid %ld%s for %llu ms"
                         " (raised from guest 0x%08X); tid %ld (guest 0x%08X) goes on"
-                        " without it\n", (long)owner, timeout_ms, guest, (long)me,
-                        g_xbox_kernel_caller);
+                        " without it\n", (long)owner, s_disp_dpc ? " (a DPC)" : "",
+                        GetTickCount64() - t0, guest, (long)me, g_xbox_kernel_caller);
                 fflush(stderr);
             }
             return 0;
@@ -231,10 +243,29 @@ int xbox_DispatchLockAcquire(unsigned timeout_ms)
     }
 }
 
+/* For the thread that runs DPCs: a DPC runs at DISPATCH_LEVEL, so on the
+ * console no thread can be raised while it runs, and none can raise until it
+ * returns. At level 1 the timer thread only checked that nobody was raised
+ * before a pass, and a raise landing after the check ran beside the DPC.
+ * DirectSound's is the one that showed it: its trap DPC unlinks idle voices
+ * by rewriting the predecessor's link in voice memory, from its own copy of
+ * the list order, while a game thread inserted voices into the same lists.
+ * The copies drifted apart, a voice it had let go stayed linked in the
+ * hardware list, and from then on its idle trap was ignored on every frame
+ * (diag 2026-10-02, voice 0x7D with 25 dead voices behind it). */
+int xbox_DispatchLockAcquireForDpc(unsigned timeout_ms)
+{
+    int got = xbox_DispatchLockAcquire(timeout_ms);
+    if (got && s_disp_depth == 1)
+        s_disp_dpc = 1;
+    return got;
+}
+
 void xbox_DispatchLockRelease(void)
 {
     LONG me = (LONG)GetCurrentThreadId();
     if (s_disp_owner == me && --s_disp_depth == 0) {
+        s_disp_dpc = 0;
         {   /* the longest hold, for [HEALTH] */
             static LARGE_INTEGER hf;
             LARGE_INTEGER hn;
@@ -1166,6 +1197,7 @@ uint64_t xbox_ReadTimeStampCounter(void)
              + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
     }
 }
+
 /* ============================================================================
  * Port I/O
  *
@@ -1205,4 +1237,3 @@ void xbox_PortOut(uint16_t port, uint32_t value, int size)
         fflush(stderr);
     }
 }
-

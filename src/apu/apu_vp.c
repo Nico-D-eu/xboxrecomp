@@ -1352,9 +1352,15 @@ static void voice_process(MCPXAPUState *d,
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
 
+/* Idle voices still linked in a list, as the last frame found them, for the
+ * [HEALTH] line. A handful in passing is DirectSound's normal stop path; a
+ * steady count is voices it has let go that the hardware lists kept. */
+volatile long g_apu_vp_idle_linked;
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    long idle_linked = 0;
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {
@@ -1377,6 +1383,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+                idle_linked++;
                 fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
                 /* Process voice directly (single-threaded) */
@@ -1385,6 +1392,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             d->regs[current] = d->regs[next];
         }
     }
+    g_apu_vp_idle_linked = idle_linked;
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
