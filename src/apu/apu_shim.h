@@ -101,7 +101,14 @@ extern volatile uint8_t g_xbox_phys_lowram[];   /* kernel_memory.c */
 /* Physical address -> host pointer, in whichever store the page came from
  * (see g_xbox_phys_lowram). */
 static inline uint8_t *apu_phys(hwaddr addr) {
-    uint32_t p = (uint32_t)addr & 0x03FFFFFF;
+    /* 64-128 MB is ordinary memory (MmGetPhysicalAddress, XBOX_PHYS_LOWRAM_BASE
+     * in kernel.h); below it, the window -- or, for an address handed out
+     * before the split or by a title that masks to 64 MB, whichever store the
+     * page was last asked for from. */
+    uint32_t p = (uint32_t)addr & 0x07FFFFFF;
+    if (p >= 0x04000000u && g_apu_lowram_ptr)
+        return g_apu_lowram_ptr + (p - 0x04000000u);
+    p &= 0x03FFFFFF;
     return ((g_apu_lowram_ptr && g_xbox_phys_lowram[p >> 12]) ? g_apu_lowram_ptr
                                                                : g_apu_ram_ptr) + p;
 }

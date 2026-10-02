@@ -13,6 +13,8 @@
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
+#include <stdio.h>
+#include <stdlib.h>
 #endif
 
 /* ============================================================================
@@ -173,6 +175,61 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
  * out of the wrong store and played noise. */
 volatile uint8_t g_xbox_phys_lowram[0x04000000u >> 12];
 
+/* Physical addresses for ordinary memory, out of the window's way.
+ *
+ * The flag table above cannot tell two live buffers apart: one bit per
+ * physical page, last caller wins. Amped 2 keeps its music ring (a looping
+ * DirectSound buffer XACT refills from WMA) in the heap; in a level, the
+ * title asks for the physical address of contiguous pages too, and when one
+ * shares the ring's page number the bit flips and the APU reads the music
+ * out of the window -- texture or geometry bytes, a constant DC of -0.15 to
+ * -0.5 in the per-voice stats, heard as crackle and distortion until the
+ * menu re-creates the ring (23 of our own runs showed it, 2026-10-02).
+ *
+ * So ordinary memory answers in 64-128 MB, the upper half of a 128 MB debug
+ * kit, which the console's own DirectSound and XAPI handle: no contiguous
+ * page has a number there. The device models map it back (apu_phys,
+ * dma_resolve, OHCI's bus_va). RECOMP_PHYS_SPLIT=0 restores the shared
+ * numbering and the flag table alone. */
+int xbox_PhysSplit(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PHYS_SPLIT");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+/* RECOMP_PHYS_TRACE: report a page asked for from one store after the
+ * other (a collision the flag table would have lost). Counted always. */
+volatile long g_xbox_phys_flips;
+
+extern uint32_t xbox_ContiguousAllocatedBytes(void);
+
+static void phys_note_store(uint32_t pa, uint8_t lowram, uint32_t va)
+{
+    static int trace = -1;
+    uint8_t was = g_xbox_phys_lowram[pa >> 12];
+    if (was == lowram)
+        return;
+    if (!was && !lowram)
+        return;
+    /* A page seen before (the table starts at 0, so only a 1 -> 0 flip, or
+     * a 0 -> 1 on a page we know was handed out from the window, counts). */
+    if (was || pa < xbox_ContiguousAllocatedBytes()) {
+        long n = InterlockedIncrement(&g_xbox_phys_flips);
+        if (trace < 0)
+            trace = getenv("RECOMP_PHYS_TRACE") != NULL;
+        if (trace && n <= 24) {
+            fprintf(stderr, "  [PHYS] page %08X now %s (va %08X), was %s\n", pa & ~0xFFFu,
+                    lowram ? "ordinary memory" : "the window", va,
+                    was ? "ordinary memory" : "the window");
+            fflush(stderr);
+        }
+    }
+}
+
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
 {
     /*
@@ -192,12 +249,21 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
     if (va >= XBOX_CONTIG_BASE &&
             (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE) {
         uint32_t pa = va - XBOX_CONTIG_BASE;
-        if (pa < 0x04000000u)
+        if (pa < 0x04000000u) {
+            phys_note_store(pa, 0, va);
             g_xbox_phys_lowram[pa >> 12] = 0;
+        }
         return (ULONG_PTR)pa;
     }
-    if (va < 0x04000000u)
+    if (va < 0x04000000u) {
+        phys_note_store(va, 1, va);
         g_xbox_phys_lowram[va >> 12] = 1;
+        /* Ordinary memory answers in 64-128 MB (a debug kit's upper half),
+         * where nothing in the contiguous window can have the same number:
+         * see XBOX_PHYS_LOWRAM_BASE. */
+        if (xbox_PhysSplit())
+            return (ULONG_PTR)(XBOX_PHYS_LOWRAM_BASE + va);
+    }
     return (ULONG_PTR)va;
 }
 

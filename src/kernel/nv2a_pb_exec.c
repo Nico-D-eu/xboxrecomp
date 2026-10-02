@@ -119,6 +119,11 @@ static uint32_t dma_resolve(uint32_t offset)
 {
     extern uint32_t xbox_ContiguousAllocatedBytes(void);
 
+    /* 64-128 MB: ordinary memory, as MmGetPhysicalAddress now numbers it
+     * (XBOX_PHYS_LOWRAM_BASE). */
+    if (offset >= XBOX_PHYS_LOWRAM_BASE && offset < 2u * XBOX_PHYS_LOWRAM_BASE)
+        return offset - XBOX_PHYS_LOWRAM_BASE;
+
     /* Did this runtime hand the offset out as contiguous memory? Then the
      * bytes live in the window, and that is not a guess: the arena is a bump
      * allocator from XBOX_CONTIG_BASE, so everything below its high-water

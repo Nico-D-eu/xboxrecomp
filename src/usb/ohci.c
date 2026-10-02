@@ -464,6 +464,10 @@ static uint32_t bus_va(uint32_t a)
 
     if (a >= OHCI_CONTIG_BASE)
         return a;
+    /* 64-128 MB: ordinary memory, as MmGetPhysicalAddress numbers it
+     * (XBOX_PHYS_LOWRAM_BASE in kernel.h) -- unambiguous, unlike below. */
+    if (a >= 0x04000000u && a < 0x08000000u)
+        return a - 0x04000000u;
     /* The loaded image first. It sits at physical == virtual, and a driver
      * can hand the controller a buffer in its own .data: Amped 2's
      * GET_DESCRIPTOR data stage is at 0x0038C0F4. The contiguous arena's

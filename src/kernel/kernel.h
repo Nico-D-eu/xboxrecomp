@@ -395,6 +395,12 @@ typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
 #define XBOX_CONTIG_BASE 0x80000000u
 #define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
 
+/* Where MmGetPhysicalAddress puts ordinary (non-window) memory: 64-128 MB, so
+ * no physical number names two stores (kernel_memory.c, xbox_PhysSplit). The
+ * APU, NV2A executor and OHCI map it back; they repeat the constant. */
+#define XBOX_PHYS_LOWRAM_BASE 0x04000000u
+int xbox_PhysSplit(void);
+
 /* Default GPU instance size, used when a caller asks to claim everything. */
 #define XBOX_GPU_INSTANCE_DEFAULT (128u * 1024u)
 
