@@ -538,6 +538,30 @@ class DisasmEngine:
         # ...through the register the load just filled.
         return jmp_ops[0].mem.base == dst.reg and jmp_ops[0].mem.index == 0
 
+    def follows_padding(self, addr: int) -> bool:
+        """
+        Read-only: is `addr` 16-byte aligned with at least two int3 bytes
+        right before it -- where MSVC starts a function after padding?
+
+        The other evidence for a seed the sweep decoded through. Amped 2 has
+        small thiscall methods with no prologue at all (`cmp word [ecx+2Ch]`,
+        `mov edx, [esp+8]`, then a vtable jump) placed right after a switch's
+        jump tables. The sweep reads the tables as instructions and runs on
+        through the padding into the method, so its first bytes land
+        mid-instruction and the seed was rejected. Two vtable slots in
+        default.xbe point at such methods (0x0006FA20, 0x00070CA0).
+        """
+        if addr % 16:
+            return False
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        offset = addr - section.virtual_addr
+        if not data or offset < 2 or offset >= len(data):
+            return False
+        return data[offset - 1] == 0xCC and data[offset - 2] == 0xCC
+
     def probes_as_prologue(self, addr: int) -> bool:
         """
         Read-only: do the bytes at `addr` start with a recognisable MSVC

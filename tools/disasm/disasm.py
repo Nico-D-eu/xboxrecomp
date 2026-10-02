@@ -210,7 +210,11 @@ class Disassembler:
                     # A prologue is the evidence that separates the two cases:
                     # the bad HL2 seed at 0x00202C2E is six bytes into a mov
                     # and decodes as nothing of the kind.
-                    if self.engine.probes_as_prologue(addr):
+                    # So is int3 padding before an aligned seed: a method
+                    # with no prologue, after a jump table the sweep read as
+                    # code (engine.follows_padding).
+                    if (self.engine.probes_as_prologue(addr)
+                            or self.engine.follows_padding(addr)):
                         if self.engine.decode_at(addr):
                             realigned += 1
                             self.func_detector._add_candidate(
