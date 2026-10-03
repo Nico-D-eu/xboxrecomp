@@ -452,6 +452,40 @@ translate:
                 host_path_buf[--n] = L'\0';
         }
 
+        /* RECOMP_OVERLAY_DIR: a file there at the same relative path as one
+         * in the game dir is used instead -- a modded archive, a replaced
+         * texture -- without touching the game dir. Read-only media paths
+         * only (base_dir is the game dir); saves and caches stay as they
+         * are. Directory listings are not merged. */
+        if (base_dir == s_game_dir && !sub_dir && remainder[0]) {
+            static WCHAR overlay[MAX_PATH];
+            static int overlay_state = -1;          /* -1 unread, 0 off, 1 on */
+            if (overlay_state < 0) {
+                const char *e = getenv("RECOMP_OVERLAY_DIR");
+                overlay_state = 0;
+                if (e && *e) {
+                    MultiByteToWideChar(CP_UTF8, 0, e, -1, overlay, MAX_PATH);
+                    if (GetFileAttributesW(overlay) & FILE_ATTRIBUTE_DIRECTORY
+                            && GetFileAttributesW(overlay) != INVALID_FILE_ATTRIBUTES)
+                        overlay_state = 1;
+                    fprintf(stderr, "  [PATH] overlay %S %s\n", overlay,
+                            overlay_state ? "on" : "(not a directory, off)");
+                    fflush(stderr);
+                }
+            }
+            if (overlay_state == 1) {
+                WCHAR cand[MAX_PATH];
+                DWORD a;
+                swprintf_s(cand, MAX_PATH, L"%s\\%s", overlay, remainder_wide);
+                a = GetFileAttributesW(cand);
+                if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
+                    wcsncpy_s(host_path_buf, buf_size, cand, _TRUNCATE);
+                    fprintf(stderr, "  [PATH] %s -> overlay\n", xbox_path);
+                    fflush(stderr);
+                }
+            }
+        }
+
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %S", xbox_path, host_path_buf);
         xbox_remember_host_path(host_path_buf);
         return TRUE;
