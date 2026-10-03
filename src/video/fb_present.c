@@ -318,6 +318,16 @@ HWND xbox_FramebufferWindowHwnd(void)
     return s_fb_hwnd;
 }
 
+/* Quit as the window's close button does (WM_CLOSE -> fb_wndproc), for a
+ * project that offers it from inside the title -- Amped 2's menu mod has a
+ * QUIT item. Callable from any thread; no window, no-op. */
+void xbox_RequestQuit(void)
+{
+    HWND h = s_fb_hwnd;
+    if (h)
+        PostMessageA(h, WM_CLOSE, 0, 0);
+}
+
 void xbox_FramebufferWindowClaim(void)
 {
     InterlockedExchange(&s_fb_gdi_off, 1);
