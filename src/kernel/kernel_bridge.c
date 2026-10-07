@@ -454,6 +454,7 @@ static int g_thread_call_count = 0;
  * `ret` consumes, and runs. */
 /* Set on threads this bridge spawned; see PsTerminateSystemThread. */
 static RECOMP_TLS int g_is_spawned_thread = 0;
+static RECOMP_TLS int g_in_dpc;     /* kernel_run_dpc_at_dispatch is running */
 
 /* This thread's simulated stack, so both exits can give it back. Thread-local
  * for the obvious reason, and needed at all because the common exit is
@@ -2323,7 +2324,9 @@ static void kernel_run_dpc_at_dispatch(uint32_t dpc_va, uint32_t arg1, uint32_t 
     extern int  xbox_DispatchLockEnabled(void);
     int got = xbox_DispatchLockEnabled() && xbox_DispatchLockAcquireForDpc(20);
     ULONGLONG t0 = GetTickCount64(), ms;
+    g_in_dpc = 1;
     kernel_run_dpc(dpc_va, arg1, arg2);
+    g_in_dpc = 0;
     if (got)
         xbox_DispatchLockRelease();
     /* A DPC that runs long holds every raise off with it: name it. */
@@ -9699,7 +9702,36 @@ static void kernel_thunk_dispatch(void)
         }
     }
 
-    if (bridge) {
+    if (bridge && g_in_dpc) {
+        /* A kernel call inside a DPC that takes long holds the dispatch
+         * lock all that time, and every raising thread waits on it: name
+         * it, with its first arguments. */
+        ULONGLONG t0 = GetTickCount64(), ms;
+        uint32_t a0 = BRIDGE_MEM32(g_esp + 4), a1 = BRIDGE_MEM32(g_esp + 8);
+        uint32_t a2 = BRIDGE_MEM32(g_esp + 12);
+        /* RtlEnterCriticalSection (277) may wait for a guest thread, which
+         * may need to raise first: not with the dispatch lock held (see
+         * xbox_DispatchLockSuspend). RECOMP_DPC_CS_KEEP_LOCK=1: the old way. */
+        static int keep = -1;
+        if (keep < 0) keep = getenv("RECOMP_DPC_CS_KEEP_LOCK") != NULL;
+        if (ordinal == 277 && !keep) {
+            extern int  xbox_DispatchLockSuspend(void);
+            extern void xbox_DispatchLockResume(int depth, int dpc);
+            int depth = xbox_DispatchLockSuspend();
+            bridge();
+            xbox_DispatchLockResume(depth, 1);
+        } else {
+            bridge();
+        }
+        ms = GetTickCount64() - t0;
+        if (ms >= 10) {
+            static volatile LONG said;
+            if (InterlockedIncrement(&said) <= 16)
+                fprintf(stderr, "  [DPC] kernel ordinal %lu took %llu ms in a DPC"
+                        " (args 0x%08X 0x%08X 0x%08X)\n",
+                        (unsigned long)ordinal, ms, a0, a1, a2);
+        }
+    } else if (bridge) {
         bridge();
     } else {
         /* No specific bridge - return 0. Warn once per ordinal rather than

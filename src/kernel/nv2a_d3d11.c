@@ -1044,7 +1044,7 @@ typedef struct {
     ID3D11ShaderResourceView *srv;
     int bad;
     int cube;               /* six faces, each its own mip chain */
-    ID3D11ShaderResourceView *rep;  /* texture pack replacement, not owned */
+    struct PackEntry *pack; /* texture pack entry for the content, or NULL */
 } TexEntry;
 
 #define TEX_SLOTS 4096
@@ -1407,18 +1407,74 @@ done:
     return srv;
 }
 
-typedef struct {
+typedef struct PackEntry {
     uint32_t crc, wh, color, used;          /* used = 0: empty */
-    ID3D11ShaderResourceView *srv;          /* NULL: not in the pack */
+    ID3D11ShaderResourceView *volatile srv; /* NULL: not (yet) loaded */
 } PackEntry;
 #define PACK_SLOTS 16384
 static PackEntry *s_pack;
 static const char *s_pack_dir;
 static int s_pack_on = -1;
-static uint32_t s_pack_misses, s_pack_loaded;
+static volatile LONG s_pack_misses, s_pack_loaded;
 
-static ID3D11ShaderResourceView *tex_pack_lookup(const Nv2aHwTexture *t,
-                                                 const TexEntry *e)
+/* Probe the pack directories for one key and load what is found. */
+static void pack_load(PackEntry *pe)
+{
+    /* Several packs, ';'-separated: the first that has the key wins. */
+    char path[1024];
+    const char *d = s_pack_dir;
+    ID3D11ShaderResourceView *srv = NULL;
+    uint32_t w = pe->wh >> 16, h = pe->wh & 0xFFFFu;
+    while (d && *d && !srv) {
+        const char *end = strchr(d, ';');
+        int len = end ? (int)(end - d) : (int)strlen(d);
+        snprintf(path, sizeof path, "%.*s\\%08x_%ux%u_%02x.dds", len, d, pe->crc,
+                 w, h, pe->color);
+        srv = dds_load(path);
+        d = end ? end + 1 : NULL;
+    }
+    if (srv) {
+        if (InterlockedIncrement(&s_pack_loaded) <= 8)
+            fprintf(stderr, "  [D3D11] texture pack: %08x_%ux%u_%02x\n",
+                    pe->crc, w, h, pe->color);
+        InterlockedExchangePointer((PVOID volatile *)&pe->srv, srv);
+    } else {
+        const char *mf = getenv("RECOMP_TEXTURE_PACK_MISSES");
+        FILE *f = mf && *mf ? fopen(mf, "a") : NULL;
+        InterlockedIncrement(&s_pack_misses);
+        if (f) {
+            fprintf(f, "%08x_%ux%u_%02x\n", pe->crc, w, h, pe->color);
+            fclose(f);
+        }
+    }
+}
+
+/* Loading off the render thread. A DDS of a 4x pack is up to 16 MB, and
+ * reading it where the texture is first drawn was a hitch each time a new
+ * area came into view. The loader takes keys from a ring, loads them (the
+ * device is free-threaded) and publishes the view; until then the draw uses
+ * the original. RECOMP_TEXTURE_PACK_SYNC=1 loads in place instead, so a
+ * test's first frames already show the pack. */
+#define PACK_QUEUE 4096
+static PackEntry *s_pack_q[PACK_QUEUE];
+static volatile LONG s_pack_qhead, s_pack_qtail;
+static HANDLE s_pack_event;
+static int s_pack_sync;
+
+static DWORD WINAPI pack_loader(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        while (s_pack_qtail != s_pack_qhead) {
+            PackEntry *pe = s_pack_q[s_pack_qtail % PACK_QUEUE];
+            pack_load(pe);
+            InterlockedIncrement(&s_pack_qtail);
+        }
+        WaitForSingleObject(s_pack_event, INFINITE);
+    }
+}
+
+static PackEntry *tex_pack_lookup(const Nv2aHwTexture *t, const TexEntry *e)
 {
     uint32_t bb, crc, at, i, lb;
     int linear;
@@ -1428,8 +1484,18 @@ static ID3D11ShaderResourceView *tex_pack_lookup(const Nv2aHwTexture *t,
         s_pack_dir = getenv("RECOMP_TEXTURE_PACK");
         s_pack_on = s_pack_dir && *s_pack_dir
                  && (s_pack = (PackEntry *)calloc(PACK_SLOTS, sizeof *s_pack)) != NULL;
-        if (s_pack_on)
-            fprintf(stderr, "  [D3D11] texture pack: %s\n", s_pack_dir);
+        if (s_pack_on) {
+            const char *sy = getenv("RECOMP_TEXTURE_PACK_SYNC");
+            s_pack_sync = sy && *sy && *sy != '0';
+            if (!s_pack_sync) {
+                s_pack_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+                if (!s_pack_event
+                        || !CreateThread(NULL, 0, pack_loader, NULL, 0, NULL))
+                    s_pack_sync = 1;
+            }
+            fprintf(stderr, "  [D3D11] texture pack: %s (%s)\n", s_pack_dir,
+                    s_pack_sync ? "loaded in place" : "loaded in the background");
+        }
     }
     if (!s_pack_on || e->cube)
         return NULL;
@@ -1442,7 +1508,7 @@ static ID3D11ShaderResourceView *tex_pack_lookup(const Nv2aHwTexture *t,
         PackEntry *c = &s_pack[(at + i) & (PACK_SLOTS - 1)];
         if (!c->used) { pe = c; break; }
         if (c->crc == crc && c->wh == ((e->w << 16) | e->h) && c->color == t->color)
-            return c->srv;
+            return c;
     }
     if (!pe)
         return NULL;                          /* table full here: no probe */
@@ -1450,35 +1516,15 @@ static ID3D11ShaderResourceView *tex_pack_lookup(const Nv2aHwTexture *t,
     pe->crc = crc;
     pe->wh = (e->w << 16) | e->h;
     pe->color = t->color;
-    {
-        /* Several packs, ';'-separated: the first that has the key wins. */
-        char path[1024];
-        const char *d = s_pack_dir;
-        pe->srv = NULL;
-        while (d && *d && !pe->srv) {
-            const char *end = strchr(d, ';');
-            int len = end ? (int)(end - d) : (int)strlen(d);
-            snprintf(path, sizeof path, "%.*s\\%08x_%ux%u_%02x.dds", len, d, crc,
-                     e->w, e->h, t->color);
-            pe->srv = dds_load(path);
-            d = end ? end + 1 : NULL;
-        }
-        if (!pe->srv)
-            s_pack_misses++;
-        if (pe->srv) {
-            if (s_pack_loaded++ < 8)
-                fprintf(stderr, "  [D3D11] texture pack: %08x_%ux%u_%02x\n",
-                        crc, e->w, e->h, t->color);
-        } else {
-            const char *mf = getenv("RECOMP_TEXTURE_PACK_MISSES");
-            FILE *f = mf && *mf ? fopen(mf, "a") : NULL;
-            if (f) {
-                fprintf(f, "%08x_%ux%u_%02x\n", crc, e->w, e->h, t->color);
-                fclose(f);
-            }
-        }
+    pe->srv = NULL;
+    if (s_pack_sync || s_pack_qhead - s_pack_qtail >= PACK_QUEUE) {
+        pack_load(pe);
+    } else {
+        s_pack_q[s_pack_qhead % PACK_QUEUE] = pe;
+        InterlockedIncrement(&s_pack_qhead);  /* publishes the slot */
+        SetEvent(s_pack_event);
     }
-    return pe->srv;
+    return pe;
 }
 
 static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w,
@@ -1562,7 +1608,7 @@ static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w
             e->bad = 1;
             s_st.tex_bad++;
         } else {
-            e->rep = tex_pack_lookup(t, e);
+            e->pack = tex_pack_lookup(t, e);
         }
     } else if (e->hashed_frame != s_frame && !e->bad) {
         /* Once a frame: has the title rewritten it? Small textures are hashed
@@ -1592,7 +1638,7 @@ static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w
         }
         if (changed) {
             tex_upload(e, t, 0);
-            e->rep = tex_pack_lookup(t, e);
+            e->pack = tex_pack_lookup(t, e);
         }
     }
     e->used_frame = s_frame;
@@ -1601,7 +1647,8 @@ static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w
     *out_levels = e->levels;
     if (e->bad)
         return NULL;
-    return e->rep ? e->rep : e->srv;
+    /* The replacement once its loader has published it. */
+    return e->pack && e->pack->srv ? e->pack->srv : e->srv;
 }
 
 /* ── Vertex data ─────────────────────────────────────────────────────── */

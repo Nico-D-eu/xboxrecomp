@@ -325,6 +325,38 @@ static int dispatch_lock_on(void)
     return dispatch_lock_level() >= 1;
 }
 
+/* Let go of the lock entirely -- every recursion level -- for a DPC that is
+ * about to wait on something a guest thread provides, and take it back after.
+ * On the console that cannot happen: one processor, so a thread holding a
+ * critical section is not running while a DPC is. Here it is, and when it
+ * then raises it queues behind the DPC that waits for it; each round only
+ * ends when its raise times out. Amped 2: XACT's DPC (0x00318663) entering a
+ * DirectSound critical section held for 62-219 ms, a visible hitch each
+ * time. Returns the depth to restore, 0 if this thread did not own it. */
+int xbox_DispatchLockSuspend(void)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    int depth;
+    if (s_disp_owner != me)
+        return 0;
+    depth = (int)s_disp_depth;
+    s_disp_depth = 0;
+    s_disp_dpc = 0;
+    InterlockedExchange(&s_disp_owner, 0);
+    return depth;
+}
+
+void xbox_DispatchLockResume(int depth, int dpc)
+{
+    if (depth <= 0)
+        return;
+    if (xbox_DispatchLockAcquire(1000)) {
+        s_disp_depth = depth;
+        if (dpc)
+            s_disp_dpc = 1;
+    }
+}
+
 /* The level (see dispatch_lock_level): callers test >= 1 or >= 2. */
 int xbox_DispatchLockEnabled(void)
 {
