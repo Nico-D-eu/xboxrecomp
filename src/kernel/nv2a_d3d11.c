@@ -773,6 +773,22 @@ static ID3D11SamplerState *sampler(const Nv2aHwTexture *t, uint32_t levels)
     sd.AddressV = addr_mode((t->address >> 8) & 0xFu);
     sd.AddressW = addr_mode((t->address >> 16) & 0xFu);
     sd.MaxAnisotropy = 1;
+    /* RECOMP_GPU_ANISO=<2-16>: anisotropic filtering, for textures the title
+     * already filters linearly across mip levels -- ground and walls seen
+     * at a grazing angle stay sharp. Point-sampled and unmipped textures
+     * (UI, fonts, lookup tables) keep their own filter. */
+    {
+        static int aniso = -1;
+        if (aniso < 0) {
+            const char *e = getenv("RECOMP_GPU_ANISO");
+            aniso = e ? atoi(e) : 0;
+            if (aniso > 16) aniso = 16;
+        }
+        if (aniso > 1 && mips && lmin) {
+            sd.Filter = D3D11_FILTER_ANISOTROPIC;
+            sd.MaxAnisotropy = (UINT)aniso;
+        }
+    }
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
     unpack_argb(t->border, sd.BorderColor);
     sd.MinLOD = 0.0f;
