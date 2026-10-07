@@ -2637,6 +2637,7 @@ static ID3D11RenderTargetView *s_bb_rtv;
 static UINT s_bb_w, s_bb_h;
 static ID3D11VertexShader *s_blit_vs;
 static ID3D11PixelShader *s_blit_ps;
+static ID3D11PixelShader *s_blit_fxaa_ps;    /* RECOMP_GPU_FXAA */
 static ID3D11SamplerState *s_blit_smp;
 static ID3D11Buffer *s_blit_cb;
 static int s_present_mode = -1;          /* 0 gdi, 1 swap chain */
@@ -2650,7 +2651,29 @@ static const char s_blit_hlsl[] =
     "  o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
     "  o.uv = t * uvscale.xy; return o;\n"
     "}\n"
-    "float4 ps(V i) : SV_Target { return float4(tx.Sample(sm, i.uv).rgb, 1); }\n";
+    "float4 ps(V i) : SV_Target { return float4(tx.Sample(sm, i.uv).rgb, 1); }\n"
+    /* RECOMP_GPU_FXAA: FXAA on the finished frame (the classic PC version:
+     * luma edges from the four diagonal neighbours, then two or four taps
+     * along the edge). uvscale.zw is one source texel. */
+    "float lum(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
+    "float3 at(float2 uv) { return tx.SampleLevel(sm, uv, 0).rgb; }\n"
+    "float4 ps_fxaa(V i) : SV_Target {\n"
+    "  float2 px = uvscale.zw, uv = i.uv;\n"
+    "  float3 m = at(uv);\n"
+    "  float nw = lum(at(uv + float2(-1, -1) * px)), ne = lum(at(uv + float2(1, -1) * px));\n"
+    "  float sw = lum(at(uv + float2(-1, 1) * px)), se = lum(at(uv + float2(1, 1) * px));\n"
+    "  float lm = lum(m);\n"
+    "  float lmin = min(lm, min(min(nw, ne), min(sw, se)));\n"
+    "  float lmax = max(lm, max(max(nw, ne), max(sw, se)));\n"
+    "  float2 d = float2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));\n"
+    "  float red = max((nw + ne + sw + se) * (0.25 / 8.0), 1.0 / 128.0);\n"
+    "  float r = 1.0 / (min(abs(d.x), abs(d.y)) + red);\n"
+    "  d = clamp(d * r, -8.0, 8.0) * px;\n"
+    "  float3 a = 0.5 * (at(uv + d * (1.0 / 3.0 - 0.5)) + at(uv + d * (2.0 / 3.0 - 0.5)));\n"
+    "  float3 b = a * 0.5 + 0.25 * (at(uv - d * 0.5) + at(uv + d * 0.5));\n"
+    "  float lb = lum(b);\n"
+    "  return float4((lb < lmin || lb > lmax) ? a : b, 1);\n"
+    "}\n";
 
 static int present_init(HWND hwnd)
 {
@@ -2702,6 +2725,23 @@ static int present_init(HWND hwnd)
                                    ID3D10Blob_GetBufferSize(pb), NULL, &s_blit_ps);
     ID3D10Blob_Release(vb);
     ID3D10Blob_Release(pb);
+    {
+        const char *fx = getenv("RECOMP_GPU_FXAA");
+        if (fx && *fx && *fx != '0') {
+            ID3DBlob *fb = NULL;
+            if (SUCCEEDED(D3DCompile(s_blit_hlsl, sizeof s_blit_hlsl - 1, NULL, NULL,
+                                     NULL, "ps_fxaa", "ps_5_0", 0, 0, &fb, &err))) {
+                ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(fb),
+                                               ID3D10Blob_GetBufferSize(fb), NULL,
+                                               &s_blit_fxaa_ps);
+                ID3D10Blob_Release(fb);
+                fprintf(stderr, "  [D3D11] FXAA on\n");
+            } else {
+                fprintf(stderr, "  [D3D11] FXAA shader: %s\n",
+                        err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+            }
+        }
+    }
     memset(&smp, 0, sizeof smp);
     smp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -2992,7 +3032,8 @@ static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
     vp.MaxDepth = 1.0f;
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        float uv[4] = { rt ? (float)w / (float)rt->w : 1.0f, rt ? (float)h / (float)rt->h : 1.0f, 0, 0 };
+        float uv[4] = { rt ? (float)w / (float)rt->w : 1.0f, rt ? (float)h / (float)rt->h : 1.0f,
+                        rt ? 1.0f / (float)rt->w : 0.0f, rt ? 1.0f / (float)rt->h : 0.0f };
         memcpy(m.pData, uv, sizeof uv);
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
     }
@@ -3004,8 +3045,10 @@ static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
     ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_fxaa_ps ? s_blit_fxaa_ps : s_blit_ps,
+                                    NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
     if (rt) {
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
         ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
