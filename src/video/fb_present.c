@@ -192,6 +192,11 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         return 0;
 
+    case WM_APP + 0x11:
+        /* xbox_SetFullscreen, from another thread. */
+        fb_set_borderless(h, (int)w);
+        return 0;
+
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         /* F11, or Alt+Enter (Enter with the context bit): fullscreen. Not
@@ -326,6 +331,21 @@ void xbox_RequestQuit(void)
     HWND h = s_fb_hwnd;
     if (h)
         PostMessageA(h, WM_CLOSE, 0, 0);
+}
+
+/* Borderless fullscreen on or off, as F11 does, for a project that offers it
+ * in the title's own options (Amped 2's Game Options). Callable from any
+ * thread: the change is made on the window's thread. */
+void xbox_SetFullscreen(int on)
+{
+    HWND h = s_fb_hwnd;
+    if (h)
+        PostMessageA(h, WM_APP + 0x11, (WPARAM)(on != 0), 0);
+}
+
+int xbox_IsFullscreen(void)
+{
+    return s_borderless;
 }
 
 void xbox_FramebufferWindowClaim(void)
