@@ -147,6 +147,10 @@ int xbox_FramebufferKeyDown(int vk)
  * the windowed placement kept to come back to. F11 or Alt+Enter toggles it;
  * RECOMP_WINDOW_MODE=borderless starts in it. The D3D11 presenter follows
  * the client size, so nothing else has to know. */
+/* Set by the project: flush its log on quit, quickly and without stdio
+ * (see WM_CLOSE in fb_wndproc). NULL: fprintf + g_xbox_flush_logs. */
+void (*g_xbox_quit_logs)(void);
+
 static int s_borderless;
 static WINDOWPLACEMENT s_windowed_place = { sizeof(WINDOWPLACEMENT) };
 
@@ -183,13 +187,24 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          * the title saves as it goes, as a console that is switched off
          * would. Flush the host's buffered log first. */
         InterlockedExchange(&s_fb_running, 0);
-        {
+        /* Gone from the screen at once: what follows (the log drain, then
+         * Windows releasing the D3D device and the guest's address space)
+         * can take seconds, and a window that lingers that long reads as a
+         * game that did not quit. */
+        ShowWindow(h, SW_HIDE);
+        /* A project with an asynchronous log hands us a bounded, stdio-free
+         * flush (g_xbox_quit_logs): a full flush takes the stdio lock and
+         * waits for the log to go quiet, which while other threads print
+         * held Amped 2's quit for 8 s. Without one, the old way. */
+        if (g_xbox_quit_logs) {
+            g_xbox_quit_logs();
+        } else {
             extern void (*g_xbox_flush_logs)(void);
             fprintf(stderr, "  [WINDOW] closed -- exiting\n");
             if (g_xbox_flush_logs)
                 g_xbox_flush_logs();
-            TerminateProcess(GetCurrentProcess(), 0);
         }
+        TerminateProcess(GetCurrentProcess(), 0);
         return 0;
 
     case WM_APP + 0x11:
