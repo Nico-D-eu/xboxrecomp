@@ -10,6 +10,8 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ============================================================================
@@ -125,6 +127,63 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  *   - DVD Region: Region 1 (North America)
  * ============================================================================ */
 
+/*
+ * RECOMP_VIDEO_MODES: the video modes the console's dashboard has enabled, as
+ * a comma list of 480p, 720p, 1080i, widescreen, letterbox, pal60 (or "none").
+ *
+ * Unset, the answers stay what they always were. Set, XC_VIDEO reports these
+ * flags in the EEPROM's own layout, XC_FACTORY_AV_REGION reports NTSC-M, and
+ * HalBootSMCVideoMode reports an HDTV pack -- the three things XAPI's
+ * XGetVideoFlags consults before a title sees a single HD flag. Titles with
+ * built-in HD or widescreen modes then pick them themselves (Amped 2 goes
+ * to 1280x720 progressive when it sees 720p).
+ */
+LONG xbox_VideoModesFlags(void)
+{
+    static LONG cached = -2;
+    const char *env, *p;
+
+    if (cached != -2)
+        return cached;
+    env = getenv("RECOMP_VIDEO_MODES");
+    if (!env) {
+        cached = -1;
+        return cached;
+    }
+
+    cached = 0;
+    for (p = env; *p; ) {
+        static const struct { const char *name; LONG flag; } names[] = {
+            { "480p",       XC_VIDEO_FLAGS_HDTV_480p  },
+            { "720p",       XC_VIDEO_FLAGS_HDTV_720p  },
+            { "1080i",      XC_VIDEO_FLAGS_HDTV_1080i },
+            { "widescreen", XC_VIDEO_FLAGS_WIDESCREEN },
+            { "letterbox",  XC_VIDEO_FLAGS_LETTERBOX  },
+            { "pal60",      XC_VIDEO_FLAGS_PAL_60Hz   },
+            { "none",       0                         },
+        };
+        size_t len = strcspn(p, ",; ");
+        size_t i;
+        int known = 0;
+
+        for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            if (strlen(names[i].name) == len && _strnicmp(p, names[i].name, len) == 0) {
+                cached |= names[i].flag;
+                known = 1;
+            }
+        }
+        if (len && !known)
+            fprintf(stderr, "[video] RECOMP_VIDEO_MODES: unknown mode '%.*s'\n",
+                    (int)len, p);
+        p += len;
+        while (*p == ',' || *p == ';' || *p == ' ')
+            p++;
+    }
+    fprintf(stderr, "[video] RECOMP_VIDEO_MODES=%s -> XC_VIDEO 0x%08lX\n",
+            env, (unsigned long)cached);
+    return cached;
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
@@ -147,7 +206,11 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     case XC_VIDEO:
         /* NTSC with widescreen and HDTV support enabled */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            /* Without RECOMP_VIDEO_MODES this keeps the old value, which was
+             * meant as widescreen + HD but sits in the low bits that
+             * XGetVideoFlags shifts away, so titles have always seen 0. */
+            LONG modes = xbox_VideoModesFlags();
+            *(PULONG)Value = modes >= 0 ? (ULONG)modes : 0x00000003;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -202,6 +265,16 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         }
         break;
 
+    case XC_FACTORY_AV_REGION:
+        /* NTSC-M 60 Hz, as AvSendTVEncoderOption already reports. Only with
+         * RECOMP_VIDEO_MODES; otherwise it falls through to zeros as before. */
+        if (xbox_VideoModesFlags() >= 0 && ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = XC_AV_REGION_NTSC_M;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+            break;
+        }
+        /* fall through */
     default:
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_XBOX,
             "ExQueryNonVolatileSetting: unhandled index 0x%02X", ValueIndex);

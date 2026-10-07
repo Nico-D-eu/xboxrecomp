@@ -864,6 +864,18 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         *Result = AV_PACK_HDTV
                 | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
                 | AV_REFRESH_60Hz;
+        /* The kernel folds the dashboard's video flags into the same word,
+         * in the EEPROM's bit positions, and D3D takes the HD modes it may
+         * use from there: with an HDTV pack, word & 0x000E0000 (480p, 720p,
+         * 1080i; Amped 2 at 0x00322CFE). Without them a title that asks for
+         * 720p fails CreateDevice. Only with RECOMP_VIDEO_MODES. */
+        {
+            LONG modes = xbox_VideoModesFlags();
+            if (modes > 0)
+                *Result |= (ULONG)modes & (XC_VIDEO_FLAGS_WIDESCREEN
+                    | XC_VIDEO_FLAGS_HDTV_720p | XC_VIDEO_FLAGS_HDTV_1080i
+                    | XC_VIDEO_FLAGS_HDTV_480p | XC_VIDEO_FLAGS_LETTERBOX);
+        }
         break;
 
     case AV_OPTION_QUERY_MODE:

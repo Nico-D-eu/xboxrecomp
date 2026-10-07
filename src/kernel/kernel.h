@@ -1042,11 +1042,31 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
 #define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
 
-/* Video standard flags in XC_VIDEO */
-#define XC_VIDEO_FLAGS_WIDESCREEN   0x01
-#define XC_VIDEO_FLAGS_HDTV         0x02
-#define XC_VIDEO_FLAGS_PAL_I        0x04
-#define XC_VIDEO_FLAGS_LETTERBOX    0x10
+#define XC_FACTORY_AV_REGION      0x103
+
+/* Video flags in XC_VIDEO, as the EEPROM stores them: the upper 16 bits.
+ * XAPI's XGetVideoFlags returns (value >> 16) & 0x5F, so the same flags in the
+ * low bits read back as 0 -- no widescreen, no 480p, no HD. */
+#define XC_VIDEO_FLAGS_WIDESCREEN   0x00010000
+#define XC_VIDEO_FLAGS_HDTV_720p    0x00020000
+#define XC_VIDEO_FLAGS_HDTV_1080i   0x00040000
+#define XC_VIDEO_FLAGS_HDTV_480p    0x00080000
+#define XC_VIDEO_FLAGS_LETTERBOX    0x00100000
+#define XC_VIDEO_FLAGS_PAL_60Hz     0x00400000
+
+/* XC_FACTORY_AV_REGION: the video standard in bits 8-15 (XGetVideoStandard
+ * reads that byte), refresh flags above. */
+#define XC_AV_REGION_NTSC_M         0x00400100
+
+/* HalBootSMCVideoMode / XGetAVPack values (the SMC's AV pack code). XAPI
+ * clears the HD flags from XGetVideoFlags unless this is HDTV. Not the same
+ * numbering as the AV_PACK_* values AvSendTVEncoderOption uses. */
+#define XC_AV_PACK_SCART            0
+#define XC_AV_PACK_HDTV             1
+
+/* RECOMP_VIDEO_MODES, parsed once (kernel_xbox.c): the XC_VIDEO flags to
+ * report, or -1 when the variable is unset and the old answers stand. */
+LONG xbox_VideoModesFlags(void);
 
 /* Unknown ordinals - stub */
 VOID    __stdcall xbox_Unknown_8(void);
