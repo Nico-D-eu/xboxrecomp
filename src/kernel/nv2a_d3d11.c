@@ -2647,6 +2647,8 @@ static UINT s_bb_w, s_bb_h;
 static ID3D11VertexShader *s_blit_vs;
 static ID3D11PixelShader *s_blit_ps;
 static ID3D11PixelShader *s_blit_fxaa_ps;    /* RECOMP_GPU_FXAA */
+static ID3D11PixelShader *s_hud_ps;          /* debug overlay (hud_draw) */
+static ID3D11BlendState *s_hud_blend;
 static ID3D11SamplerState *s_blit_smp;
 static ID3D11Buffer *s_blit_cb;
 static int s_present_mode = -1;          /* 0 gdi, 1 swap chain */
@@ -2682,7 +2684,8 @@ static const char s_blit_hlsl[] =
     "  float3 b = a * 0.5 + 0.25 * (at(uv - d * 0.5) + at(uv + d * 0.5));\n"
     "  float lb = lum(b);\n"
     "  return float4((lb < lmin || lb > lmax) ? a : b, 1);\n"
-    "}\n";
+    "}\n"
+    "float4 ps_hud(V i) : SV_Target { return tx.Sample(sm, i.uv); }\n";
 
 static int present_init(HWND hwnd)
 {
@@ -2734,6 +2737,27 @@ static int present_init(HWND hwnd)
                                    ID3D10Blob_GetBufferSize(pb), NULL, &s_blit_ps);
     ID3D10Blob_Release(vb);
     ID3D10Blob_Release(pb);
+    {
+        /* The debug overlay's shader and alpha blend (hud_draw). */
+        ID3DBlob *hb = NULL;
+        D3D11_BLEND_DESC bd;
+        if (SUCCEEDED(D3DCompile(s_blit_hlsl, sizeof s_blit_hlsl - 1, NULL, NULL,
+                                 NULL, "ps_hud", "ps_5_0", 0, 0, &hb, NULL))) {
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(hb),
+                                           ID3D10Blob_GetBufferSize(hb), NULL, &s_hud_ps);
+            ID3D10Blob_Release(hb);
+        }
+        memset(&bd, 0, sizeof bd);
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        ID3D11Device_CreateBlendState(s_dev, &bd, &s_hud_blend);
+    }
     {
         const char *fx = getenv("RECOMP_GPU_FXAA");
         if (fx && *fx && *fx != '0') {
@@ -2982,6 +3006,125 @@ static void present_overlay_tick(void)
                   s_last_flip_w, s_last_flip_h);
 }
 
+/* ── Debug overlay ───────────────────────────────────────────────────────
+ *
+ * F3 (fb_present.c) or RECOMP_GPU_HUD=1: a small box in the top-left corner
+ * of the window -- frame rate, render size, texture pack and file overlays.
+ * The text is drawn with GDI into a 32-bit DIB twice a second, uploaded to
+ * a texture, and blended over the presented frame, so it shows in
+ * RECOMP_GPU_SHOT_PRESENT shots but never in the title's own surfaces. */
+volatile long g_xbox_hud_on = -1;       /* -1: not read from the env yet */
+#define HUD_W 560
+#define HUD_H 72
+static ID3D11Texture2D *s_hud_tex;
+static ID3D11ShaderResourceView *s_hud_srv;
+static uint32_t s_hud_frames, s_hud_last;
+static float s_hud_fps;
+
+static void hud_draw(uint32_t rw, uint32_t rh)
+{
+    static HDC dc;
+    static HBITMAP bmp;
+    static uint32_t *px;
+    static HFONT font;
+    DWORD now = GetTickCount();
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_VIEWPORT vp;
+
+    if (g_xbox_hud_on < 0) {
+        const char *e = getenv("RECOMP_GPU_HUD");
+        g_xbox_hud_on = e && *e && *e != '0';
+    }
+    s_hud_frames++;
+    if (now - s_hud_last >= 500) {
+        s_hud_fps = s_hud_last ? s_hud_frames * 1000.0f / (float)(now - s_hud_last) : 0.0f;
+        s_hud_frames = 0;
+        s_hud_last = now;
+        if (g_xbox_hud_on && s_hud_ps) {
+            char text[768];
+            const char *ov = getenv("RECOMP_OVERLAY_DIR");
+            uint32_t i;
+            if (!dc) {
+                BITMAPINFO bi;
+                memset(&bi, 0, sizeof bi);
+                bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+                bi.bmiHeader.biWidth = HUD_W;
+                bi.bmiHeader.biHeight = -HUD_H;          /* top-down */
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                dc = CreateCompatibleDC(NULL);
+                bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+                SelectObject(dc, bmp);
+                font = CreateFontA(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, 0, 0,
+                                   ANTIALIASED_QUALITY, FIXED_PITCH, "Consolas");
+                SelectObject(dc, font);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, RGB(255, 255, 255));
+            }
+            snprintf(text, sizeof text,
+                     "%.1f fps   game %ux%u x%d%s%s\n"
+                     "texture pack: %u replaced, %u not in the pack\n"
+                     "overlays: %s",
+                     s_hud_fps, rw, rh, gpu_scale(),
+                     s_blit_fxaa_ps ? "   FXAA" : "",
+                     getenv("RECOMP_GPU_ANISO") ? "   aniso" : "",
+                     s_pack_loaded, s_pack_misses, ov && *ov ? ov : "none");
+            if (px && !s_hud_tex) {
+                D3D11_TEXTURE2D_DESC td;
+                memset(&td, 0, sizeof td);
+                td.Width = HUD_W; td.Height = HUD_H; td.MipLevels = 1; td.ArraySize = 1;
+                td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                td.SampleDesc.Count = 1;
+                td.Usage = D3D11_USAGE_DYNAMIC;
+                td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_hud_tex)))
+                    ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_hud_tex,
+                                                          NULL, &s_hud_srv);
+            }
+            if (px && s_hud_tex) {
+                RECT r = { 8, 6, HUD_W - 8, HUD_H - 4 };
+                memset(px, 0, HUD_W * HUD_H * 4);
+                DrawTextA(dc, text, -1, &r, DT_LEFT | DT_NOPREFIX);
+                GdiFlush();
+                /* GDI leaves alpha 0: text opaque, the rest a dark veil. */
+                for (i = 0; i < HUD_W * HUD_H; i++)
+                    px[i] = (px[i] & 0x00FFFFFFu) ? (px[i] | 0xFF000000u) : 0xA0000000u;
+                if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_hud_tex,
+                                                      0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                    for (i = 0; i < HUD_H; i++)
+                        memcpy((uint8_t *)m.pData + i * m.RowPitch, px + i * HUD_W, HUD_W * 4);
+                    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_hud_tex, 0);
+                }
+            }
+        }
+    }
+    if (!g_xbox_hud_on || !s_hud_srv || !s_hud_ps)
+        return;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float uv[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
+        memcpy(m.pData, uv, sizeof uv);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
+    }
+    vp.TopLeftX = 8.0f; vp.TopLeftY = 8.0f;
+    vp.Width = (float)HUD_W; vp.Height = (float)HUD_H;
+    vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_hud_blend, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_hud_ps, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_hud_srv);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    {
+        ID3D11ShaderResourceView *none = NULL;
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    }
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+}
+
 static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
 {
     HWND hwnd;
@@ -3068,6 +3211,7 @@ static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
         }
     }
     overlay_compose(rt, w, h, &vp);
+    hud_draw(rt ? rt->w : w, rt ? rt->h : h);
     present_shot();
     IDXGISwapChain1_Present(s_swap, 0, 0);
     s_last_present_ms = GetTickCount64();

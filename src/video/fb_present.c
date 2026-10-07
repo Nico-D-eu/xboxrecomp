@@ -206,6 +206,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             fb_set_borderless(h, !s_borderless);
             return 0;
         }
+        /* F3: the debug overlay (nv2a_d3d11.c), not passed to the title. */
+        if (w == VK_F3 && !(l & (1 << 30))) {
+            extern volatile long g_xbox_hud_on;
+            InterlockedExchange(&g_xbox_hud_on, !g_xbox_hud_on);
+            return 0;
+        }
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
