@@ -1282,7 +1282,8 @@ static ID3D11ShaderResourceView *vol_srv(const Nv2aHwTexture *t)
  * The original is still uploaded as before; a replacement only changes the
  * view the draw samples. Looked up when a texture is created or its guest
  * memory changes, one file probe per key (hits and misses both cached).
- * Cube maps keep their originals. RECOMP_TEXTURE_PACK_MISSES=<file>
+ * Cube maps keep their originals. Several packs: separate the directories
+ * with ';', highest priority first. RECOMP_TEXTURE_PACK_MISSES=<file>
  * appends the key of every texture the pack does not cover, once each,
  * to find what a pack still lacks (textures built at run time included).
  */
@@ -1450,10 +1451,18 @@ static ID3D11ShaderResourceView *tex_pack_lookup(const Nv2aHwTexture *t,
     pe->wh = (e->w << 16) | e->h;
     pe->color = t->color;
     {
+        /* Several packs, ';'-separated: the first that has the key wins. */
         char path[1024];
-        snprintf(path, sizeof path, "%s\\%08x_%ux%u_%02x.dds", s_pack_dir, crc,
-                 e->w, e->h, t->color);
-        pe->srv = dds_load(path);
+        const char *d = s_pack_dir;
+        pe->srv = NULL;
+        while (d && *d && !pe->srv) {
+            const char *end = strchr(d, ';');
+            int len = end ? (int)(end - d) : (int)strlen(d);
+            snprintf(path, sizeof path, "%.*s\\%08x_%ux%u_%02x.dds", len, d, crc,
+                     e->w, e->h, t->color);
+            pe->srv = dds_load(path);
+            d = end ? end + 1 : NULL;
+        }
         if (!pe->srv)
             s_pack_misses++;
         if (pe->srv) {

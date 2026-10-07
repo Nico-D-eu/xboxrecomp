@@ -456,32 +456,50 @@ translate:
          * in the game dir is used instead -- a modded archive, a replaced
          * texture -- without touching the game dir. Read-only media paths
          * only (base_dir is the game dir); saves and caches stay as they
-         * are. Directory listings are not merged. */
+         * are. Directory listings are not merged.
+         *
+         * Several directories, separated by ';', are searched in order and
+         * the first that has the file wins -- mod packs by priority. Ones
+         * that are not directories are left out. */
         if (base_dir == s_game_dir && !sub_dir && remainder[0]) {
-            static WCHAR overlay[MAX_PATH];
-            static int overlay_state = -1;          /* -1 unread, 0 off, 1 on */
-            if (overlay_state < 0) {
+#define OVERLAY_MAX 16
+            static WCHAR overlay[OVERLAY_MAX][MAX_PATH];
+            static int n_overlay = -1;              /* -1 unread */
+            int k;
+            if (n_overlay < 0) {
                 const char *e = getenv("RECOMP_OVERLAY_DIR");
-                overlay_state = 0;
-                if (e && *e) {
-                    MultiByteToWideChar(CP_UTF8, 0, e, -1, overlay, MAX_PATH);
-                    if (GetFileAttributesW(overlay) & FILE_ATTRIBUTE_DIRECTORY
-                            && GetFileAttributesW(overlay) != INVALID_FILE_ATTRIBUTES)
-                        overlay_state = 1;
-                    fprintf(stderr, "  [PATH] overlay %S %s\n", overlay,
-                            overlay_state ? "on" : "(not a directory, off)");
-                    fflush(stderr);
+                n_overlay = 0;
+                while (e && *e && n_overlay < OVERLAY_MAX) {
+                    const char *end = strchr(e, ';');
+                    size_t len = end ? (size_t)(end - e) : strlen(e);
+                    char one[MAX_PATH];
+                    DWORD a;
+                    if (len && len < MAX_PATH) {
+                        memcpy(one, e, len);
+                        one[len] = 0;
+                        MultiByteToWideChar(CP_UTF8, 0, one, -1,
+                                            overlay[n_overlay], MAX_PATH);
+                        a = GetFileAttributesW(overlay[n_overlay]);
+                        fprintf(stderr, "  [PATH] overlay %S %s\n", overlay[n_overlay],
+                                a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)
+                                    ? "on" : "(not a directory, off)");
+                        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY))
+                            n_overlay++;
+                    }
+                    e = end ? end + 1 : NULL;
                 }
+                fflush(stderr);
             }
-            if (overlay_state == 1) {
+            for (k = 0; k < n_overlay; k++) {
                 WCHAR cand[MAX_PATH];
                 DWORD a;
-                swprintf_s(cand, MAX_PATH, L"%s\\%s", overlay, remainder_wide);
+                swprintf_s(cand, MAX_PATH, L"%s\\%s", overlay[k], remainder_wide);
                 a = GetFileAttributesW(cand);
                 if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) {
                     wcsncpy_s(host_path_buf, buf_size, cand, _TRUNCATE);
-                    fprintf(stderr, "  [PATH] %s -> overlay\n", xbox_path);
+                    fprintf(stderr, "  [PATH] %s -> overlay %d\n", xbox_path, k);
                     fflush(stderr);
+                    break;
                 }
             }
         }
