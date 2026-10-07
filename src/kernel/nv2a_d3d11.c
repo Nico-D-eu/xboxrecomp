@@ -1044,6 +1044,7 @@ typedef struct {
     ID3D11ShaderResourceView *srv;
     int bad;
     int cube;               /* six faces, each its own mip chain */
+    ID3D11ShaderResourceView *rep;  /* texture pack replacement, not owned */
 } TexEntry;
 
 #define TEX_SLOTS 4096
@@ -1268,6 +1269,209 @@ static ID3D11ShaderResourceView *vol_srv(const Nv2aHwTexture *t)
     return e->srv;
 }
 
+/* ── Texture packs ───────────────────────────────────────────────────────
+ *
+ * RECOMP_TEXTURE_PACK=<dir>: replacement textures, one DDS per original,
+ * named <crc32>_<W>x<H>_<fmt>.dds -- the CRC-32 (zlib's) of the top mip as
+ * it sits in guest memory, its size, and the NV2A colour format, in hex.
+ * That is the key a project's asset tools compute from the game files
+ * (Amped 2: tools/assets, `tex-pack`), so a pack built offline finds its
+ * textures here without any table. The DDS can be any size and format
+ * D3D11 samples (BC7 from texconv, BC1-3, or 32-bit), with its own mips.
+ *
+ * The original is still uploaded as before; a replacement only changes the
+ * view the draw samples. Looked up when a texture is created or its guest
+ * memory changes, one file probe per key (hits and misses both cached).
+ * Cube maps keep their originals. RECOMP_TEXTURE_PACK_MISSES=<file>
+ * appends the key of every texture the pack does not cover, once each,
+ * to find what a pack still lacks (textures built at run time included).
+ */
+static uint32_t s_crc_table[256];
+
+static uint32_t crc32_bytes(const uint8_t *p, size_t n)
+{
+    uint32_t c = 0xFFFFFFFFu;
+    size_t i;
+    if (!s_crc_table[1]) {
+        uint32_t k, j, v;
+        for (k = 0; k < 256; k++) {
+            for (v = k, j = 0; j < 8; j++)
+                v = (v & 1) ? 0xEDB88320u ^ (v >> 1) : v >> 1;
+            s_crc_table[k] = v;
+        }
+    }
+    for (i = 0; i < n; i++)
+        c = s_crc_table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+/* Load a DDS as a shader resource view, or NULL. */
+static ID3D11ShaderResourceView *dds_load(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *buf = NULL;
+    long n;
+    uint32_t w, h, mips, flags, fourcc, bits, off = 128, block = 0, i;
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd[16];
+    ID3D11Texture2D *tex = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    const uint8_t *p;
+
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n > 128 && (buf = (uint8_t *)malloc((size_t)n)) != NULL
+            && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf);
+        buf = NULL;
+    }
+    fclose(f);
+    if (!buf)
+        return NULL;
+    if (memcmp(buf, "DDS ", 4) != 0)
+        goto done;
+    memcpy(&h, buf + 12, 4);
+    memcpy(&w, buf + 16, 4);
+    memcpy(&mips, buf + 28, 4);
+    memcpy(&flags, buf + 80, 4);
+    memcpy(&fourcc, buf + 84, 4);
+    memcpy(&bits, buf + 88, 4);
+    if (!mips) mips = 1;
+    if (mips > 16) mips = 16;
+    if (fourcc == 0x30315844u) {                    /* "DX10" */
+        uint32_t dxgi;
+        if (n < 148) goto done;
+        memcpy(&dxgi, buf + 128, 4);
+        fmt = (DXGI_FORMAT)dxgi;
+        off = 148;
+    } else if (fourcc == 0x31545844u) {             /* "DXT1" */
+        fmt = DXGI_FORMAT_BC1_UNORM;
+    } else if (fourcc == 0x33545844u) {             /* "DXT3" */
+        fmt = DXGI_FORMAT_BC2_UNORM;
+    } else if (fourcc == 0x35545844u) {             /* "DXT5" */
+        fmt = DXGI_FORMAT_BC3_UNORM;
+    } else if ((flags & 0x40u) && bits == 32) {     /* RGB, 32 bits */
+        uint32_t rmask;
+        memcpy(&rmask, buf + 92, 4);
+        fmt = rmask == 0x00FF0000u ? DXGI_FORMAT_B8G8R8A8_UNORM
+                                   : DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+    switch (fmt) {
+    case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC4_UNORM:
+        block = 8; break;
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC7_UNORM:
+    case DXGI_FORMAT_BC7_UNORM_SRGB:
+        block = 16; break;
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM:
+        break;
+    default:
+        goto done;
+    }
+    p = buf + off;
+    for (i = 0; i < mips; i++) {
+        uint32_t lw = w >> i ? w >> i : 1, lh = h >> i ? h >> i : 1;
+        uint32_t pitch = block ? ((lw + 3) / 4) * block : lw * 4;
+        uint32_t size = block ? pitch * ((lh + 3) / 4) : pitch * lh;
+        if (p + size > buf + n)
+            break;
+        sd[i].pSysMem = p;
+        sd[i].SysMemPitch = pitch;
+        sd[i].SysMemSlicePitch = size;
+        p += size;
+    }
+    if (!i)
+        goto done;
+    memset(&td, 0, sizeof td);
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = i;
+    td.ArraySize = 1;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, sd, &tex))) {
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)tex, NULL, &srv);
+        ID3D11Texture2D_Release(tex);        /* the view keeps it */
+    }
+done:
+    free(buf);
+    return srv;
+}
+
+typedef struct {
+    uint32_t crc, wh, color, used;          /* used = 0: empty */
+    ID3D11ShaderResourceView *srv;          /* NULL: not in the pack */
+} PackEntry;
+#define PACK_SLOTS 16384
+static PackEntry *s_pack;
+static const char *s_pack_dir;
+static int s_pack_on = -1;
+static uint32_t s_pack_misses, s_pack_loaded;
+
+static ID3D11ShaderResourceView *tex_pack_lookup(const Nv2aHwTexture *t,
+                                                 const TexEntry *e)
+{
+    uint32_t bb, crc, at, i, lb;
+    int linear;
+    PackEntry *pe = NULL;
+
+    if (s_pack_on < 0) {
+        s_pack_dir = getenv("RECOMP_TEXTURE_PACK");
+        s_pack_on = s_pack_dir && *s_pack_dir
+                 && (s_pack = (PackEntry *)calloc(PACK_SLOTS, sizeof *s_pack)) != NULL;
+        if (s_pack_on)
+            fprintf(stderr, "  [D3D11] texture pack: %s\n", s_pack_dir);
+    }
+    if (!s_pack_on || e->cube)
+        return NULL;
+    bb = dxt_block(t->color);
+    linear = !d3d8_format_is_swizzled(t->color) && !bb;
+    lb = level_bytes(t->color, e->w, e->h, t->pitch, linear);
+    crc = crc32_bytes(guest() + t->va, lb);
+    at = (crc ^ (e->w * 73856093u) ^ (e->h * 19349663u) ^ t->color) & (PACK_SLOTS - 1);
+    for (i = 0; i < 64; i++) {
+        PackEntry *c = &s_pack[(at + i) & (PACK_SLOTS - 1)];
+        if (!c->used) { pe = c; break; }
+        if (c->crc == crc && c->wh == ((e->w << 16) | e->h) && c->color == t->color)
+            return c->srv;
+    }
+    if (!pe)
+        return NULL;                          /* table full here: no probe */
+    pe->used = 1;
+    pe->crc = crc;
+    pe->wh = (e->w << 16) | e->h;
+    pe->color = t->color;
+    {
+        char path[1024];
+        snprintf(path, sizeof path, "%s\\%08x_%ux%u_%02x.dds", s_pack_dir, crc,
+                 e->w, e->h, t->color);
+        pe->srv = dds_load(path);
+        if (!pe->srv)
+            s_pack_misses++;
+        if (pe->srv) {
+            if (s_pack_loaded++ < 8)
+                fprintf(stderr, "  [D3D11] texture pack: %08x_%ux%u_%02x\n",
+                        crc, e->w, e->h, t->color);
+        } else {
+            const char *mf = getenv("RECOMP_TEXTURE_PACK_MISSES");
+            FILE *f = mf && *mf ? fopen(mf, "a") : NULL;
+            if (f) {
+                fprintf(f, "%08x_%ux%u_%02x\n", crc, e->w, e->h, t->color);
+                fclose(f);
+            }
+        }
+    }
+    return pe->srv;
+}
+
 static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w,
                                          uint32_t *out_h, uint32_t *out_levels)
 {
@@ -1348,6 +1552,8 @@ static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w
             e->srv = NULL; e->tex = NULL;
             e->bad = 1;
             s_st.tex_bad++;
+        } else {
+            e->rep = tex_pack_lookup(t, e);
         }
     } else if (e->hashed_frame != s_frame && !e->bad) {
         /* Once a frame: has the title rewritten it? Small textures are hashed
@@ -1375,14 +1581,18 @@ static ID3D11ShaderResourceView *tex_srv(const Nv2aHwTexture *t, uint32_t *out_w
             if (changed)
                 e->hash = hash64(src, e->bytes, 7);
         }
-        if (changed)
+        if (changed) {
             tex_upload(e, t, 0);
+            e->rep = tex_pack_lookup(t, e);
+        }
     }
     e->used_frame = s_frame;
     *out_w = e->w;
     *out_h = e->h;
     *out_levels = e->levels;
-    return e->bad ? NULL : e->srv;
+    if (e->bad)
+        return NULL;
+    return e->rep ? e->rep : e->srv;
 }
 
 /* ── Vertex data ─────────────────────────────────────────────────────── */
@@ -3726,6 +3936,9 @@ void nv2a_d3d11_report(void)
             s_st.vs_compiled, s_st.ps_compiled, s_st.compile_failed,
             s_st.tex_uploads, s_st.tex_bad, s_st.rt_created, s_st.ds_created,
             s_st.readbacks, s_st.cpu_frames, s_st.vs_const_writes, s_st.fallback_attrs);
+    if (s_pack_on > 0)
+        fprintf(stderr, "  [D3D11] texture pack: %u replaced, %u not in the pack\n",
+                s_pack_loaded, s_pack_misses);
     fflush(stderr);
 }
 
