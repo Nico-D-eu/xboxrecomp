@@ -463,6 +463,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpfnWndProc   = fb_wndproc;
         wc.hInstance     = GetModuleHandleA(NULL);
         wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+        wc.hIcon         = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));  /* the game's, if it has one */
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
