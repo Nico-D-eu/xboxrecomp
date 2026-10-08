@@ -47,9 +47,28 @@ static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
 size_t g_xbox_map_size = 0;   /* 0 = same as RAM */
 
+uint32_t g_xbox_contig_size = XBOX_TOTAL_RAM;
+uint32_t g_xbox_ram_top = XBOX_TOTAL_RAM;
+/* Mask that keeps every physical number this run hands out (window, then
+ * ordinary memory above it): 0x07FFFFFF at retail size. */
+uint32_t g_xbox_phys_mask = 2u * XBOX_TOTAL_RAM - 1u;
+
+/* The contiguous window grows with RAM: on hardware it is all of physical
+ * memory, and a debug kit's D3D and XAPI allocate from all 128 MB. */
 void xbox_SetTotalRam(size_t bytes)
 {
     g_xbox_total_ram = bytes;
+    g_xbox_contig_size = (uint32_t)bytes;
+}
+
+/* RAM mirrors sit at multiples of the mapped size and have to stay below the
+ * contiguous window at 0x80000000: at 128 MB, 28 of them would cover it. */
+static void test_high_mem(void);
+
+static int mirror_count(void)
+{
+    size_t fit = 0x80000000u / g_memory_size - 2;   /* the last can meet the window */
+    return fit < XBOX_NUM_MIRRORS ? (int)fit : XBOX_NUM_MIRRORS;
 }
 
 
@@ -482,6 +501,23 @@ static void dsp_ack_init(void)
     if (g_dsp_ack_count)
         fprintf(stderr, "  DSP ack: %d command word(s) will be completed"
                         " immediately\n", g_dsp_ack_count);
+}
+
+/* The same, for a word a title hook finds at runtime: the block moves when
+ * anything allocated before it does (the 128 MB layout, a mod), so a fixed
+ * RECOMP_DSP_ACK address only holds for one allocation order. */
+void xbox_DspAckAdd(uint32_t va)
+{
+    int i;
+    for (i = 0; i < g_dsp_ack_count; i++)
+        if (g_dsp_ack[i] == va)
+            return;
+    if (g_dsp_ack_count >= XBOX_MAX_DSP_ACK)
+        return;
+    g_dsp_ack[g_dsp_ack_count] = va;
+    MemoryBarrier();
+    g_dsp_ack_count++;
+    fprintf(stderr, "  DSP ack: command word at 0x%08X\n", va);
 }
 
 static int fence_readable(uint32_t va, uint32_t bytes);  /* defined below */
@@ -2053,7 +2089,24 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     /* The mapped range, which is not necessarily RAM. Mirrors are placed
      * at multiples of this, so growing it is what stops a title's
      * above-RAM allocations from aliasing low memory. */
+    {
+        /* RECOMP_GUEST_RAM_MB=128: a debug kit's memory, twice the heap and
+         * twice the contiguous window. Opt-in; 64 is the retail console. */
+        const char *e = getenv("RECOMP_GUEST_RAM_MB");
+        if (e && atoi(e) == 128 && g_xbox_total_ram < XBOX_DEVKIT_RAM)
+            xbox_SetTotalRam(XBOX_DEVKIT_RAM);
+    }
     g_memory_size = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+    g_xbox_ram_top = (uint32_t)g_memory_size;
+    {
+        uint32_t end = g_xbox_contig_size + g_xbox_ram_top, m = 1;
+        while (m && m < end)
+            m <<= 1;
+        g_xbox_phys_mask = m ? m - 1u : 0xFFFFFFFFu;
+    }
+    if (g_xbox_total_ram != XBOX_TOTAL_RAM)
+        fprintf(stderr, "xbox_MemoryLayoutInit: %u MB of RAM, %u MB contiguous window\n",
+                (unsigned)(g_xbox_total_ram >> 20), (unsigned)(g_xbox_contig_size >> 20));
 
     /*
      * Create a file mapping backed by the page file.
@@ -2105,7 +2158,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         /* Reserve base + mirrors as one range, and map the base at its head.
          * VirtualFree releases just the slice about to be used, so each view
          * replaces our own reservation rather than racing for free space. */
-        g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+        g_span_size = g_memory_size * (size_t)(1 + mirror_count());
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
@@ -2862,7 +2915,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         uint64_t tiled_lo = XBOX_TILED_BASE;
         uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
 
-        for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+        for (int m = 0; m < mirror_count(); m++) {
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                     (uintptr_t)(m + 1) * g_memory_size;
             uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
@@ -2894,7 +2947,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
         }
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
-                mirrors_ok, XBOX_NUM_MIRRORS,
+                mirrors_ok, mirror_count(),
                 (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
     }
 
@@ -2983,6 +3036,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     xbox_WatchInit();
+    if (g_xbox_total_ram > XBOX_TOTAL_RAM && getenv("RECOMP_TEST_HIGH_MEM"))
+        test_high_mem();
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }
@@ -3888,4 +3943,22 @@ static void heap_free_locked(uint32_t xbox_va)
 HANDLE xbox_GetMappingHandle(void)
 {
     return g_mapping_handle;
+}
+
+/* RECOMP_TEST_HIGH_MEM=1 with more than 64 MB of RAM: take the heap and the
+ * contiguous window up to 64 MB before the title runs, never freed, so
+ * everything it allocates lands in the upper half. A test of the 128 MB
+ * layout: every device model that reads guest memory (GPU, APU, USB) then has
+ * to resolve addresses above the retail range. */
+static void test_high_mem(void)
+{
+    const char *which = getenv("RECOMP_TEST_HIGH_MEM");   /* 1, heap or contig */
+    uint32_t heap = strcmp(which, "contig") ? XBOX_TOTAL_RAM - g_heap_next : 0;
+    uint32_t contig = strcmp(which, "heap")
+                    ? XBOX_TOTAL_RAM - (g_contig_next - XBOX_CONTIG_BASE) : 0;
+    uint32_t h = heap ? xbox_HeapAlloc(heap, 4096) : 0;
+    uint32_t c = contig ? xbox_ContiguousAlloc(contig, 4096) : 0;
+    fprintf(stderr, "  RECOMP_TEST_HIGH_MEM: heap filler %u MB at 0x%08X, contiguous"
+            " filler %u MB at 0x%08X; next heap 0x%08X, next contiguous 0x%08X\n",
+            heap >> 20, h, contig >> 20, c, g_heap_next, g_contig_next);
 }

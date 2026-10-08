@@ -393,12 +393,22 @@ typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
  * MmClaimGpuInstanceMemory reports GPU instance memory at its top. Shared so
  * the layout and the bridges cannot disagree about where it is. */
 #define XBOX_CONTIG_BASE 0x80000000u
-#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
 
-/* Where MmGetPhysicalAddress puts ordinary (non-window) memory: 64-128 MB, so
- * no physical number names two stores (kernel_memory.c, xbox_PhysSplit). The
- * APU, NV2A executor and OHCI map it back; they repeat the constant. */
-#define XBOX_PHYS_LOWRAM_BASE 0x04000000u
+/* Physical RAM for this run: 64 MB retail, or 128 MB like a debug kit
+ * (RECOMP_GUEST_RAM_MB=128, or xbox_SetTotalRam before xbox_MemoryLayoutInit).
+ * The window covers all of it, as on hardware; ordinary memory is [0,
+ * g_xbox_ram_top), the mapped range. Both default to 64 MB. */
+extern uint32_t g_xbox_contig_size;
+extern uint32_t g_xbox_ram_top;
+extern uint32_t g_xbox_phys_mask;   /* covers window + ordinary numbers */
+#define XBOX_CONTIG_SIZE g_xbox_contig_size
+
+/* Where MmGetPhysicalAddress puts ordinary (non-window) memory: right above
+ * the window (64-128 MB at retail size), so no physical number names two
+ * stores (kernel_memory.c, xbox_PhysSplit). The APU, NV2A executor and OHCI
+ * map it back. */
+#define XBOX_PHYS_LOWRAM_BASE XBOX_CONTIG_SIZE
+#define XBOX_PHYS_LOWRAM_END  (XBOX_PHYS_LOWRAM_BASE + g_xbox_ram_top)
 int xbox_PhysSplit(void);
 
 /* Default GPU instance size, used when a caller asks to claim everything. */

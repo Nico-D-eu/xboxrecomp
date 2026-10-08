@@ -119,9 +119,9 @@ static uint32_t dma_resolve(uint32_t offset)
 {
     extern uint32_t xbox_ContiguousAllocatedBytes(void);
 
-    /* 64-128 MB: ordinary memory, as MmGetPhysicalAddress now numbers it
-     * (XBOX_PHYS_LOWRAM_BASE). */
-    if (offset >= XBOX_PHYS_LOWRAM_BASE && offset < 2u * XBOX_PHYS_LOWRAM_BASE)
+    /* Above the window (64-128 MB at retail size): ordinary memory, as
+     * MmGetPhysicalAddress now numbers it (XBOX_PHYS_LOWRAM_BASE). */
+    if (offset >= XBOX_PHYS_LOWRAM_BASE && offset < XBOX_PHYS_LOWRAM_END)
         return offset - XBOX_PHYS_LOWRAM_BASE;
 
     /* Did this runtime hand the offset out as contiguous memory? Then the
@@ -147,7 +147,7 @@ static uint32_t dma_resolve(uint32_t offset)
         extern volatile uint8_t g_xbox_phys_lowram[];
         if (on < 0)
             on = getenv("RECOMP_GPU_LOWRAM_PAGES") != NULL;
-        if (on && offset < 0x04000000u && g_xbox_phys_lowram[offset >> 12])
+        if (on && offset < XBOX_CONTIG_SIZE && g_xbox_phys_lowram[offset >> 12])
             return offset;
     }
     if (offset < xbox_ContiguousAllocatedBytes())
@@ -2515,9 +2515,9 @@ static void raster_batch(void)
                         const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
                         float probe[4][4];
                         uint32_t a0 = (uint32_t)floorf(in0[3][0] * s_vp.constants[168][0]);
-                        static const uint32_t ranges[2][2] = {
-                            { 0x00010000u, 0x04000000u },
-                            { XBOX_CONTIG_BASE, XBOX_CONTIG_BASE + 0x04000000u } };
+                        const uint32_t ranges[2][2] = {
+                            { 0x00010000u, g_xbox_ram_top },
+                            { XBOX_CONTIG_BASE, XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE } };
                         int r, hits = 0;
                         if (a0 + 1 < NV2A_VP_CONSTANTS) {
                             memcpy(probe[0], s_vp.constants[a0 + 1], 16);

@@ -1097,8 +1097,8 @@ static void bridge_NtQueryVirtualMemory(void)
     BRIDGE_MEM32(info_va + 0x14) = 0x04;               /* Protect */
     BRIDGE_MEM32(info_va + 0x18) = 0x20000;            /* MEM_PRIVATE */
 
-    if (page_base >= g_xbox_code_lo && page_base < XBOX_TOTAL_RAM) {
-        BRIDGE_MEM32(info_va + 0x0C) = XBOX_TOTAL_RAM - page_base; /* RegionSize */
+    if (page_base >= g_xbox_code_lo && page_base < g_xbox_ram_top) {
+        BRIDGE_MEM32(info_va + 0x0C) = g_xbox_ram_top - page_base; /* RegionSize */
         BRIDGE_MEM32(info_va + 0x10) = 0x1000;         /* MEM_COMMIT */
     } else {
         BRIDGE_MEM32(info_va + 0x0C) = 0x1000;
@@ -1330,7 +1330,7 @@ static void bridge_HalReturnToFirmware(void)
          * cut. */
         for (i = 0; i < 1024; i++) {
             uint32_t a = g_esp + i * 4;
-            if (a < 0x00010000u || a >= 0x04000000u) break;
+            if (a < 0x00010000u || a >= g_xbox_ram_top) break;
             fprintf(stderr, "    GS %08X %08X\n", a,
                     *(const uint32_t *)(mem + a));
         }
@@ -3066,7 +3066,7 @@ static HANDLE ke_dispatcher_handle(uint32_t va)
     if (h)
         return h;
     if ((va & 0xFF000000u) != BRIDGE_HANDLE_TAG && va >= 0x00010000u
-            && va < 0x04000000u) {
+            && va < g_xbox_ram_top) {
         uint8_t type = BRIDGE_MEM8(va);
         uint8_t size = BRIDGE_MEM8(va + 2);
 
@@ -3098,7 +3098,7 @@ static HANDLE ke_dispatcher_handle(uint32_t va)
 static int ke_is_event_header(uint32_t va)
 {
     if ((va & 0xFF000000u) == BRIDGE_HANDLE_TAG || va < 0x00010000u
-            || va >= 0x04000000u)
+            || va >= g_xbox_ram_top)
         return 0;
     return (BRIDGE_MEM8(va) == 0 || BRIDGE_MEM8(va) == 1)
         && BRIDGE_MEM8(va + 2) == 4;

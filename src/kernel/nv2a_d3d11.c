@@ -144,14 +144,16 @@ static const uint8_t *guest(void)
  * or its tiled alias? Addresses come from the title's pushbuffer, and one
  * misread command makes a vertex array or texture point anywhere -- reading
  * 0xEE0B0C10 took the whole process down. */
+extern uint32_t g_xbox_contig_size, g_xbox_ram_top;   /* kernel.h: 64 or 128 MB */
+
 static int guest_ok(uint32_t va, uint32_t bytes)
 {
     uint64_t end = (uint64_t)va + bytes;
-    if (end <= 0x04000000u)
+    if (end <= g_xbox_ram_top)
         return 1;
-    if (va >= 0x80000000u && end <= 0x84000000ull)          /* contiguous window */
+    if (va >= 0x80000000u && end <= 0x80000000ull + g_xbox_contig_size)   /* contiguous window */
         return 1;
-    return va >= 0xF0000000u && end <= 0xF4000000ull;
+    return va >= 0xF0000000u && end <= 0xF0000000ull + g_xbox_contig_size;
 }
 
 /* ── Shaders ─────────────────────────────────────────────────────────── */
@@ -2879,8 +2881,8 @@ static int overlay_read(Overlay *o)
     if (((fmt >> 16) & 0xFu) != 1u)            /* YUY2 is all D3D asks for */
         return 0;
     phys = (pvideo(0x900) + pvideo(0x920)) & 0x0FFFFFFFu;
-    o->va = (phys >= 0x04000000u && phys < 0x08000000u) ? phys - 0x04000000u
-                                                        : 0x80000000u + phys;
+    o->va = (phys >= g_xbox_contig_size && phys - g_xbox_contig_size < g_xbox_ram_top)
+          ? phys - g_xbox_contig_size : 0x80000000u + phys;
     sin = pvideo(0x928);
     o->w = sin & 0xFFFFu;
     o->h = sin >> 16;

@@ -88,6 +88,10 @@ void xbox_SetMapSize(size_t bytes);
  * See the implementation for why reservations must not come from the heap. */
 uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align);
 
+/* Complete a DSP mailbox command word as soon as it is posted (see
+ * RECOMP_DSP_ACK in xbox_memory_layout.c), for a word found at runtime. */
+void xbox_DspAckAdd(uint32_t va);
+
 /* Bounds of the guest's executable sections, derived from the XBE at load.
  *
  * recomp_types.h declares these too, for RECOMP_ICALL_IS_CODE. They are

@@ -336,7 +336,7 @@ static void pb_run_body(uint32_t end_va)
 
     for (;;) {
         int ring = !outside && !in_call;
-        uint32_t limit = (ring && !need_wrap) ? end_va : XBOX_CONTIG_BASE + 0x04000000u;
+        uint32_t limit = (ring && !need_wrap) ? end_va : XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
         uint32_t w;
 
         if (va >= limit)
@@ -386,7 +386,7 @@ static void pb_run_body(uint32_t end_va)
              * hundreds of recorded buffers, and counting them all against
              * one budget called a long run a runaway. Jumps within the ring
              * are bounded by the word budget instead. */
-            if (target >= XBOX_CONTIG_BASE + 0x04000000u
+            if (target >= XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
                     || ((outside || in_call || !in_ring) && ++followed > 256)) {
                 stop = 2;                     /* not memory, or runaway */
                 break;
@@ -461,7 +461,7 @@ static void pb_run_body(uint32_t end_va)
                 stop = 5;
                 break;
             }
-            if (!in_call && target < XBOX_CONTIG_BASE + 0x04000000u && ++followed <= 256) {
+            if (!in_call && target < XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE && ++followed <= 256) {
                 in_call = 1;
                 call_ret = va;
                 s_tot_followed++;

@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"   /* g_xbox_total_ram, XBOX_DEVKIT_RAM */
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -140,9 +141,9 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics)
     memset(MemoryStatistics, 0, sizeof(XBOX_MM_STATISTICS));
     MemoryStatistics->Length = sizeof(XBOX_MM_STATISTICS);
 
-    /* Xbox has 64MB RAM. Report plausible values. */
+    /* 64 MB on a retail Xbox, 128 MB with RECOMP_GUEST_RAM_MB=128. */
     ULONG page_size = 4096;
-    MemoryStatistics->TotalPhysicalPages = 64 * 1024 * 1024 / page_size; /* 16384 pages */
+    MemoryStatistics->TotalPhysicalPages = (ULONG)(g_xbox_total_ram / page_size);
     MemoryStatistics->AvailablePages = (ULONG)(ms.ullAvailPhys / page_size);
     if (MemoryStatistics->AvailablePages > MemoryStatistics->TotalPhysicalPages)
         MemoryStatistics->AvailablePages = MemoryStatistics->TotalPhysicalPages / 2;
@@ -173,7 +174,7 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
  * scatter-gather tables with this call, one page at a time; XACT keeps its
  * wave banks in the ordinary heap, so the APU read every ADPCM sound effect
  * out of the wrong store and played noise. */
-volatile uint8_t g_xbox_phys_lowram[0x04000000u >> 12];
+volatile uint8_t g_xbox_phys_lowram[XBOX_DEVKIT_RAM >> 12];   /* by window page */
 
 /* Physical addresses for ordinary memory, out of the window's way.
  *
@@ -249,15 +250,17 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
     if (va >= XBOX_CONTIG_BASE &&
             (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE) {
         uint32_t pa = va - XBOX_CONTIG_BASE;
-        if (pa < 0x04000000u) {
+        if (pa < XBOX_DEVKIT_RAM) {
             phys_note_store(pa, 0, va);
             g_xbox_phys_lowram[pa >> 12] = 0;
         }
         return (ULONG_PTR)pa;
     }
-    if (va < 0x04000000u) {
-        phys_note_store(va, 1, va);
-        g_xbox_phys_lowram[va >> 12] = 1;
+    if (va < g_xbox_ram_top) {
+        if (va < XBOX_DEVKIT_RAM) {
+            phys_note_store(va, 1, va);
+            g_xbox_phys_lowram[va >> 12] = 1;
+        }
         /* Ordinary memory answers in 64-128 MB (a debug kit's upper half),
          * where nothing in the contiguous window can have the same number:
          * see XBOX_PHYS_LOWRAM_BASE. */

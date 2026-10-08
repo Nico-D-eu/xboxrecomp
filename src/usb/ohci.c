@@ -441,7 +441,7 @@ static int     g_ctrl_sent;
 /* The contiguous (physical-mirror) window. Mapped separately from main RAM
  * and far above it, so a size check against the mapped RAM size rejects it. */
 #define OHCI_CONTIG_BASE 0x80000000u
-#define OHCI_CONTIG_SIZE (64u * 1024u * 1024u)
+#define OHCI_CONTIG_SIZE XBOX_CONTIG_SIZE   /* kernel.h: 64 or 128 MB */
 
 /* A bus address, as the driver hands one to the controller, to the guest
  * address the same bytes are visible at.
@@ -464,10 +464,10 @@ static uint32_t bus_va(uint32_t a)
 
     if (a >= OHCI_CONTIG_BASE)
         return a;
-    /* 64-128 MB: ordinary memory, as MmGetPhysicalAddress numbers it
+    /* Above the window: ordinary memory, as MmGetPhysicalAddress numbers it
      * (XBOX_PHYS_LOWRAM_BASE in kernel.h) -- unambiguous, unlike below. */
-    if (a >= 0x04000000u && a < 0x08000000u)
-        return a - 0x04000000u;
+    if (a >= XBOX_PHYS_LOWRAM_BASE && a < XBOX_PHYS_LOWRAM_END)
+        return a - XBOX_PHYS_LOWRAM_BASE;
     /* The loaded image first. It sits at physical == virtual, and a driver
      * can hand the controller a buffer in its own .data: Amped 2's
      * GET_DESCRIPTOR data stage is at 0x0038C0F4. The contiguous arena's
