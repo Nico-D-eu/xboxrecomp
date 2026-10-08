@@ -1411,30 +1411,138 @@ done:
 
 typedef struct PackEntry {
     uint32_t crc, wh, color, used;          /* used = 0: empty */
+    uint32_t va, bytes;                     /* the top mip, for RECOMP_TEXTURE_PACK_DUMP */
+    uint32_t tail;                          /* crc32 of the top mip past its first block */
     ID3D11ShaderResourceView *volatile srv; /* NULL: not (yet) loaded */
 } PackEntry;
 #define PACK_SLOTS 16384
 static PackEntry *s_pack;
 static const char *s_pack_dir;
 static int s_pack_on = -1;
-static volatile LONG s_pack_misses, s_pack_loaded;
+static volatile LONG s_pack_misses, s_pack_loaded, s_pack_freed;
+/* DXT entries by `tail`: see tex_pack_lookup. Render thread only. */
+#define PACK_TAIL_SLOTS 16384
+static PackEntry **s_pack_tail;
+
+/* RECOMP_TEXTURE_PACK_DUMP=<dir>: write each missed texture's top mip, as
+ * it sits in guest memory, to <dir>\<key>.raw, so a pack can be completed
+ * with textures the asset exporter never sees (built at run time, or from
+ * files it does not read). Amped 2's tools/assets `tex-misses` decodes them.
+ * Skipped when the bytes changed since the key was taken. */
+static void pack_dump(const PackEntry *pe)
+{
+    static const char *dir = (const char *)1;
+    char path[1024];
+    const uint8_t *src;
+    FILE *f;
+
+    if (dir == (const char *)1) {
+        dir = getenv("RECOMP_TEXTURE_PACK_DUMP");
+        if (dir && *dir)
+            CreateDirectoryA(dir, NULL);
+    }
+    if (!dir || !*dir || !pe->bytes || !guest_ok(pe->va, pe->bytes))
+        return;
+    src = guest() + pe->va;
+    if (crc32_bytes(src, pe->bytes) != pe->crc)
+        return;
+    snprintf(path, sizeof path, "%s\\%08x_%ux%u_%02x.raw", dir, pe->crc,
+             pe->wh >> 16, pe->wh & 0xFFFFu, pe->color);
+    if ((f = fopen(path, "wb")) != NULL) {
+        fwrite(src, 1, pe->bytes, f);
+        fclose(f);
+    }
+}
+
+/* A pack's tails.txt: `<tail>_<w>x<h>_<fmt> <key>` per DXT texture, tail
+ * being the crc32 of its top mip past the first 16 bytes. Amped 2 draws its
+ * loading screen from textures it has already freed, whose first block the
+ * pool's free-list header has replaced; the full key then names nothing, the
+ * tail still names the texture. Read once, from every pack directory. */
+typedef struct { uint32_t tail, wh, color, crc; } PackTail;
+#define PACK_TAILMAP_SLOTS 16384
+static PackTail *s_tailmap;
+
+static uint32_t tailmap_at(uint32_t tail, uint32_t wh, uint32_t color)
+{
+    return (tail ^ (wh * 2654435761u) ^ color) & (PACK_TAILMAP_SLOTS - 1);
+}
+
+static void tailmap_load(void)
+{
+    char path[1024], line[128];
+    const char *d = s_pack_dir;
+    unsigned n = 0;
+    s_tailmap = (PackTail *)calloc(PACK_TAILMAP_SLOTS, sizeof *s_tailmap);
+    while (s_tailmap && d && *d) {
+        const char *end = strchr(d, ';');
+        int len = end ? (int)(end - d) : (int)strlen(d);
+        FILE *f;
+        snprintf(path, sizeof path, "%.*s\\tails.txt", len, d);
+        if ((f = fopen(path, "r")) != NULL) {
+            while (fgets(line, sizeof line, f)) {
+                unsigned tail, w, h, fmt, crc, i;
+                if (sscanf(line, "%8x_%ux%u_%2x %8x", &tail, &w, &h, &fmt, &crc) != 5 || !tail)
+                    continue;
+                for (i = 0; i < 64; i++) {
+                    PackTail *s = &s_tailmap[(tailmap_at(tail, (w << 16) | h, fmt) + i)
+                                             & (PACK_TAILMAP_SLOTS - 1)];
+                    if (!s->tail) {
+                        s->tail = tail; s->wh = (w << 16) | h; s->color = fmt; s->crc = crc;
+                        n++;
+                        break;
+                    }
+                }
+            }
+            fclose(f);
+        }
+        d = end ? end + 1 : NULL;
+    }
+    if (n)
+        fprintf(stderr, "  [D3D11] texture pack: %u tails (freed textures)\n", n);
+}
+
+static uint32_t tailmap_find(const PackEntry *pe)
+{
+    uint32_t i, at;
+    if (!s_tailmap || !pe->tail)
+        return 0;
+    at = tailmap_at(pe->tail, pe->wh, pe->color);
+    for (i = 0; i < 64; i++) {
+        const PackTail *s = &s_tailmap[(at + i) & (PACK_TAILMAP_SLOTS - 1)];
+        if (!s->tail)
+            return 0;
+        if (s->tail == pe->tail && s->wh == pe->wh && s->color == pe->color)
+            return s->crc;
+    }
+    return 0;
+}
+
+/* The first pack directory with this key wins. */
+static ID3D11ShaderResourceView *pack_find(uint32_t crc, uint32_t w, uint32_t h,
+                                           uint32_t color)
+{
+    char path[1024];
+    const char *d = s_pack_dir;
+    ID3D11ShaderResourceView *srv = NULL;
+    while (d && *d && !srv) {
+        const char *end = strchr(d, ';');
+        int len = end ? (int)(end - d) : (int)strlen(d);
+        snprintf(path, sizeof path, "%.*s\\%08x_%ux%u_%02x.dds", len, d, crc, w, h, color);
+        srv = dds_load(path);
+        d = end ? end + 1 : NULL;
+    }
+    return srv;
+}
 
 /* Probe the pack directories for one key and load what is found. */
 static void pack_load(PackEntry *pe)
 {
     /* Several packs, ';'-separated: the first that has the key wins. */
-    char path[1024];
-    const char *d = s_pack_dir;
-    ID3D11ShaderResourceView *srv = NULL;
-    uint32_t w = pe->wh >> 16, h = pe->wh & 0xFFFFu;
-    while (d && *d && !srv) {
-        const char *end = strchr(d, ';');
-        int len = end ? (int)(end - d) : (int)strlen(d);
-        snprintf(path, sizeof path, "%.*s\\%08x_%ux%u_%02x.dds", len, d, pe->crc,
-                 w, h, pe->color);
-        srv = dds_load(path);
-        d = end ? end + 1 : NULL;
-    }
+    uint32_t w = pe->wh >> 16, h = pe->wh & 0xFFFFu, alt;
+    ID3D11ShaderResourceView *srv = pack_find(pe->crc, w, h, pe->color);
+    if (!srv && (alt = tailmap_find(pe)) != 0 && (srv = pack_find(alt, w, h, pe->color)) != NULL)
+        InterlockedIncrement(&s_pack_freed);
     if (srv) {
         if (InterlockedIncrement(&s_pack_loaded) <= 8)
             fprintf(stderr, "  [D3D11] texture pack: %08x_%ux%u_%02x\n",
@@ -1448,6 +1556,7 @@ static void pack_load(PackEntry *pe)
             fprintf(f, "%08x_%ux%u_%02x\n", pe->crc, w, h, pe->color);
             fclose(f);
         }
+        pack_dump(pe);
     }
 }
 
@@ -1489,6 +1598,7 @@ static PackEntry *tex_pack_lookup(const Nv2aHwTexture *t, const TexEntry *e)
         if (s_pack_on) {
             const char *sy = getenv("RECOMP_TEXTURE_PACK_SYNC");
             s_pack_sync = sy && *sy && *sy != '0';
+            tailmap_load();
             if (!s_pack_sync) {
                 s_pack_event = CreateEventA(NULL, FALSE, FALSE, NULL);
                 if (!s_pack_event
@@ -1514,10 +1624,39 @@ static PackEntry *tex_pack_lookup(const Nv2aHwTexture *t, const TexEntry *e)
     }
     if (!pe)
         return NULL;                          /* table full here: no probe */
+    /* A texture whose first block alone changed is the one already seen:
+     * Amped 2's pool writes its free-list header over the first 16 bytes of
+     * a block it frees, and a menu's textures are often hashed again in the
+     * frame they are freed. The key then names nothing (and holds pointers,
+     * so it differs every run): 15 of the 22 misses of a full-pack ML1 run.
+     * Keep the replacement the texture had. DXT only, where 16 bytes are
+     * one block. */
+    if (bb && lb > 64) {
+        uint32_t tail = crc32_bytes(guest() + t->va + 16, lb - 16);
+        uint32_t wh = (e->w << 16) | e->h;
+        uint32_t ta = (tail ^ (wh * 2654435761u) ^ t->color) & (PACK_TAIL_SLOTS - 1);
+        if (!s_pack_tail)
+            s_pack_tail = (PackEntry **)calloc(PACK_TAIL_SLOTS, sizeof *s_pack_tail);
+        for (i = 0; s_pack_tail && i < 64; i++) {
+            PackEntry **slot = &s_pack_tail[(ta + i) & (PACK_TAIL_SLOTS - 1)];
+            PackEntry *c = *slot;
+            if (!c) {
+                *slot = pe;                   /* first sight: remember it */
+                break;
+            }
+            if (c->tail == tail && c->wh == wh && c->color == t->color) {
+                InterlockedIncrement(&s_pack_freed);
+                return c;
+            }
+        }
+        pe->tail = tail;
+    }
     pe->used = 1;
     pe->crc = crc;
     pe->wh = (e->w << 16) | e->h;
     pe->color = t->color;
+    pe->va = t->va;
+    pe->bytes = lb;
     pe->srv = NULL;
     if (s_pack_sync || s_pack_qhead - s_pack_qtail >= PACK_QUEUE) {
         pack_load(pe);
@@ -4182,8 +4321,9 @@ void nv2a_d3d11_report(void)
             s_st.tex_uploads, s_st.tex_bad, s_st.rt_created, s_st.ds_created,
             s_st.readbacks, s_st.cpu_frames, s_st.vs_const_writes, s_st.fallback_attrs);
     if (s_pack_on > 0)
-        fprintf(stderr, "  [D3D11] texture pack: %u replaced, %u not in the pack\n",
-                s_pack_loaded, s_pack_misses);
+        fprintf(stderr, "  [D3D11] texture pack: %u replaced, %u not in the pack,"
+                " %u freed (first block overwritten) kept theirs\n",
+                s_pack_loaded, s_pack_misses, s_pack_freed);
     fflush(stderr);
 }
 
