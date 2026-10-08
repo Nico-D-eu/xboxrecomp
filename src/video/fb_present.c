@@ -143,6 +143,65 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* The mouse cursor over the game: hidden from the start, shown while the
+ * mouse moves, hidden again once it has been still for
+ * RECOMP_CURSOR_HIDE_MS (2000 by default; 0 keeps it always visible). Only
+ * over the client area -- the title bar and borders keep theirs. Windows
+ * sends WM_MOUSEMOVE without a move as well (the window appearing under the
+ * cursor, a resize, F11), so a move is the screen position changing. All of
+ * this runs on the window thread. */
+static int   s_cursor_hidden = 1;
+static DWORD s_cursor_moved;
+static POINT s_cursor_pos;
+static DWORD s_cursor_hide_ms = 2000;
+
+static void fb_cursor_init(void)
+{
+    const char *e = getenv("RECOMP_CURSOR_HIDE_MS");
+    if (e)
+        s_cursor_hide_ms = (DWORD)strtoul(e, NULL, 10);
+    s_cursor_hidden = s_cursor_hide_ms != 0;
+    GetCursorPos(&s_cursor_pos);
+    s_cursor_moved = GetTickCount();
+}
+
+/* Is the cursor over this window's client area? */
+static int fb_cursor_over_client(HWND h)
+{
+    POINT p;
+    RECT r;
+    if (!GetCursorPos(&p) || WindowFromPoint(p) != h)
+        return 0;
+    ScreenToClient(h, &p);
+    GetClientRect(h, &r);
+    return PtInRect(&r, p);
+}
+
+static void fb_cursor_moved(void)
+{
+    POINT p;
+    if (!s_cursor_hide_ms || !GetCursorPos(&p)
+            || (p.x == s_cursor_pos.x && p.y == s_cursor_pos.y))
+        return;
+    s_cursor_pos = p;
+    s_cursor_moved = GetTickCount();
+    if (s_cursor_hidden) {
+        s_cursor_hidden = 0;
+        SetCursor(LoadCursorA(NULL, IDC_ARROW));
+    }
+}
+
+/* Once per pass of the window loop. */
+static void fb_cursor_tick(HWND h)
+{
+    if (s_cursor_hidden || !s_cursor_hide_ms
+            || GetTickCount() - s_cursor_moved < s_cursor_hide_ms)
+        return;
+    s_cursor_hidden = 1;
+    if (fb_cursor_over_client(h))
+        SetCursor(NULL);
+}
+
 /* Borderless fullscreen: the window as a popup over its whole monitor, with
  * the windowed placement kept to come back to. F11 or Alt+Enter toggles it;
  * RECOMP_WINDOW_MODE=borderless starts in it. The D3D11 presenter follows
@@ -252,6 +311,17 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         if ((unsigned)w < 256)
             s_key_down[w] = 0;
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
+
+    case WM_MOUSEMOVE:
+        fb_cursor_moved();
+        return 0;
+
+    case WM_SETCURSOR:
+        if (LOWORD(l) == HTCLIENT && s_cursor_hidden) {
+            SetCursor(NULL);
+            return TRUE;
+        }
+        return DefWindowProcA(h, m, w, l);
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
@@ -432,6 +502,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     hdc = GetDC(hwnd);
     s_fb_hwnd = hwnd;
+    fb_cursor_init();
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -452,6 +523,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
+        fb_cursor_tick(hwnd);
         if (s_fb_gdi_off && s_present_idx >= 0 && s_rgb) {
             /* A swap chain owns the client area; keep s_rgb current for the
              * dumps, paint nothing. */
