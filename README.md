@@ -1,3 +1,8 @@
+> **This is the RE-Amped2 fork of xboxrecomp.** The `amped2-fixes` branch
+> carries the toolkit changes that [RE-Amped2](https://github.com/Nico-D-eu/RE-Amped2)
+> (Amped 2) needs. Many are general fixes and are being offered upstream.
+> `main` follows [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp).
+
 # xboxrecomp
 
 ```
