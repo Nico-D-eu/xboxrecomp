@@ -1,7 +1,15 @@
-> **This is the RE-Amped2 fork of xboxrecomp.** The `amped2-fixes` branch
+> [!TIP]
+> **Looking to play Amped 2 on PC?** Go to **[RE-Amped2](https://github.com/Nico-D-eu/RE-Amped2)**
+> and download the installer from its
+> **[Releases page](https://github.com/Nico-D-eu/RE-Amped2/releases)**. This
+> repository is only the toolkit underneath it.
+
+> **This is RE-Amped2's fork of xboxrecomp.** The `amped2-fixes` branch
 > carries the toolkit changes that [RE-Amped2](https://github.com/Nico-D-eu/RE-Amped2)
 > (Amped 2) needs. Many are general fixes and are being offered upstream.
 > `main` follows [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp).
+> Problems with RE-Amped2 go to its
+> [issues](https://github.com/Nico-D-eu/RE-Amped2/issues).
 
 # xboxrecomp
 
