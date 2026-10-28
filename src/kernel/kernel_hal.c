@@ -68,14 +68,32 @@ extern ptrdiff_t g_xbox_mem_offset;
 static XBOX_THREAD_LOCAL int t_release_due;
 static void irql_release_due(void);
 
+/* The thread that owns XBOX_TIB_MAIN: the one that ran xbox_kernel_init and
+ * goes on to run the title's entry point (set in kernel_thunks.c).
+ *
+ * Every guest thread has a TIB of its own (bridge_thread_main, the timer
+ * thread), but a device-model thread -- the OHCI and APU models delivering an
+ * ISR at device IRQL -- never asked for one: its g_fs_base is still the
+ * thread-local default, XBOX_TIB_MAIN, the main thread's. Publishing there
+ * wrote the ISR's level into the MAIN thread's KPCR.Irql while it ran
+ * unraised, so for that moment it read as being at DIRQL: DirectSound's lock
+ * on it skipped its critical section (see above) and raced the thread that
+ * held it. Amped 2 after the v0.16 merge: XACT corrupting its state
+ * (sub_003153FE writing through -1), deadlocks in ML1, and KeBugCheck 0xA.
+ * Only the owner of a KPCR writes its IRQL. */
+DWORD g_xbox_main_thread_id;
+
 static void irql_publish(void)
 {
     static int on = -1;
     if (on < 0) {
+        /* RECOMP_IRQL_PUBLISH=0: never write KPCR.Irql (A/B). */
         const char *e = getenv("RECOMP_IRQL_PUBLISH");
         on = !(e && *e == '0');
     }
-    if (on && g_fs_base)
+    if (on && g_fs_base
+            && (g_fs_base != XBOX_TIB_MAIN
+                || GetCurrentThreadId() == g_xbox_main_thread_id))
         *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base
                               + 0x24) = (uint8_t)g_current_irql;
     if (t_release_due)
