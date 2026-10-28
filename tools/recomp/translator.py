@@ -2996,11 +2996,16 @@ class BatchTranslator:
             stub_lines.append(
                 " * esp off by N on every call. */")
             stub_lines.append("")
+            # RECOMP_REACHED (recomp_types.h) reports a stub the first time a
+            # run calls it, when the project builds with RECOMP_COVERAGE: a
+            # stub that is reached is a function the disassembler missed.
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ "
+                    f"RECOMP_REACHED(RECOMP_REACHED_STUB, 0x{addr:08X}u); "
+                    f"g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")

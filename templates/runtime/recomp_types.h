@@ -1344,4 +1344,27 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
 void recomp_unimpl(const char *text, uint32_t va);
 #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
 
+/* A site the recompiler could only guess at, reached at run time.
+ *
+ * Two kinds of generated code compile but may not do what the guest did:
+ *   RECOMP_REACHED_STUB   an unresolved call target, stubbed to a bare return
+ *                         (recomp_stubs_unresolved.c);
+ *   RECOMP_REACHED_FLAGS  a conditional (jcc, setcc, cmovcc, loope/loopne)
+ *                         whose flags the lifter could not trace, so it tests
+ *                         the `_flags` fallback, which nothing assigns.
+ * Whether one is ever reached decides whether it matters, and only a run can
+ * say. With RECOMP_COVERAGE defined, each site calls recomp_reached() the
+ * first time it runs -- one byte test per pass after that, so the marker can
+ * stay on in normal play. Without it the marker compiles to nothing, and a
+ * project (or a test harness) need not define recomp_reached at all. */
+#define RECOMP_REACHED_STUB  1
+#define RECOMP_REACHED_FLAGS 2
+#ifdef RECOMP_COVERAGE
+void recomp_reached(int kind, uint32_t va);
+#define RECOMP_REACHED(_kind, _va) do { static volatile char _reached; \
+    if (!_reached) { _reached = 1; recomp_reached((_kind), (_va)); } } while (0)
+#else
+#define RECOMP_REACHED(_kind, _va) ((void)0)
+#endif
+
 #endif /* RECOMP_TYPES_H */

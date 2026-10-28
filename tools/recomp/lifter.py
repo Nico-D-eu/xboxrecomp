@@ -334,6 +334,16 @@ COND_MAP = {
     "jcxz":  (None,      None,      "cx is zero"),
 }
 
+def _reached_flags(va):
+    """The coverage marker for a condition lifted as the `_flags` fallback.
+
+    Compiles to nothing unless the project defines RECOMP_COVERAGE; then the
+    run reports the guest address the first time the site executes (see
+    RECOMP_REACHED in recomp_types.h). The fallback is a guess, and which of
+    them a real run reaches is what says which to fix."""
+    return f"RECOMP_REACHED(RECOMP_REACHED_FLAGS, 0x{va:08X}u);"
+
+
 # Instructions that set arithmetic flags (primary set, fully handled)
 FLAG_SETTERS = frozenset({
     "cmp", "test", "sub", "add", "and", "or", "xor",
@@ -2758,11 +2768,14 @@ class Lifter:
             elif jcc in ("jae", "jnb", "jnc"):
                 cond = "!_cf"
 
+        # The marker shares the branch's line, so anything that looks at a
+        # lifted jcc as one statement still sees one.
+        mark = (_reached_flags(insn.address) + " ") if cond == "_flags" else ""
         if target:
             if self._is_external_target(target):
                 name = self._call_target_name(target)
-                return [f"if ({cond} /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
-            return [f"if ({cond} /* {jcc}: {desc} */) goto loc_{target:08X};"]
+                return [f"{mark}if ({cond} /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
+            return [f"{mark}if ({cond} /* {jcc}: {desc} */) goto loc_{target:08X};"]
         return [f"/* {jcc}: {desc} - no target */"]
 
     # ── SETcc / CMOVcc ──
@@ -2784,6 +2797,8 @@ class Lifter:
         if jcc == "loop":
             cond, desc = "ecx != 0", "ecx is non-zero"
         else:
+            if not zf_expr:
+                stmts.append(_reached_flags(insn.address))
             cond = f"(ecx != 0) && ({zf_expr or '_flags'})"
             desc = ("ecx is non-zero and zero flag set" if jcc == "loope"
                     else "ecx is non-zero and zero flag clear")
@@ -2797,13 +2812,15 @@ class Lifter:
     def _lift_setcc(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
-        return [_fmt_operand_write(ops[0], f"_flags /* {m} */")]
+        return [_reached_flags(insn.address) + " "
+                + _fmt_operand_write(ops[0], f"_flags /* {m} */")]
 
     def _lift_cmovcc(self, insn, ops, m):
         if len(ops) < 2:
             return [f"/* {m}: bad operands */"]
         src = _fmt_operand_read(ops[1])
-        return [f"if (_flags /* {m} */) {_fmt_operand_write(ops[0], src)}"]
+        return [f"{_reached_flags(insn.address)} "
+                f"if (_flags /* {m} */) {_fmt_operand_write(ops[0], src)}"]
 
     # ── String operations ──
 
