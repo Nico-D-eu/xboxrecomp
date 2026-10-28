@@ -29,37 +29,37 @@ class FpuReverseFormTest(unittest.TestCase):
         lifted = _lift("fdivr", "dword ptr [0x281250]", [_mem(disp=0x281250)])
 
         self.assertEqual(len(lifted), 1)
-        self.assertIn("fp_top() = MEMF(0x281250) / fp_top();", lifted[0])
+        self.assertIn("fp_top() = RECOMP_FP_PC(MEMF(0x281250) / fp_top());", lifted[0])
         self.assertNotIn("/* FPU:", lifted[0])
 
     def test_fsubr_subtracts_the_stack_top_from_the_operand(self):
         lifted = _lift("fsubr", "dword ptr [eax + 0x10]",
                        [_mem(base="eax", disp=0x10)])
 
-        self.assertIn("fp_top() = MEMF(eax + 0x10) - fp_top();", lifted[0])
+        self.assertIn("fp_top() = RECOMP_FP_PC(MEMF(eax + 0x10) - fp_top());", lifted[0])
 
     def test_reverse_pop_forms_use_the_reversed_operand_order(self):
-        self.assertIn("fp_st1() = fp_top() / fp_st1(); fp_pop();",
+        self.assertIn("fp_st1() = RECOMP_FP_PC(fp_top() / fp_st1()); fp_pop();",
                       _lift("fdivrp", "st(1)", [])[0])
-        self.assertIn("fp_st1() = fp_top() - fp_st1(); fp_pop();",
+        self.assertIn("fp_st1() = RECOMP_FP_PC(fp_top() - fp_st1()); fp_pop();",
                       _lift("fsubrp", "st(1)", [])[0])
 
     def test_forward_forms_keep_their_original_operand_order(self):
         """The reverse cases must not disturb the plain ones."""
-        self.assertIn("fp_top() = fp_top() / MEMF(eax);",
+        self.assertIn("fp_top() = RECOMP_FP_PC(fp_top() / MEMF(eax));",
                       _lift("fdiv", "dword ptr [eax]", [_mem(base="eax")])[0])
-        self.assertIn("fp_top() = fp_top() - MEMF(eax);",
+        self.assertIn("fp_top() = RECOMP_FP_PC(fp_top() - MEMF(eax));",
                       _lift("fsub", "dword ptr [eax]", [_mem(base="eax")])[0])
 
     def test_integer_memory_operands_are_read_as_signed_integers(self):
         lifted = _lift("fidiv", "dword ptr [esp + 8]",
                        [_mem(base="esp", disp=8)])
 
-        self.assertIn("fp_top() = fp_top() / (double)SMEM32(esp + 8);", lifted[0])
+        self.assertIn("fp_top() = RECOMP_FP_PC(fp_top() / (double)SMEM32(esp + 8));", lifted[0])
 
         word = _lift("fisubr", "word ptr [ebx + 0xbc]",
                      [_mem(base="ebx", disp=0xBC, size=2)])
-        self.assertIn("fp_top() = (double)SMEM16(ebx + 0xBC) - fp_top();",
+        self.assertIn("fp_top() = RECOMP_FP_PC((double)SMEM16(ebx + 0xBC) - fp_top());",
                       word[0])
 
     def test_transcendentals_emit_statements_rather_than_comments(self):
@@ -76,8 +76,8 @@ class FpuReverseFormTest(unittest.TestCase):
                 self.assertNotIn("/* FPU:", lifted[0])
 
     def test_fptan_pushes_the_implicit_one(self):
-        """FPTAN leaves tan(x) and then 1.0 on the stack."""
-        self.assertIn("fp_push(1.0);", _lift("fptan", "", [])[0])
+        """FPTAN leaves tan(x) and then 1.0 (NaN for a non-finite x)."""
+        self.assertIn("fp_push(isfinite(_a) ? 1.0 : _a - _a);", _lift("fptan", "", [])[0])
 
 
 if __name__ == "__main__":

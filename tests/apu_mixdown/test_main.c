@@ -8,6 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The runtime links against the title's dispatch; nothing here calls it. */
+void *recomp_lookup(unsigned long address) { (void)address; abort(); }
+void *recomp_lookup_manual(unsigned long address) { (void)address; abort(); }
+
 /* The bins a title's 3D positional voices actually land in, from JSRF's own
  * V0BIN..V3BIN. 6 and 8 are even (left), 7 and 9 odd (right), so a mixdown
  * that preserves the guest's stereo pairing puts signal on both channels. */
@@ -16,7 +20,7 @@
 
 int main(void)
 {
-    const char *expect_env = getenv("APU_MIXDOWN_EXPECT");
+    const char *expect_env = getenv("RECOMP_TEST_MIXDOWN_EXPECT");
     const int expect_heard = expect_env ? atoi(expect_env) : 1;
 
     /* Zeroed is deliberately enough: ram_ptr NULL makes dsp_ack_frame return

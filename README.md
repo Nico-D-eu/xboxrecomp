@@ -24,7 +24,7 @@
  Static Recompilation Toolkit for Original Xbox Games
 ```
 
-> Turn any Xbox game binary into a native Windows executable. No emulation. No interpreter. Just raw, recompiled C.
+> Turn any Xbox game binary into a native executable for Windows, Linux or macOS. No emulation. No interpreter. Just raw, recompiled C.
 
 **[Join the sp00nznet recomp Discord](https://discord.gg/CRpzGWZFcu)** — the
 community hub for sp00nznet's recomp projects, where ps3recomp development
@@ -35,16 +35,16 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.12.0 — _"Never Taken"_ (September 2026).**
+**Current version: v0.16.0 — _"Small Print"_ (October 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
 
 ## What Is This?
 
-This is a complete toolkit for **statically recompiling original Xbox (2001-2005) games** from their retail XBE executables into native Windows programs.
+This is a complete toolkit for **statically recompiling original Xbox (2001-2005) games** from their retail XBE executables into native programs: Windows first, with Linux and macOS (x86-64 and arm64) hosts too.
 
-Static recompilation takes the raw x86 machine code from an Xbox binary and translates every function — every `mov`, every `jmp`, every `call` — into equivalent C source code. That C code compiles with MSVC into a native x86-64 `.exe` that runs on modern Windows. The game's original logic executes directly on your CPU, not through an interpreter or JIT compiler.
+Static recompilation takes the raw x86 machine code from an Xbox binary and translates every function — every `mov`, every `jmp`, every `call` — into equivalent C source code. That C code compiles with MSVC into a native x86-64 `.exe` that runs on modern Windows; the runtime libraries also build on Linux and macOS, x86-64 or arm64, with SDL2 and OpenGL standing in for Win32 and D3D11. The game's original logic executes directly on your CPU, not through an interpreter or JIT compiler.
 
 **This is the first *public* static recompilation toolkit for the original Xbox.**
 Microsoft got here first: their internal Ficl/Fission recompiler shipped Xbox
@@ -110,13 +110,14 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 
 | Library | Source | What It Does |
 |---------|--------|-------------|
-| **xbox_kernel** | Custom | Xbox kernel → Win32 (170 of the kernel's 371 ordinals routed, 169 with dedicated bridge functions: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
-| **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
+| **xbox_kernel** | Custom | Xbox kernel → Win32 (all 371 ordinals routed: 347 `bridge_*` functions + 24 data exports — memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus), plus the NV2A pushbuffer executor for titles that statically link the XDK's D3D |
+| **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions. On Linux/macOS a separate OpenGL 3.3 back end (SDL2 + libepoxy, `d3d8_gl.c`) |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
-| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
+| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF). Output through XAudio2 (waveOut fallback) on Windows, SDL2 elsewhere. The GP DSP doorbell ack is derived by default (`RECOMP_APU_DSP_ACK=auto`; an explicit address, or `0`/`off`, still overrides) |
 | **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
-| **xbox_input** | Custom | Xbox gamepad → XInput |
-| **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture, plus a window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays |
+| **xbox_input** | Custom | Xbox gamepad → XInput, plus the keyboard as the port-0 pad (`RECOMP_KEYBOARD=1`) with one key map on every host |
+| **xbox_usb** | Custom | MCPX OHCI host controllers, so a title's statically linked XAPI finds a pad |
+| **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture, plus a window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays. Linux/macOS get the framebuffer window (SDL2) but no decoder |
 
 ### Building the Libraries
 
@@ -126,7 +127,7 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
-This produces 6 static libraries in `build/src/*/Release/`. Link your game project against `xboxrecomp` (umbrella target) or individual libraries.
+This produces the static libraries in the table above, plus the `platform` layer they share, in `build/src/*/Release/` (`build/src/*/` with a single-config generator). Link your game project against `xboxrecomp` (umbrella target) or individual libraries.
 
 **This repo builds libraries only — there is no game `.exe` here, and building it will never produce one.** The executable is built by *your* game project, which lives in its own directory and links these libraries. Start it by copying [`templates/new-game/`](templates/new-game/): it has the `CMakeLists.txt` that produces the `.exe` and the `main.c` that boots the guest. See [Getting Started, Step 6](docs/GETTING_STARTED.md#step-6-create-your-game-project).
 
@@ -168,7 +169,7 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 │  │D3D11  │ │mixer  │ │(xemu)  │ │(xemu)│ │XInput│
 │  └───────┘ └───────┘ └────────┘ └──────┘ └─────┘│
 ├──────────────────────────────────────────────────┤
-│  Windows 11: D3D11, XInput, waveOut, Win32 API   │
+│  Windows: D3D11/XInput/XAudio2; POSIX: SDL2/GL   │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -176,10 +177,11 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 
 ### Prerequisites
 
-- **Windows 11/10** (D3D11 backend) — or **Linux** (OpenGL backend; `tools/linux/install_deps.sh`)
-- **macOS**: homebrew, docker `tools/macos/setup.sh`
+- **Windows 11/10** (D3D11 backend) — or **Linux** / **macOS**, x86-64 or arm64 (OpenGL + SDL2 backend)
+- **Linux**: `tools/linux/install_deps.sh` installs the build dependencies
+- **macOS**: `tools/macos/setup.sh` (Homebrew SDL2 + libepoxy; `--test` adds the Docker images the conformance suite needs)
 - **Python 3.10+** with `capstone` (`pip install capstone`)
-- **Visual Studio 2022** (MSVC compiler)
+- **Visual Studio 2022** (MSVC compiler) on Windows; Clang or GCC elsewhere
 - **CMake 3.20+**
 - An original Xbox game disc image (you must own the game)
 
@@ -259,6 +261,15 @@ cmake --build build --config Release
 build\Release\your_game_recomp.exe          # named after project() in your CMakeLists
 ```
 
+### An optional front end
+
+[xboxrecomp-cli](https://github.com/apexJCL/xboxrecomp-cli) (`xbr`, by
+[@apexJCL](https://github.com/apexJCL)) wraps this pipeline for game repos.
+A game repo describes itself in one `game.toml`, and the CLI provides pinned
+toolchains, cross-builds, packaging and a player build wizard. It is
+maintained outside this repo and tracks its tags. `regen.sh` and the steps
+above stay the documented route (#223).
+
 ### What To Expect
 
 The first time you run a recompiled game, **it will crash**. That's normal. The process is iterative:
@@ -288,16 +299,22 @@ xboxrecomp/
 │   ├── symbols/ ghidra_naming/  # Optional symbol-name recovery (Ghidra)
 │   ├── ida_naming/              # ... or the same thing through IDA
 │   ├── xiso/ xmv/               # Disc image and video container tools
+│   ├── conformance/             # Differential tests: lifted C vs the real CPU
+│   ├── kernel_audit/            # Kernel import coverage per title
+│   ├── linux/ macos/            # Host setup scripts
 │   └── fusion/                  # MS Ficl/Fission study tooling
 ├── src/                         # Runtime libraries (C, link-time)
+│   ├── platform/                # Win32 vocabulary + its POSIX implementation
 │   ├── kernel/                  # xbox_kernel - Xbox kernel → Win32
 │   ├── d3d/                     # xbox_d3d8   - D3D8 → D3D11 graphics
 │   ├── audio/                   # xbox_dsound - DirectSound compat
 │   ├── apu/                     # xbox_apu    - MCPX APU emulation (xemu)
 │   ├── nv2a/                    # xbox_nv2a   - NV2A GPU emulation (xemu)
 │   ├── input/                   # xbox_input  - Gamepad → XInput
+│   ├── usb/                     # xbox_usb    - MCPX OHCI controllers
 │   └── video/                   # xbox_video  - FMV playback + framebuffer window
 ├── include/xbox/                # Public umbrella header (xboxrecomp.h)
+├── tests/                       # Runtime C tests, one CMake project each
 ├── templates/                   # Starter templates for new projects
 │   ├── new-game/                # ** Copy this to start a game project **
 │   │   ├── CMakeLists.txt       # Builds the game .exe, links xboxrecomp
@@ -317,17 +334,18 @@ xboxrecomp/
 
 ### Start Here
 - **[Getting Started Guide](docs/GETTING_STARTED.md)** — End-to-end walkthrough from XBE to running game
+- **[Documentation Index](docs/INDEX.md)** — Every document in one place, and the same pages again by symptom
 - **[Decompilation Guide](docs/DECOMP.md)** — Using this as a function splitter instead: one byte-exact `.s` per function, with signatures and the call graph. You never run the recompiler
 - **[Tools Reference](tools/README.md)** — Detailed usage for every pipeline tool
 - **[Runtime Libraries](src/README.md)** — Architecture, build instructions, integration guide
 
 ### Per-Module API Reference
-- [xbox_kernel](src/kernel/README.md) — Memory layout, file I/O, threading, sync, crypto, EEPROM, SMBus (11,128 LOC)
-- [xbox_d3d8](src/d3d/README.md) — D3D8 interface, register combiners, vertex shaders, texture unswizzle (8,838 LOC)
-- [xbox_dsound](src/audio/README.md) — DirectSound buffers, 3D audio, mixbins (573 LOC)
-- [xbox_apu](src/apu/README.md) — MCPX APU voice processor, mixer, MMIO (4,168 LOC)
-- [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH→D3D11 (4,892 LOC)
-- [xbox_input](src/input/README.md) — Gamepad state, vibration, button mapping (360 LOC)
+- [xbox_kernel](src/kernel/README.md) — Memory layout, file I/O, threading, sync, crypto, EEPROM, SMBus
+- [xbox_d3d8](src/d3d/README.md) — D3D8 interface, register combiners, vertex shaders, texture unswizzle
+- [xbox_dsound](src/audio/README.md) — DirectSound buffers, 3D audio, mixbins
+- [xbox_apu](src/apu/README.md) — MCPX APU voice processor, mixer, MMIO
+- [xbox_nv2a](src/nv2a/README.md) — NV2A GPU registers, push buffer, PGRAPH→D3D11
+- [xbox_input](src/input/README.md) — Gamepad state, vibration, button mapping
 
 ### Pipeline Guides
 - [Extracting and Parsing XBE Files](docs/pipeline/01-xbe-parsing.md)
@@ -348,6 +366,7 @@ xboxrecomp/
 - [SEH and Exception Handling](docs/technical/seh-handling.md) — Structured exception handling in recompiled code
 - [Lessons Learned](docs/technical/lessons-learned.md) — What worked, what didn't, mistakes to avoid
 - [Gap Analysis vs xemu](docs/technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
+- [Pushbuffer Executor](docs/technical/pushbuffer-executor.md) — Executing a statically linked XDK D3D title's pushbuffer: DMA-engine walk, answering the title, fixed-function transform and lighting, anti-aliased surfaces, render back ends
 - [Microsoft's Own Recompiler](docs/technical/ms-fusion-recompiler.md) — White-room analysis of Ficl/Fission: pipeline, address map, HLE boundary
 - [Ficl/Fission Codegen Teardown](docs/technical/ms-fusion-codegen-teardown.md) — IDA/Hex-Rays teardown of both their translators, and how it reframes our roadmap
 - [SVOD Extraction](docs/technical/svod-extraction.md) — reading the BC package container to get the donor title's guest XBE out, and the validation gate that catches a plausible-looking bad extraction
@@ -436,7 +455,7 @@ definitions — they are the real proof for the shift, flag and x87 work, and
 each is paired with a negative control that feeds the harness the pre-fix
 expression and requires it to fail. They need a C compiler on `PATH`, and
 **skip rather than fail without one**, so check the skip count: a clean run is
-579 passed / 0 skipped. If clang is installed but not on `PATH`:
+936 passed / 0 skipped. If clang is installed but not on `PATH`:
 
 ```bash
 export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
@@ -448,7 +467,7 @@ lifted C *and the original instructions* over the same inputs and requires them
 to agree. The CPU executing those instructions is the oracle — no model to be
 wrong. See [Conformance Testing](docs/technical/conformance-testing.md).
 
-### Running the tests (MacOS)
+### Running the tests (Linux and macOS)
 
 That oracle has to be 32-bit x86. On Windows a 32-bit MSVC supplies one.
 Everywhere else Docker containers stand in for the toolchain while the lifting stays on
@@ -481,11 +500,16 @@ XBE need the real MSVC where snippets do not, and why it takes two images.
 
 If you fix a lift, add the case.
 
+The runtime's own C tests live in `tests/`, one CMake project each. On a Linux
+host, [tests/proton_run.sh](tests/proton_run.sh) runs the mingw-built Windows
+ones under Proton as ctest's emulator; its header has the commands.
+
 The runtime libraries (C) use:
-- MSVC (Visual Studio 2022) or MinGW-w64
-- Windows SDK (D3D11, DXGI, XInput, waveOut)
+- MSVC (Visual Studio 2022) or MinGW-w64 on Windows; Clang or GCC on Linux/macOS
+- Windows SDK (D3D11, DXGI, XInput, XAudio2, waveOut, Media Foundation)
+- Linux/macOS: SDL2, libepoxy, pkg-config
 - CMake 3.20+
-- No external dependencies — all hardware emulation code is self-contained
+- No other external dependencies — all hardware emulation code is self-contained
 
 ## FAQ
 
@@ -549,6 +573,674 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.16.0 — *"Small Print"* (October 2026)
+
+*Four PRs, every one about a few bytes the tools read past or read too wide.
+A `push cx` moved the stack by four bytes where the CPU moves it by two. An
+MSVC byte index table, `00 02 02 00`, was read as one more dword arm of the
+switch in front of it. Functions behind `nop` padding went unnoticed because
+only `int3` counted as padding. And a save file opened by its bare name,
+`Data.ssx`, lost the directory handle that said where it lived. Each was
+small, and each stopped a game: Jet Set Radio Future's attract demo, SSX 3's
+saves on Linux, and Panzer Dragoon Orta's first boot.*
+
+**Contributed: disassembler**
+
+- **Vtable methods that never reach a `ret` inside their own gap are found.**
+  The closed-body proof refused 103 of JSRF's methods. They were guarded vcall
+  tails (`test eax, eax ; je done ; … ; jmp [eax+N]`), dispatchers whose
+  switch arms are other methods, and error paths that leave by a direct `jmp`
+  to a helper nobody had found yet. A body may now close through an indirect
+  tail via memory, through a proven entry, or through a direct branch whose
+  destination is proven the same way in its own gap, eight levels deep. A
+  byte index table is never taken as an entry: v0.15.0 had accepted eight
+  such data words as functions. A measured jump table also stops in front of
+  the byte table packed after it. On JSRF, 111 of the 113 methods are now
+  entries, up from 10, and the attract demo's three are all found —
+  *[@nworkers](https://github.com/nworkers)* (#236)
+
+**Contributed: kernel**
+
+- **The POSIX file backend opens names relative to a `RootDirectory`
+  handle**, as the Win32 backend already did. XAPI's save code opens the save
+  directory, then each file in it by its bare name. On Linux, overwriting an
+  SSX 3 save failed with "Unable to save" (`STATUS_OBJECT_PATH_NOT_FOUND`).
+  `NtCreateFile`, `NtOpenFile`, `NtDeleteFile` and
+  `NtQueryFullAttributesFile` all take the join. A new cross-platform test,
+  `tests/kernel_file_relative`, covers it —
+  *[@bertibertig](https://github.com/bertibertig)* (#237)
+
+**Maintainer: found by Panzer Dragoon Orta**
+
+- **16-bit `push` and `pop` move esp by 2.** `pop cx` emitted `POP32(esp,
+  cx)`, which did not compile. `push cx` compiled but pushed four bytes,
+  leaving the stack two bytes off. A pop to memory now writes after the
+  increment, as x86 does —
+  *[@sp00nznet](https://github.com/sp00nznet)* (#238)
+- **Functions past `nop` padding are gap functions.** `_pass_cc_boundaries`
+  only knew `int3` padding, so Orta's COM forwarders, reached only through
+  vtables, went unfound, and the first one called at boot was an unresolved
+  indirect call. The gap pass now sweeps the addresses past padding first,
+  then the ones straight after a `ret`. Doing both in one sweep split a
+  forwarder's own error return off as a function. On Orta: 17,764 → 17,933
+  functions, unresolved call stubs 71 → 41, and it boots to the SEGA and
+  Smilebit logos —
+  *[@sp00nznet](https://github.com/sp00nznet)* (#239)
+
+**Testing**
+
+- [@dplewis](https://github.com/dplewis) ran a fresh macOS install of
+  v0.15.0: Burnout 3 boots through the EA, Criterion and RenderWare logos to
+  its title screen, with the keyboard working (#19).
+- `tests/kernel_file_relative` and `tests/kernel_file_status` build and pass
+  under MSVC x64 and on Linux (WSL, GCC 14).
+- **Half-Life 2, regenerated and rebuilt on this release.** It finds 51,114
+  functions (51,104 before), lifts every one, reaches its title screen, and
+  runs 90 s with no faults and no unresolved indirect calls. MSVC pads with
+  `int3`, so #239 finds little there, as expected.
+- A clean run is now **936 passed / 0 skipped**, up from 916, plus 6,368
+  conformance vectors with no mismatches on an AMD host.
+
+**Known issue**
+
+- Burnout 3 (sp00nznet/burnout3) built against `main` stops before its first
+  draw. The break is somewhere in `afeb69f..fb09636`, before v0.15.0, and is
+  being bisected; `burnout3` pins `afeb69f` until then (#240).
+
+### v0.15.0 — *"Second Reading"* (October 2026)
+
+*Twenty-four PRs from six people, plus one bug report. Much of what is fixed
+here was caught because contributors read and ran each other's work before it
+merged. [@apexJCL](https://github.com/apexJCL) tested
+[@koenhendriks](https://github.com/koenhendriks)'s SSX 3 PRs on Burnout 3 and
+BLiNX 2 and found three things. A DVD region had landed in MiscFlags. With
+vsync off the present spun a core at 8,500 loops a second. A clipped vertex
+could come out with w ≤ 0. [@vyanhursky](https://github.com/vyanhursky)'s
+Def Jam test notes found an interrupt snapshot that dropped* `g_eflags`*. A
+Darkwatch bring-up sent a measured report, a patch and a watchdog dump. Even
+the test oracle needed checking: the new x87 trig model matches the Xbox's
+Pentium III, and an AMD test machine disagreed with it, correctly. Everything
+below was looked at twice.*
+
+**Contributed: lifter, recompiler and disassembler**
+
+- **Lifter accuracy and discovery past switch tables.** The changes:
+  - `movsx r32, bp/sp` used to zero-extend; it now sign-extends.
+  - `pushfd`/`popfd` go through a `g_eflags` image, with OF and PF rebuilt
+    from `cmp`, `sub`, `add` and the logic ops. `cmp al, bl; pushfd` with
+    -128 - 1 had pushed OF clear.
+  - `cpuid` answers as the P3.
+  - x87 trig reduces with the 66-bit pi the hardware uses.
+  - `pop esp` leaves esp at the popped value.
+  - MSVC offset frames own their frame.
+  - `RECOMP_STUB_LOG=1` names each unresolved stub the first time it runs.
+  - Code sections are decoded to their virtual end.
+  - Functions after an embedded switch table are found.
+
+  *[@apexJCL](https://github.com/apexJCL)* (#186)
+- **An unresolved target inside a function enters that function.**
+  `--entry-stubs` re-emits the containing function from the target instead of
+  returning at once. It's opt-in, because each target gets a full copy.
+  Shared epilogues get a stub that pops their registers —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#207)
+- **XDK register constants no longer cut `.text` functions.** With
+  `--skip-library-immediates`, an immediate in a library section (D3D's NV2A
+  constants, which can equal `.text` addresses) never starts a function.
+  Found on NFSU1, where it split a switch —
+  *[@kaskabayev](https://github.com/kaskabayev)* (#234)
+
+**Contributed: kernel, interrupts and timing**
+
+- **Interrupts, DPCs and pacing**, every part behind a switch that is off by
+  default:
+  - `RECOMP_DISPATCH_GATE=1`: a one-CPU DISPATCH gate, with DPCs at the raise
+    and interrupts at safe points.
+  - `RECOMP_VBLANK=paced`: a 60 Hz vblank schedule with an ack thread.
+  - `RECOMP_FLIP_PACING=1`: flips held to the guest's vblank.
+  - `RECOMP_GUEST_CPUS=<n>`: guest threads pinned to fewer cores.
+  - The lifter's `--back-edge-yield`: loop checks for the guest CPU
+    scheduler.
+
+  `RECOMP_GUEST_LOCK=1` used to be a plain critical section and is now the
+  quantum/hand-off scheduler. With nothing set, the runtime and the generated
+  code behave as in v0.14.0 —
+  *[@apexJCL](https://github.com/apexJCL)* (#192)
+- **The host time zone reaches the title.** `XC_MAX_OS` and the single
+  time-zone queries return the host's bias, names and daylight dates instead
+  of zeroes, so saves stop being stamped UTC —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#216)
+- **`Partition1\CACHE` goes to `<save_dir>/TitleCache`.** It used to go into
+  the game directory: every run wrote into the extracted game files, and all
+  save directories shared one cache —
+  *[@apexJCL](https://github.com/apexJCL)* (#206)
+
+**Contributed: graphics, video and audio**
+
+- **Pushbuffer executor:**
+  - Attributes with no array read their current value. SSX 3's front end had
+    collapsed onto the viewport offset.
+  - `SET_FOG_PLANE` and `SET_EYE_POSITION` reach c[57] and c[56].
+  - The oD0/oD1 colour outputs are clamped.
+  - Mirror and border addressing are implemented.
+
+  *[@koenhendriks](https://github.com/koenhendriks)* (#210)
+- **Clipping happens in clip space, and at the near plane.** It used to
+  happen after the viewport scale, which is a constant the title owns —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#211)
+- **Render to texture and `CLEAR_RECT`.** Swizzled colour surfaces are
+  written in Morton order, so SSX 3's shadow maps sample correctly. A clear
+  covers the clear rect alone, as xemu does —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#212)
+- **A scalable Windows window, fullscreen, and an opt-in D3D11 presenter**
+  (`RECOMP_D3D_PRESENT=1`, `RECOMP_PRESENT_VSYNC`). Closing the window exits
+  through the exit hook —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#215)
+- **PVIDEO overlay scanout.** Bink's Xbox player draws through the NV2A
+  overlay, so movies never appeared. The YUY2 overlay is now drawn over the
+  framebuffer at its scale and colour key, and STOP clears the pending banks
+  the title waits on —
+  *[@MattSG](https://github.com/MattSG)* (#220)
+- **Voice processor fixes:**
+  - ADPCM reads used to overrun the decode buffers; they now stay inside
+    them.
+  - VOICE_LOCK locks one voice, instead of waiting for a whole frame of
+    mixing.
+  - Volume changes ramp across a frame.
+  - HRTF is on, as in xemu; `RECOMP_APU_HRTF=0` turns it off.
+
+  *[@MattSG](https://github.com/MattSG)* (#217)
+
+**Contributed: input and platform**
+
+- **Portable controller mapping rules:**
+  - named bindings and a text format for them;
+  - remapping;
+  - radial deadzones and trigger thresholds;
+  - merge rules.
+
+  They're built on #191's key table, and `RECOMP_KEYBOARD` is the first
+  adopter, byte for byte the same as v0.14.0 —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#203)
+- **Four root-hub ports, and the first pad on controller port 1.** The pad
+  used to arrive as player 3, so a title that reads only slot 0 saw no
+  controller. `RECOMP_USB_PORT=0` / `RECOMP_USB_NDP=2` bring back the old
+  layout —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#214)
+- **Rumble.** The XID output report is forwarded to the host pad;
+  `RECOMP_RUMBLE=0` turns it off —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#213)
+- **mingw-built exes start on stock Windows.** They link `xinput1_4` instead
+  of the redistributable's `xinput1_3` —
+  *[@apexJCL](https://github.com/apexJCL)* (#221)
+- **NOTICE lists the xemu-derived NV2A core, NV2A state and APU API
+  headers** — *[@kaskabayev](https://github.com/kaskabayev)* (#233)
+
+**From the Darkwatch report**
+(*[@ranzo312-cyber](https://github.com/ranzo312-cyber)*, #127)
+
+- **In-thread guest callbacks give the caller its registers back.** APCs,
+  inline DPCs, `NtUserIoApcDispatcher` and `KeSynchronizeExecution` run guest
+  code inside the kernel call. The loader resumed with an APC's RDTSC value
+  in esi and faulted.
+- **`RECOMP_CONTIG_AVOID_IMAGE=1` keeps contiguous blocks out of the image's
+  pages.** In this runtime one physical number can name both the window and
+  the image, and the pad never enumerated because XPP's descriptors resolved
+  to the wrong one. It's opt-in, because it moves every block (#235).
+- **`lahf` after `add` emitted `_cf` undeclared.** #186 had the same fix;
+  the report's tests are kept.
+
+**Found by rebuilding real titles (maintainer)**
+
+- **Three v0.14.0 regressions, found by rebuilding Half-Life 2**, which no
+  test had caught:
+  - `lock xadd` didn't compile.
+  - Code after int3 padding had to probe as code, so `mov eax, N; call
+    __chkstk` frames vanished and the game segfaulted at boot.
+  - This-adjusting vcall thunks vanished.
+
+  HL2 now reaches its title screen (#224).
+- **Fallout: Brotherhood of Steel:**
+  - File I/O APCs left esp 12 bytes high, and can now be deferred to the next
+    alertable wait (#226).
+  - Code-section gaps are scanned for function-pointer tables, skipping
+    switch tables; D3D's render-state handlers had no body (#227).
+  - A batch's triangles rasterise together on the worker pool. The first
+    level went from 5.5 fps, with the workers idle (#228).
+  - The per-kick `DMA_PUT` line only prints under `RECOMP_NV2A_TRACE` (#230).
+  - `conformance --xbe` builds on titles with untranslated instructions
+    (#229).
+
+**Follow-ups made while merging**
+
+- **Conformance and fpdiff on AMD hosts.** Both use the host CPU as the
+  oracle, and only Intel's x87 reduces like the P3. On AMD the trig rows
+  with pi/4 < |x| < 2^63 are dropped; `tests/x87_trig` checks them against
+  the model everywhere.
+- **`g_eflags` in the IRQ snapshot**, the point #186 and #192 met at.
+  `guest_cpu` and `vblank_ack` raise the timer resolution, because at
+  Windows' default 15.6 ms tick they failed natively.
+- **`XC_MAX_OS`'s layout.** It's 0x60 bytes, DVD region at 0x5C, and a short
+  buffer gets `STATUS_BUFFER_TOO_SMALL`.
+- **Present pacing.** It's paced only when vsync is on.
+- **A clipped vertex sits exactly on its plane.**
+- **`CLEAR_RECT`** needs both halves, and swizzled writes stay inside
+  `1<<log`.
+- **ADPCM buffers** hold every block count the 5-bit field can name, so a
+  stream voice is never refused and left hanging.
+- **The input layer:** both Shifts are released on `VK_SHIFT`.
+- **`xbox_video` links `xbox_nv2a`.** #220's overlay scanout calls into
+  `nv2a_mmio_hook.c`, and a game that links the libraries one by one (HL2)
+  failed to link. The Half-Life 2 rebuild caught it.
+
+**Held** for the next round, with reviews posted:
+- #222, Black bring-up 2. Its shadow and critical-section caches tear.
+- #231, the pipelined rasteriser. It needs a rebase over the NV2A PRs above.
+- #197, the flags carried across calls. It is still waiting on its
+  size-cost rework.
+- #209, timing. It is ready to rebase now that #192 is in.
+
+**Testing**
+
+- Every `tests/*` project builds and passes under MSVC except the POSIX-only
+  ones and `d3d8_smoke`, as before, and #221's `input_xinput_imports`, which
+  needs mingw.
+- On Linux (WSL, GCC 14) the runtime builds, and every `tests/*` project that
+  targets POSIX builds and passes. The five Win32-only tests still don't build
+  there, as before, and the new `kernel_io_apc` is Windows-only and says so at
+  configure.
+- **Half-Life 2, regenerated and rebuilt on this release.** It found 51,104
+  functions (48,884 before), reaches its title screen as v0.14.0 with #224
+  did, and runs 90 s with no faults and no unresolved indirect calls.
+- A clean run is now **916 passed / 0 skipped**, up from 812, plus 6,368
+  conformance vectors with no mismatches on an AMD host, up from 6,351.
+
+### v0.14.0 — *"Other Machines"* (October 2026)
+
+*Twenty-two contributed PRs from six people, and almost none of it was found on the
+machines or games this toolkit was built on. The runtime now runs on macOS
+and Linux, arm64 included, because a contributor ran BLiNX 2 and Burnout 3 on a
+Mac and a Steam Deck. On Jet Set Radio Future,* `lock xadd` *had no flags, so
+every COM* `Release` *freed its object twice. Dead or Alive 3 hands its engine
+callbacks the disassembler never saw. A Def Jam port on Apple Silicon checked
+the Darwin mapping fix against its own regression suite before approving it.
+On Black, DirectSound waited forever for an interrupt the APU never raised.
+Most of these bugs live in shared code and would have reached any title. They
+were found on other people's machines.*
+
+**Contributed: lifter and recompiler**
+
+- **`lock xadd` had no flags**, so `InterlockedDecrement; jne` never branched,
+  every COM `Release` destroyed its object, and the double free corrupted the
+  heap's free list. `FCMOVcc` was a comment, so MSVC's float min/max never
+  moved. MXCSR is now modelled: `stmxcsr` stored nothing, and
+  `cvtss2si`/`cvtsd2si` now round by its RC field instead of the host's —
+  *[@nworkers](https://github.com/nworkers)* (#198)
+- **x87 and SSE forms that lifted to the wrong value**: `sahf`, the `fcomi`
+  family, tbyte loads and stores, `ficom`, the trig 2^63 limit, partial `fprem`,
+  `fscale`/`f2xm1`/`fyl2xp1`, `cvtss2si` rounding, `rcpss`/`rsqrtss` estimates
+  and SSE2 scalar double lanes. All of them were found with `tools/recomp/fpdiff.py`,
+  which runs a snippet lifted and on the CPU and compares the two —
+  *[@NoRain211](https://github.com/NoRain211)* (#183)
+- **COMISD/UCOMISD read the float lane**, so 1.0 and 2.0 as doubles could
+  compare equal —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#178)
+- **Parity `setcc`/`cmovcc` readers**, including the `pe`/`po` spellings, read
+  their bit after a known flag producer —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#180)
+- **FPREM/FPREM1 report completion**: C2 is clear after a full reduction, so
+  a CRT `fmod` loop that polls it terminates. Also covered by #183's
+  `recomp_fprem`; its two conformance cases are kept —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#177)
+- **`in`/`out` lift to runtime port I/O.** They were `RECOMP_UNIMPL`, so `in al, dx`
+  left AL unchanged. The video encoder's field pin at 0x80C0, which D3D's vblank
+  ISR polls, is modelled; every other port reads 0 and logs once. Takes effect
+  on regeneration —
+  *[@apexJCL](https://github.com/apexJCL)* (#194)
+- **`neg` negates in unsigned arithmetic.** `(uint32_t)(-(int32_t)v)` is
+  undefined for 0x80000000, and clang -O2 miscompiled it. Found when #179 ran
+  the fixtures at -O2.
+
+**Contributed: function discovery**
+
+- **Game callbacks static discovery missed.** DOA3's callbacks sit outside every
+  bounded table, or in gaps of unlisted code. They are now recovered from
+  reachable immediates and tail branches, and a weak immediate must start on a
+  code boundary. That rule rejects every false start review found on
+  Wreckless —
+  *[@NoRain211](https://github.com/NoRain211)* (#176)
+- **Callbacks and tails the disassembler missed.** A closed-CFG proof replaces
+  the instruction budget, late table aliases join the tail closure, and
+  out-of-phase sweep bytes realign on seeds. Each fix cleared a stop the runtime
+  hit on DOA3. On Wreckless it also drops 129 junk starts —
+  *[@NoRain211](https://github.com/NoRain211)* (#182)
+- **Branches out of alias bodies into gaps**: a vtable-only dispatcher branched
+  past its own `ret` into bytes nothing claimed, and each call came back 12
+  bytes short on the stack —
+  *[@nworkers](https://github.com/nworkers)* (#199)
+
+**Contributed: macOS, Linux and arm64 hosts**
+
+- **Devices on POSIX hosts.** Trapped MMIO on arm64 is decoded from the faulting
+  instruction, and one fault dispatcher serves the APU, AC'97 and OHCI. There is
+  an SDL2 framebuffer window and audio device (`RECOMP_FB_WINDOW`), and one
+  keyboard table and Xbox map for every host. **On Windows the keyboard map
+  changes**: X/Y move to C/V and the left stick is on WASD —
+  *[@apexJCL](https://github.com/apexJCL)* (#191)
+- **Memory layout and POSIX fixes.** The toolkit region, stack and heap sit above
+  the highest section, so a large image's `.data` is no longer overlapped, and
+  every section loads. The contiguous arena became a page allocator that honours
+  `MmAllocateContiguousMemoryEx`'s range: D3D's request for the low 16 MB
+  failed once the bump pointer passed it. `RECOMP_WIN_PLACEHOLDER` (opt-in)
+  reserves the 4 GB guest window as one placeholder, which keeps the aperture
+  mappable under Proton —
+  *[@apexJCL](https://github.com/apexJCL)* (#189)
+- **A failed fixed view on Darwin leaked its placeholder**, and every later view
+  at that address was refused —
+  *[@apexJCL](https://github.com/apexJCL)* (#185), tested on a Def Jam port by
+  *[@vyanhursky](https://github.com/vyanhursky)*
+- **`tests/proton_run.sh`** runs mingw-built Windows tests under Proton as
+  ctest's emulator —
+  *[@apexJCL](https://github.com/apexJCL)* (#187)
+
+**Contributed: kernel and APU**
+
+- **Kernel objects and files.** Worker threads get a guest thread object, with
+  TLS sized from `TlsDataSize`. The other changes:
+  - FATX overwrite and rename;
+  - partition images on POSIX, without which XAPI's utility-drive mount fails;
+  - `NtFreeVirtualMemory` answers in guest terms;
+  - a missing game file is reported once by name (`RECOMP_MISSING_FILES`);
+  - POSIX `NtClose` drops a handle's directory search, which
+    *[@vyanhursky](https://github.com/vyanhursky)* also found (#201).
+
+  *[@apexJCL](https://github.com/apexJCL)* (#190)
+- **Guest-built events in multiple-object waits.** A KEVENT the title built by
+  writing its header now resolves in `KeWaitForMultipleObjects`, as it already
+  did for a single wait —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#181)
+- **The APU.** Physical addresses above 64 MB were folded into the low 64 MB.
+  Voices are resampled by pitch: 44.1 kHz material had played 8.8% fast. The
+  trapped front end takes one trap at a time, output is paced by the device,
+  and FETINTSTS is latched once per trap. **The DSP doorbell ack is now found
+  from GPSADDR by default** (`RECOMP_APU_DSP_ACK=auto`); an explicit address,
+  or `0`/`off`, still overrides —
+  *[@apexJCL](https://github.com/apexJCL)* (#193)
+- **Diagnostics for audio reports**, all off by default:
+  - `RECOMP_AUDIO_WAV` writes exactly what the device is given, and the file
+    stays valid however the run ends;
+  - `RECOMP_AUDIO_HOST` lines up host starvation with that file;
+  - `RECOMP_APU_TRACE` adds per-voice statistics, `RECOMP_APU_SOLO` mixes one
+    voice, and `RECOMP_APU_RING` finds a streamed ring replaying a stale lap.
+
+  *[@apexJCL](https://github.com/apexJCL)* (#195)
+- **The sequencer's sample-limit interrupt.** DirectSound programs SSL and
+  waits for ISTS bit 3. Without it, Black re-ran its audio setup forever.
+  XGSCNT is now a 48 kHz sample counter, not the host clock divided by 100 —
+  *[@LeandroSSB](https://github.com/LeandroSSB)* (#205)
+
+**Contributed: graphics**
+
+- **The pushbuffer executor.** It adds fixed-function transform and lighting,
+  anti-aliased surfaces, render back ends, bounds on every vertex fetch and
+  surface write, and statics allocated on first use. The DMA-style walk is
+  opt-in (`RECOMP_PB_WALK=dma`): with it, D3D's fence wait sleeps on a
+  software-method interrupt the runtime doesn't raise yet —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#162)
+- **`oPos.w == 0` vertices were dropped as behind the eye.** A program that writes
+  screen-space x/y/z itself leaves w at 0, so menus and loading screens drew
+  nothing on the executor path. They now draw with w = 1 —
+  *[@apexJCL](https://github.com/apexJCL)* (#188). Found independently on
+  Black by *[@soldieg](https://github.com/soldieg)* (#127) and
+  *[@LeandroSSB](https://github.com/LeandroSSB)* (#205), whose frontend went
+  from 0 pixels to its boot scene at 42 fps.
+- **Vertex-constant tracing under `RECOMP_VSH_DUMP`** shows every constant
+  load, the values it completes and the writes dropped past the end of the
+  file —
+  *[@LeandroSSB](https://github.com/LeandroSSB)* (#205)
+
+**Contributed: input**
+
+- **A mouse and keyboard pad** (`RECOMP_MKB`, Windows, off by default):
+  raw-input mouse movement becomes stick deflection, WASD and buttons merge on
+  top of a real pad or stand in for a missing one, and F9 toggles capture —
+  *[@LeandroSSB](https://github.com/LeandroSSB)* (#205)
+
+**Contributed: tests**
+
+- **The C fixtures run under MSVC**: 25 tests that skipped on a
+  Visual Studio-only machine now execute, and a missing compiler is a real
+  skip instead of a silent pass —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#179)
+- **A standalone POSIX directory-search fixture**: 300 abandoned searches,
+  live searches running side by side, restart, and mixed closes. #190 carries
+  the same fix —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#201)
+
+**Maintenance**
+
+- **Linux builds again**: the platform library links libm, `xbox_memory_layout.c`
+  defines `_GNU_SOURCE` for `dladdr`, the SDL window answers #162's AA hook, and
+  GNU ld links the umbrella's archives as a group (the APU and kernel call each
+  other).
+
+**Things that move.** #189 moves contiguous allocations, so an address you
+hard-coded from an earlier run, such as an explicit `RECOMP_APU_DSP_ACK`, may
+be stale; the new `auto` default exists for exactly that. #189 also makes
+`XBOX_STACK_BASE` and its neighbours runtime variables, so glue that used them
+in a `case` label or a static initialiser won't compile. Neither generated code
+nor the template does. #205 changes what an XGSCNT read returns, from host
+time to the sequencer's sample count, for every title that reads it.
+
+**Held, with the reasons on each PR:**
+- **#186** (lifter and disasm, apexJCL): overlaps #182, #183 and #198 (and the
+  held #197) in 21 places, where the two sides model the same instructions differently. It
+  needs a rebase that keeps what only it has.
+- **#192** (interrupts and pacing): its default-on DISPATCH gate and flip hold
+  have an untraced Burnout 3 boot hang on the latest heads.
+- **#197** (integer flags across calls): publishes EFLAGS before every call and
+  `ret`, which makes Wreckless's generated source 32% larger to serve 5
+  readers.
+- **#200** (late tail jumps): its new passes walk measured ranges, so they take
+  data after a tail `jmp` that #182's reachability rule excludes.
+- **#203** (input mapping library): a second key table beside #191's.
+- Drafts #196 and #184 (the index of apexJCL's fork) are not up for merge.
+
+Checked on native Windows (MSVC x64):
+- Wreckless (DSTEAL_JP), built against this runtime before #195 and #205
+  merged, reaches the same point as on v0.13.1: 87 assets, the LOGO1 intro, then the known WMV decoder stall, with
+  no faults.
+- With `RECOMP_APU_DSP_ACK` unset, `auto` finds the doorbell at its new
+  physical address `0x00474810`. The old explicit `0x80478810` now stalls
+  DirectSound init: the "things that move" above, in practice.
+- New on Windows: the paced audio device logs `[XA2] underrun` lines. Nothing
+  in the runtime calls `timeBeginPeriod`, so its 1 ms waits take about 15 ms.
+- Every `tests/*` project builds and passes under MSVC except the POSIX-only
+  ones and `d3d8_smoke`, as before.
+
+Checked on Linux (WSL, GCC 14): the runtime builds, and every `tests/*` project
+that targets POSIX builds and passes. Five Win32-only tests don't build there,
+as before.
+
+A clean run is now **812 passed / 0 skipped**, up from 641, plus 6,351
+conformance vectors with no mismatches, up from 5,843.
+
+### v0.13.1 — *"Cut Short"* (October 2026)
+
+*Three fixes from one contributor, all about where a function ends. A CRT*
+`memcpy` *ended at its own jump table, leaving the arms after it with no owner.
+A run of alias entries in a gap each claimed the whole gap. A wrapped body's
+rename carried every call with it, past the wrapper meant to intercept them.
+Each one compiles, links and runs; the first two lift the wrong bytes, and the
+third runs the right bytes without the code the project wrote to go around them.*
+
+- **Arms that follow their inline jump table** are lifted inside the function:
+  it is extended over its tables when every path stays in range, instead of
+  dispatching to an address with no body —
+  *[@NoRain211](https://github.com/NoRain211)* (#173)
+- **Gap aliases stay inside their gap**: each ends after its own body, within
+  its section's file-backed bytes, rather than at the next start measured before
+  the other aliases existed. On DOA3 that is 1.58M → 1.28M lines of C —
+  *[@NoRain211](https://github.com/NoRain211)* (#174)
+- **Calls reach a wrapped function's wrapper**: direct calls, tail jumps and the
+  dispatch table go to `recomp_manual.c`'s `sub_X`, and the `sub_X_gen` body it
+  calls is always emitted —
+  *[@NoRain211](https://github.com/NoRain211)* (#175)
+
+**Held:** #176 (static callback recovery) accepts plain constants that land
+mid-function in unlisted code as function entries; on Wreckless one of them is
+data lifted as code. #162 (the pushbuffer executor, rebased) has a walk that
+can run past `PUT` and an unbounded 32-bit vertex index. Both are back with
+their authors.
+
+Checked on Wreckless (DSTEAL_JP): regenerated with 0 failures, the only change
+to the function set is four jump-table arms now lifted as labels, and the boot
+reaches the same point as on v0.13.0.
+
+A clean run is now **641 passed / 0 skipped**, up from 630, plus 5,843
+conformance vectors with no mismatches.
+
+### v0.13.0 — *"Given Back"* (October 2026)
+
+*Burnout 3: Takedown is playable end to end, and eleven contributed PRs from
+three new contributors land beside it. The batch keeps finding things the runtime took and never
+returned. A heap that handed a whole freed block to the next small request
+and passed guest pointers to the host's* `VirtualFree`*, so nothing came back.
+A directory search abandoned mid-way that kept its host slot after the handle
+closed. A failed indirect call that rewound over its arguments before the
+caller popped them again.* `pushad`*/*`popad` *emitted as TODOs, so the
+registers a routine saved were never restored. None of them fails where it
+happens; each surfaces later, somewhere else.*
+
+**Contributed: lifter and recompiler**
+
+- **`pushad`/`popad` were TODOs**, so a routine that saved every register
+  with them returned with its caller's registers clobbered —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#167)
+- **A failed indirect call to a caller-cleans function popped its arguments
+  twice**: the failure path rewound over them, then the caller's
+  `add esp, N` did too —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#169)
+- **`rep movs` touching the hardware aperture used host `memcpy`**, whose
+  vector loads skip the element-sized accesses trapped device memory needs —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#170)
+- **Two kinds of join read a flag nothing assigns**: swapped-operand float
+  compares, and a result snapshot meeting a compare snapshot. Each edge now
+  computes the join's condition itself —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#159)
+- **Manual entry hooks**: a `sub_XXXXXXXX_enter()` in the manual file runs at
+  the top of the generated function on every call, direct ones included —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#168)
+
+**Contributed: kernel**
+
+- **Opt-in memory reclaim and high reservations.** `RECOMP_HEAP_RECLAIM` splits
+  freed blocks, makes `NtFreeVirtualMemory` and `MmFreeContiguousMemory`
+  actually free, and zeroes decommitted pages; `RECOMP_EXT_VMA` honours a
+  reservation at a fixed address above the RAM mirrors. The heap table also
+  gains a lock —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#158)
+- **Opt-in guest synchronisation.** `RECOMP_TITLE_KEVENTS` gives a KEVENT a
+  title built by writing its header a host event, instead of every wait on it
+  failing at once; `RECOMP_GUEST_LOCK` runs one guest thread at a time —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#160)
+- **Closing a directory mid-search leaked the host search**, and a reused
+  handle value continued the old cursor —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#171)
+- **Kernel small fixes**: NT pseudo-handles sign-extended on x64 (the CRT had
+  retried `NtDuplicateObject` forever), `STATUS_CONFLICTING_ADDRESSES` → 487 so
+  the CRT heap grows elsewhere, a 64-bit kernel call counter that no longer
+  starts logging every call after 2^31, an OHCI short-packet underrun, MinGW
+  thread-locals, two headless Ghidra scripts and a docs index by symptom —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#157)
+- **Diagnostics**: `g_xbox_path_hook`, an `[EXIT]` line when a title ends
+  itself, and an opt-in `RECOMP_CALL_PROFILE` —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#161)
+
+**Contributed: build**
+
+- **The runtime builds with GCC on Linux** —
+  *[@eolandro](https://github.com/eolandro)* (#172)
+
+**Toolkit fixes found on MechAssault, Wreckless and Half-Life 2**
+
+- **A switch arm's resync left misaligned decodes inside it**: MechAssault's
+  CRT `memcpy` ran an `inc esp` lifted from the middle of a real `mov`, and
+  every 28–31 byte copy returned with ESP a byte off — *[@sp00nznet](https://github.com/sp00nznet)* (#135)
+- **Jump tables named by their last slot** were measured as one entry, so
+  `memmove`'s backward tail lost every arm after the table, epilogue included — *[@sp00nznet](https://github.com/sp00nznet)* (#134)
+- **The save directory was relative**, so `SHCreateDirectoryExW` created
+  nothing and a title probing `partition1` at boot quit to the dashboard — *[@sp00nznet](https://github.com/sp00nznet)* (#133)
+- **String-reference labels no longer name code** (#163); **disasm trusts
+  only seeds a run actually reached** (#164); clang-cl builds the NV2A shim
+  (#165) — *[@sp00nznet](https://github.com/sp00nznet)*
+
+**Burnout 3: Takedown, from its entry point to every game mode playable**
+
+*One and two players. Most of what it needed is general: the XDK's USB and
+DirectSound stacks handing the hardware physical addresses, an x87 that
+honours precision control, and enough of the NV2A to draw a 3D game through
+its own D3D8LTCG. All by [@sp00nznet](https://github.com/sp00nznet).*
+
+**Lifter**
+
+- **x87 results ignored precision control.** Under PC=24 (D3D's default) the
+  significand now rounds to 24 bits (#149)
+- **`lahf` lifted; unordered x87/SSE compares set ZF, PF and CF**, not
+  "greater" (#150)
+- **All eight SSE compare predicates**, 4-lane `sqrtps`/`rsqrtps`/`rcpps`,
+  and bare `cmps`/`scas` (#151)
+- **Switch tables whose displacement is not slot 0**: the CRT memcpy's
+  unaligned-byte dispatch no longer silently skips the copy (#140)
+
+**Kernel, memory and interrupts**
+
+- The RAM mirror span no longer leaks 1.8 GB of reservation on Windows (#138)
+- Physical page 0 is kept for the XDK USB stack (#143)
+- ISRs and DPCs run at their IRQL and restore it; `KPCR.Irql` is published
+  (#148)
+- The DPC queue is locked, and `KDPC.Inserted` is honoured (#155)
+- A game file the dump lacks is named once, `[FILE] missing <guest> ->
+  <host>`, with a summary at exit; repeats of its FAILED line are counted,
+  not printed. `RECOMP_MISSING_FILES=all` also lists probes and every
+  attempt, `=0` turns it off. NtOpenFile and IoCreateFile log their failed
+  opens (and, under `all`, their successes), and POSIX returns
+  PATH_NOT_FOUND for a missing directory, as Win32 does
+
+**Audio**
+
+- GP/EP DSP memory is left untrapped under `RECOMP_AC97_READY` (#139)
+- The DSP doorbell ack runs whatever the front end is doing (#141)
+- The APU resolves physical addresses into the contiguous window and
+  delivers its interrupt (#147)
+
+**USB**
+
+- OHCI resolves physical descriptor and buffer addresses (#142)
+- `RECOMP_PAD_SCRIPT` and `RECOMP_PAD_LIVE` drive a pad headless (#144)
+- Up to four pads (`RECOMP_USB_PADS`), stick steps in pad scripts, and a
+  rumble transfer no longer ends a control request (#154)
+
+**NV2A**
+
+- Vertex programs, register combiners, four texture stages, visibility
+  reports, near-plane clipping, bilinear filtering, and a threaded
+  rasteriser (#152)
+- P8 textures sample through the stage palette (#145)
+- `RECOMP_PB_REPORT_MS` (#146); `RECOMP_FB_DUMP_FLIPS` dumps every flip for
+  recordings (#156)
+- The window title shows the XBE title, FPS and draws (#153)
+
+**Held:** #162, the pushbuffer executor from the X-Men Legends split, is a
+draft and overlaps the executor that landed in #152; #128 is closed as split.
+
+Merge fixups: #134's lifter half reduced to the one shape main's own fix
+missed; #160's `KePulseEvent` block moved out of `KeReleaseSemaphore`, where
+it never ran; #170's fixture renamed off glibc's `index`; #172's declarations
+hoisted out of the macOS block so every POSIX host gets them.
+
+A clean run is now **630 passed / 0 skipped**, up from 579, plus 5,843
+conformance vectors with no mismatches.
 
 ### v0.12.0 — *"Never Taken"* (September 2026)
 

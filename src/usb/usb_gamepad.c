@@ -17,6 +17,7 @@
 #include <stdlib.h>
 
 #include <string.h>
+#include <ctype.h>
 
 /* ---- descriptors ------------------------------------------------------- */
 
@@ -50,10 +51,20 @@ static const uint8_t s_config_desc[32] = {
     7, 0x05, 0x02, 0x03, 0x20, 0x00, 0x04
 };
 
-static uint8_t s_address;
-static uint8_t s_configuration;
+static uint8_t s_address[USB_GAMEPAD_MAX];
+static uint8_t s_configuration[USB_GAMEPAD_MAX];
 
-uint8_t usb_gamepad_address(void) { return s_address; }
+uint8_t usb_gamepad_address(int pad) { return s_address[pad & 3]; }
+int usb_gamepad_configured(int pad) { return s_configuration[pad & 3] != 0; }
+
+/* A bus reset on the pad's port: back to the default address, unconfigured,
+ * as a device is after one. ohci.c calls it when several pads share the bus
+ * and the driver re-enumerates one; declared there, not in usb_gamepad.h. */
+void usb_gamepad_port_reset(int pad)
+{
+    s_address[pad & 3] = 0;
+    s_configuration[pad & 3] = 0;
+}
 
 /* ---- control transfers ------------------------------------------------- */
 
@@ -80,7 +91,7 @@ static int copy_out(uint8_t *out, int max, const uint8_t *src, int len,
     return len;
 }
 
-int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
+int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
 {
     int is_in = (setup->bmRequestType & 0x80) != 0;
     int type  = (setup->bmRequestType >> 5) & 3;   /* 0 standard, 1 class */
@@ -105,16 +116,16 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
             }
 
         case REQ_SET_ADDRESS:
-            s_address = (uint8_t)(setup->wValue & 0x7F);
+            s_address[pad & 3] = (uint8_t)(setup->wValue & 0x7F);
             return 0;                    /* zero-length status stage */
 
         case REQ_SET_CONFIGURATION:
-            s_configuration = (uint8_t)(setup->wValue & 0xFF);
+            s_configuration[pad & 3] = (uint8_t)(setup->wValue & 0xFF);
             return 0;
 
         case REQ_GET_CONFIGURATION:
             if (!is_in || max < 1) return -1;
-            out[0] = s_configuration;
+            out[0] = s_configuration[pad & 3];
             return 1;
 
         case REQ_GET_STATUS:
@@ -151,7 +162,7 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
         && setup->bRequest == 0x01u                    /* GET_REPORT */
         && is_in) {
         uint8_t report[20];
-        int n = usb_gamepad_report(report, (int)sizeof report);
+        int n = usb_gamepad_report(pad, report, (int)sizeof report);
         if (n <= 0)
             return -1;
         return copy_out(out, max, report, n, setup->wLength);
@@ -250,28 +261,35 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
  * the left (low-frequency) and right (high-frequency) motor speeds as 16-bit
  * little-endian values -- passed to the host pad. RECOMP_RUMBLE=0 turns it
  * off. Sent only when it changes: the title repeats it every frame or so,
- * and a host call per report is wasted work. */
-void usb_gamepad_output(const uint8_t *r, int len)
+ * and a host call per report is wasted work.
+ *
+ * Pad n's report drives host pad n (upstream forwarded it per pad from
+ * ohci.c; this keeps the change filter and the diagnostic line). ohci.c
+ * calls it; declared there. */
+void usb_gamepad_output(int pad, const uint8_t *r, int len)
 {
     static int on = -1;
-    static XBOX_VIBRATION last = { 0xFFFF, 0xFFFF };
+    static XBOX_VIBRATION last[USB_GAMEPAD_MAX] = {
+        { 0xFFFF, 0xFFFF }, { 0xFFFF, 0xFFFF }, { 0xFFFF, 0xFFFF }, { 0xFFFF, 0xFFFF }
+    };
     XBOX_VIBRATION v;
 
     if (on < 0) {
         const char *e = getenv("RECOMP_RUMBLE");
         on = !(e && *e == '0');
     }
+    pad &= USB_GAMEPAD_MAX - 1;
     if (!on || len < 6 || r[1] < 6)
         return;
     v.wLeftMotorSpeed  = (WORD)(r[2] | (r[3] << 8));
     v.wRightMotorSpeed = (WORD)(r[4] | (r[5] << 8));
-    if (v.wLeftMotorSpeed == last.wLeftMotorSpeed
-            && v.wRightMotorSpeed == last.wRightMotorSpeed)
+    if (v.wLeftMotorSpeed == last[pad].wLeftMotorSpeed
+            && v.wRightMotorSpeed == last[pad].wRightMotorSpeed)
         return;
-    last = v;
-    xbox_InputSetState(0, &v);
+    last[pad] = v;
+    xbox_InputSetState((DWORD)pad, &v);
     if (getenv("RECOMP_INPUT_DIAG"))
-        fprintf(stderr, "  [INPUT] rumble %u / %u\n",
+        fprintf(stderr, "  [INPUT] rumble pad %d %u / %u\n", pad,
                 (unsigned)v.wLeftMotorSpeed, (unsigned)v.wRightMotorSpeed);
 }
 
@@ -311,7 +329,11 @@ static unsigned synthetic_buttons(void)
      * RECOMP_PAD_PRESS's pulses are held off for it. Outside the script's
      * entries the pulses run as usual, so a run can be walked to a menu by
      * the pulses, steered there by the script, and carried on after. Bits
-     * 16-19 push the left stick fully down, up, left and right. */
+     * 16-19 push the left stick fully down, up, left and right.
+     *
+     * Upstream's named form ("40000:start,44000:a+down:400", p2- prefixes,
+     * @file) shares the variable: an entry whose mask does not start with a
+     * digit is left to pad_script_parse() below, so the two can be mixed. */
     {
         static int nscript = -1;
         static struct { unsigned long at, hold; unsigned mask; } script[64];
@@ -322,9 +344,19 @@ static unsigned synthetic_buttons(void)
             nscript = 0;
             while (p && *p && nscript < 64) {
                 char *end;
+                const char *m;
                 script[nscript].at = strtoul(p, &end, 0);
                 if (*end != ':')
                     break;
+                for (m = end + 1; *m == ' ' || *m == '\t'; m++)
+                    ;
+                if (!isdigit((unsigned char)*m)) {
+                    /* A named step: upstream's parser's. */
+                    p = strchr(m, ',');
+                    if (p)
+                        p++;
+                    continue;
+                }
                 script[nscript].mask = (unsigned)strtoul(end + 1, &end, 0) & 0xFFFFFu;
                 script[nscript].hold = (*end == ':') ? strtoul(end + 1, &end, 0) : 200u;
                 nscript++;
@@ -353,12 +385,325 @@ static unsigned synthetic_buttons(void)
     return (phase < hold_ms) ? mask : 0u;
 }
 
-int usb_gamepad_report(uint8_t *out, int max)
+/* A scripted pad, for driving a title through its menus with nobody at it.
+ *
+ * RECOMP_PAD_PRESS pulses one digital mask forever, which gets past a
+ * "press Start" screen and no further: a menu wants A, which is an analog
+ * button on this pad, and it wants presses in order. This takes a timeline:
+ *
+ *   RECOMP_PAD_SCRIPT=40000:start,44000:a,46000:down,47000:a:400
+ *
+ * Each entry is <ms>:<button>[+<button>...][:<hold ms>], with times measured
+ * from the first report the title asks for (so from enumeration, not from
+ * process start) and a default hold of 150 ms. RECOMP_PAD_SCRIPT=@file reads
+ * the same syntax from a file, one entry per line or comma separated.
+ *
+ * Buttons: up down left right start back lthumb rthumb (the digital byte),
+ * a b x y black white lt rt (the analog bytes, reported fully pressed), and
+ * lleft lright lup ldown / rleft rright rup rdown (a stick at full throw).
+ * Every entry is printed as it fires, so a run log says what was pressed when.
+ *
+ * RECOMP_PAD_LIVE=<file> is the same thing driven while the title runs: each
+ * line appended to the file -- <button>[+<button>...][:<hold ms>], no time --
+ * is pressed as soon as it is read. With RECOMP_FB_DUMP and a short
+ * RECOMP_PB_REPORT_MS that makes a loop: look at the frame, append a press,
+ * look again. A fixed timeline cannot do that on a rasterised run, where
+ * how long a screen takes to appear depends on how much the software
+ * rasteriser has to draw.
+ *
+ * Like RECOMP_PAD_PRESS this is a bring-up tool, off unless set. */
+#define PAD_SCRIPT_MAX 256
+
+typedef struct {
+    unsigned long at_ms, hold_ms;
+    uint8_t digital;         /* report byte 2 */
+    uint8_t analog;          /* bit n = report byte 4 + n */
+    uint8_t pad;             /* which controller: "p2-a" is pad 1 */
+    uint8_t stick;           /* full deflection: 1 L-left 2 L-right 4 L-up
+                                8 L-down, then the same four for the right */
+    int announced;
+} PadStep;
+
+static PadStep s_script[PAD_SCRIPT_MAX];
+static int     s_script_len = -1;
+/* Set while the inline RECOMP_PAD_SCRIPT is parsed: its numeric
+ * "ms:mask[:hold]" steps for pad 0 are synthetic_buttons()'s (quiet spells
+ * and all), so this parser leaves them alone. In a script file or a
+ * RECOMP_PAD_LIVE line a numeric mask is taken here, with the same bits. */
+static int     s_numeric_elsewhere;
+
+static int same_word(const char *a, const char *b, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++)
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i]))
+            return 0;
+    return 1;
+}
+
+static int pad_button_bits(const char *name, size_t n, uint8_t *dig,
+                           uint8_t *ana, uint8_t *stick)
+{
+    /* Stick directions, for screens and games that read the stick and
+     * ignore the d-pad: Burnout 3 steers and picks map locations with it. */
+    static const struct { const char *name; uint8_t bit; } sk[] = {
+        {"lleft", 0x01}, {"lright", 0x02}, {"lup", 0x04}, {"ldown", 0x08},
+        {"rleft", 0x10}, {"rright", 0x20}, {"rup", 0x40}, {"rdown", 0x80},
+    };
+    static const struct { const char *name; uint8_t dig, ana; } k[] = {
+        {"up", 0x01, 0}, {"down", 0x02, 0}, {"left", 0x04, 0},
+        {"right", 0x08, 0}, {"start", 0x10, 0}, {"back", 0x20, 0},
+        {"lthumb", 0x40, 0}, {"rthumb", 0x80, 0},
+        {"a", 0, 0x01}, {"b", 0, 0x02}, {"x", 0, 0x04}, {"y", 0, 0x08},
+        {"black", 0, 0x10}, {"white", 0, 0x20}, {"lt", 0, 0x40}, {"rt", 0, 0x80},
+    };
+    size_t i;
+    for (i = 0; i < sizeof sk / sizeof sk[0]; i++) {
+        if (strlen(sk[i].name) == n && same_word(sk[i].name, name, n)) {
+            *stick |= sk[i].bit;
+            return 1;
+        }
+    }
+    for (i = 0; i < sizeof k / sizeof k[0]; i++) {
+        if (strlen(k[i].name) == n && same_word(k[i].name, name, n)) {
+            *dig |= k[i].dig;
+            *ana |= k[i].ana;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void pad_script_parse(const char *text)
+{
+    const char *p = text;
+
+    while (*p && s_script_len < PAD_SCRIPT_MAX) {
+        PadStep st;
+        char *end;
+        const char *b;
+        int prefixed = 0;
+
+        while (*p == ',' || *p == ' ' || *p == '\r' || *p == '\n' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+        memset(&st, 0, sizeof st);
+        st.hold_ms = 150;
+        st.at_ms = strtoul(p, &end, 0);
+        if (end == p || *end != ':') {
+            fprintf(stderr, "  PAD: script entry without <ms>: at \"%.20s\"\n", p);
+            break;
+        }
+        b = end + 1;
+        /* "p2-" .. "p4-": the step is for that controller, not the first. */
+        if ((b[0] == 'p' || b[0] == 'P') && b[1] >= '1' && b[1] <= '4'
+            && b[2] == '-') {
+            st.pad = (uint8_t)(b[1] - '1');
+            b += 3;
+            prefixed = 1;
+        }
+        while (*b == ' ' || *b == '\t')
+            b++;
+        if (isdigit((unsigned char)*b)) {
+            /* The numeric mask of RECOMP_PAD_PRESS: bits 0-7 the digital
+             * byte, 8-15 the analog buttons, 16-19 the left stick down, up,
+             * left, right. Default hold 200 ms, as synthetic_buttons() has. */
+            char *e2;
+            unsigned long m = strtoul(b, &e2, 0);
+            b = e2;
+            if (s_numeric_elsewhere && !prefixed) {
+                while (*b && *b != ',' && *b != '\r' && *b != '\n')
+                    b++;
+                p = b;
+                continue;
+            }
+            st.hold_ms = 200;
+            st.digital = (uint8_t)(m & 0xFFu);
+            st.analog  = (uint8_t)((m >> 8) & 0xFFu);
+            if (m & 0x10000u) st.stick |= 0x08;
+            if (m & 0x20000u) st.stick |= 0x04;
+            if (m & 0x40000u) st.stick |= 0x01;
+            if (m & 0x80000u) st.stick |= 0x02;
+        } else {
+            for (;;) {
+                size_t n = strcspn(b, "+:,\r\n ");
+                if (!pad_button_bits(b, n, &st.digital, &st.analog, &st.stick))
+                    fprintf(stderr, "  PAD: unknown button \"%.*s\"\n", (int)n, b);
+                b += n;
+                if (*b != '+')
+                    break;
+                b++;
+            }
+        }
+        if (*b == ':')
+            st.hold_ms = strtoul(b + 1, (char **)&b, 0);
+        s_script[s_script_len++] = st;
+        p = b;
+    }
+}
+
+static void pad_script_load(void)
+{
+    const char *spec = getenv("RECOMP_PAD_SCRIPT");
+
+    s_script_len = 0;
+    if (!spec || !*spec)
+        return;
+    if (spec[0] == '@') {
+        FILE *f = fopen(spec + 1, "rb");
+        static char buf[16384];
+        size_t n;
+        if (!f) {
+            fprintf(stderr, "  PAD: cannot open script %s\n", spec + 1);
+            return;
+        }
+        n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        pad_script_parse(buf);
+    } else {
+        s_numeric_elsewhere = 1;
+        pad_script_parse(spec);
+        s_numeric_elsewhere = 0;
+    }
+    /* A purely numeric script has said so already (synthetic_buttons). */
+    if (s_script_len) {
+        fprintf(stderr, "  PAD: script of %d step(s)\n", s_script_len);
+        fflush(stderr);
+    }
+}
+
+/* Drop steps that have finished, so a long live session never fills up. */
+static void pad_script_compact(unsigned long t)
+{
+    int i, n = 0;
+    for (i = 0; i < s_script_len; i++)
+        if (t < s_script[i].at_ms + s_script[i].hold_ms)
+            s_script[n++] = s_script[i];
+    s_script_len = n;
+}
+
+/* Read whatever has been appended to RECOMP_PAD_LIVE since last time, and
+ * schedule each complete line at t. Polled at most every 50 ms. */
+static void pad_live_poll(unsigned long t)
+{
+    static const char *path;
+    static int checked;
+    static long consumed;
+    static unsigned long last_poll;
+    static char pending[512];
+    static size_t npending;
+    static unsigned long next_free[USB_GAMEPAD_MAX];
+    FILE *f;
+    int c;
+
+    if (!checked) {
+        checked = 1;
+        path = getenv("RECOMP_PAD_LIVE");
+        if (path && *path) {
+            fprintf(stderr, "  PAD: live input from %s\n", path);
+            fflush(stderr);
+        }
+    }
+    if (!path || !*path || (t - last_poll < 50 && last_poll))
+        return;
+    last_poll = t;
+    f = fopen(path, "rb");
+    if (!f)
+        return;
+    if (fseek(f, consumed, SEEK_SET) != 0) {
+        fclose(f);
+        return;
+    }
+    while ((c = fgetc(f)) != EOF) {
+        consumed++;
+        if (c == '\n' || c == '\r') {
+            if (npending) {
+                char line[560];
+                /* Several lines in one read go one after another, with a
+                 * 200 ms release between: a title polling its pad a few times
+                 * a second would otherwise see "down" and "a" in the same
+                 * report, which is a different input from "down, then a". */
+                /* Serialised per pad: pad 2's throttle must not wait out
+                 * pad 1's -- split-screen players press at the same time. */
+                int pd = (pending[0] == 'p' || pending[0] == 'P')
+                         && pending[1] >= '1' && pending[1] <= '4'
+                         && pending[2] == '-' ? pending[1] - '1' : 0;
+                unsigned long at = t > next_free[pd] ? t : next_free[pd];
+                pending[npending] = 0;
+                snprintf(line, sizeof line, "%lu:%s", at, pending);
+                if (s_script_len >= PAD_SCRIPT_MAX - 1)
+                    pad_script_compact(t);
+                pad_script_parse(line);
+                if (s_script_len > 0)
+                    next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
+                fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
+                fflush(stderr);
+                npending = 0;
+            }
+        } else if (npending < sizeof pending - 1) {
+            pending[npending++] = (char)c;
+        }
+    }
+    fclose(f);
+}
+
+static void pad_script_apply(int pad, uint8_t *out)
+{
+    static unsigned long t0;
+    unsigned long now, t;
+    int i, j;
+
+    if (s_script_len < 0)
+        pad_script_load();
+    now = (unsigned long)GetTickCount();
+    if (!t0)
+        t0 = now;
+    t = now - t0;
+    pad_live_poll(t);
+    if (s_script_len == 0)
+        return;
+    for (i = 0; i < s_script_len; i++) {
+        PadStep *st = &s_script[i];
+        if (st->pad != pad)
+            continue;
+        if (t < st->at_ms || t >= st->at_ms + st->hold_ms)
+            continue;
+        if (!st->announced) {
+            st->announced = 1;
+            fprintf(stderr, "  PAD: t=%lu ms step %d (digital 0x%02X analog 0x%02X)\n",
+                    t, i, st->digital, st->analog);
+            fflush(stderr);
+        }
+        out[2] |= st->digital;
+        for (j = 0; j < 8; j++)
+            if (st->analog & (1u << j))
+                out[4 + j] = 0xFF;
+        if (st->stick) {
+            /* Axes at 12..19: LX LY RX RY, signed 16-bit, up positive. */
+            static const int16_t full = 32767;
+            int16_t ax[4];
+            memcpy(ax, &out[12], sizeof ax);
+            if (st->stick & 0x01) ax[0] = (int16_t)-full;
+            if (st->stick & 0x02) ax[0] = full;
+            if (st->stick & 0x04) ax[1] = full;
+            if (st->stick & 0x08) ax[1] = (int16_t)-full;
+            if (st->stick & 0x10) ax[2] = (int16_t)-full;
+            if (st->stick & 0x20) ax[2] = full;
+            if (st->stick & 0x40) ax[3] = full;
+            if (st->stick & 0x80) ax[3] = (int16_t)-full;
+            memcpy(&out[12], ax, sizeof ax);
+        }
+    }
+}
+
+int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;
     unsigned synth_all = synthetic_buttons();
-    uint8_t synth = (uint8_t)(synth_all & 0xFFu);
+    uint8_t synth;
     int i;
 
     if (max < 20)
@@ -410,7 +755,13 @@ int usb_gamepad_report(uint8_t *out, int max)
         }
     }
 
-    if (xbox_InputGetState(0, &state) != 0) {
+    /* The synthetic press and the host pad drive pad n from host pad n:
+     * RECOMP_PAD_PRESS and the numeric RECOMP_PAD_SCRIPT steps are pad 0's
+     * (the "p2-" named steps reach the others through pad_script_apply). */
+    if (pad != 0)
+        synth_all = 0;
+    synth = (uint8_t)(synth_all & 0xFFu);
+    if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         for (i = 0; i < 8; i++)
             if (synth_all & (0x100u << i))
@@ -440,6 +791,8 @@ stick:
         out[14] = (uint8_t)(ly & 0xFF);
         out[15] = (uint8_t)((ly >> 8) & 0xFF);
     }
+    /* The named script and RECOMP_PAD_LIVE go on top of everything. */
+    pad_script_apply(pad, out);
     return 20;
 }
 

@@ -54,8 +54,9 @@ typedef uintptr_t target_ulong;
  * Bit manipulation
  * ============================================================ */
 
-/* For MSVC which doesn't have __builtin_ctz: */
-#ifdef _MSC_VER
+/* For MSVC, which doesn't have __builtin_ctz. clang-cl defines _MSC_VER too
+ * but has the builtins, and rejects redefining them. */
+#if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 static inline int __builtin_ctz(unsigned int x) {
     unsigned long index;
@@ -374,7 +375,10 @@ static inline int64_t qemu_clock_get_ns(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (int64_t)(count.QuadPart * 1000000000LL / freq.QuadPart);
+    /* Split: count * 1e9 overflows int64 after 15 minutes of uptime at a
+     * 10 MHz counter (Windows) and at once with a nanosecond one (POSIX). */
+    return (int64_t)(count.QuadPart / freq.QuadPart) * 1000000000LL +
+           (int64_t)(count.QuadPart % freq.QuadPart) * 1000000000LL / freq.QuadPart;
 }
 #define QEMU_CLOCK_VIRTUAL 0
 

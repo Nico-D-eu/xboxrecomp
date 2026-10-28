@@ -86,14 +86,32 @@ def _load_addrs(path):
     return out
 
 
+def _wrap_generated_bodies(batch, funcs, manual, wrapped):
+    """Emit each wrapped body as sub_X_gen and keep sub_X for its callers.
+
+    recomp_manual.c defines sub_X and calls the generated body as sub_X_gen,
+    so that body must be translated even when --category, --max-funcs or the
+    --manual-functions list would leave it out.
+    """
+    for addr in wrapped:
+        batch.func_db[addr]["name"] = f"sub_{addr:08X}_gen"
+        batch.func_db[addr]["wrapper_name"] = f"sub_{addr:08X}"
+    listed = {addr for addr, _ in funcs}
+    owned = batch.translator.owned_function_starts
+    funcs = funcs + [(addr, batch.func_db[addr]) for addr in sorted(wrapped)
+                     if addr not in listed and addr not in owned]
+    return funcs, manual - wrapped
+
+
 def _load_manual_protection(manual_functions, exclude_manual):
     """Load manual entry points before any destructive boundary repair."""
     protected = _load_addrs(manual_functions)
     scan_result = None
     if exclude_manual:
-        from .manual_scan import scan as _scan_manual
+        from .manual_scan import scan as _scan_manual, entry_hooks
         scan_result = _scan_manual(exclude_manual)
         protected.update(set().union(*scan_result))
+        protected.update(entry_hooks(exclude_manual))
     return protected, scan_result
 
 
@@ -253,12 +271,31 @@ def main():
     parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
                         help="Explicit owner bounds and false interior starts "
                              "to merge before translation; repeatable")
+    parser.add_argument("--entry-stubs", action="store_true",
+                        help="Stub an unresolved target that lies inside a "
+                             "known function with a copy of that function "
+                             "entered at the target, instead of a plain "
+                             "return. Each target is a full copy, so it can "
+                             "grow the generated code a lot. Off by default")
+    parser.add_argument("--back-edge-yield", action="store_true",
+                        help="Call RECOMP_BACK_EDGE, the guest CPU's quantum "
+                             "check, at every loop back edge. The guest CPU "
+                             "lock (RECOMP_GUEST_LOCK=1) needs it to preempt "
+                             "a loop that makes no kernel call; it costs a "
+                             "load and a branch per edge when the lock is "
+                             "off. Off by default: edges stay bare")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
     args = parser.parse_args()
+
+    # Reset on every CLI invocation, including one with no manual file.
+    from . import translator as translator_module
+    from .manual_scan import entry_hooks
+    translator_module.ENTRY_HOOKS = (entry_hooks(args.exclude_manual)
+                                    if args.exclude_manual else set())
 
     # Boundary repair is destructive: an interior function start disappears
     # once it is coalesced into its owner. Load hand-written entry points before
@@ -324,6 +361,8 @@ def main():
         icall_sites_json_path=args.icall_sites or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "output",
             "icall_sites.json"),
+        back_edge_yield=args.back_edge_yield,
+        entry_stubs=args.entry_stubs,
     )
 
     t_load = time.time() - t0
@@ -458,11 +497,8 @@ def main():
                     info["name"] = plain
                     pinned += 1
 
-            # wrap: recomp_manual.c defines sub_X itself and calls the generated
-            # body as sub_X_gen. So do NOT add these to `manual` (the body is
-            # still needed) -- just rename them so the emitted body is sub_X_gen.
-            for addr in wrap & known:
-                translator.func_db[addr]["name"] = f"sub_{addr:08X}_gen"
+            funcs, manual = _wrap_generated_bodies(
+                translator, funcs, manual, wrap & known)
 
             # skip - wrap: defined by hand and not wrapped -> declare-only, which
             # is exactly what membership in `manual` produces.

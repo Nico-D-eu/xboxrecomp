@@ -58,13 +58,24 @@ int  video_dump_frame_bmp(const char *path);
 
 /* Show the guest framebuffer in its own window (RECOMP_FB_WINDOW). Whatever
  * the title renders into guest RAM appears there; nothing else scans it out. */
-/* Non-zero while that virtual key is held in the framebuffer window. Always
- * zero when there is no window, which is the right answer: with nothing to
- * focus there is nothing to type into. */
-int xbox_FramebufferKeyDown(int vk);
-
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+/* Rows per displayed row: 2 for a 2x2 anti-aliased surface, else 1. */
+void xbox_FramebufferWindowSetAA(uint32_t sy);
 int  xbox_FramebufferDumpBmp(const char *path);
+/* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
+ * UTF-16 title (40 chars max); the stats come from each flip. */
+void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
+void xbox_FramebufferWindowFrameStats(uint32_t draws);
+
+#if !defined(_WIN32)
+/* POSIX hosts: the framebuffer window needs the process main thread (AppKit
+ * on macOS), so a title that wants it calls this from main() with its boot
+ * sequence. With RECOMP_FB_WINDOW set it opens the window, runs guest_main on
+ * a pthread and pumps events until guest_main returns (its value is returned)
+ * or the window is closed (the process exits). Otherwise, or headless, it
+ * just calls guest_main. */
+int  xbox_HostWindowMain(int (*guest_main)(void));
+#endif
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

@@ -23,6 +23,14 @@
  * after every clear, which separates "the pixel path is broken" from "the title
  * has not given us any vertices". RECOMP_FB_DUMP=<prefix> writes the surface to
  * <prefix>NNN.bmp, so the result can be looked at without a display.
+ *
+ * Two executors. This one hands draws to the D3D11 backend (nv2a_d3d11.c,
+ * RECOMP_GPU=d3d11) or rasterises them itself, and is what Amped 2 runs.
+ * nv2a_pb_exec_upstream.c is xboxrecomp v0.16.0's: a threaded CPU rasteriser
+ * with fixed-function T&L, swizzled render targets, CLEAR_RECT, the flip hold
+ * and render back ends (nv2a_backend.h). RECOMP_GPU=upstream, or a game
+ * project registering a back end, sends every method there instead; see
+ * "The other executor" below.
  */
 #include <math.h>
 #include <stdio.h>
@@ -41,6 +49,8 @@
 #include "nv2a_combiner.h"
 /* The GPU backend, when RECOMP_GPU=d3d11 asks for it. */
 #include "nv2a_d3d11.h"
+/* The render back-end interface; its calls go to nv2a_pb_exec_upstream.c. */
+#include "nv2a_backend.h"
 
 /* getenv once per name. Several switches are tested per method or per
  * batch, and getenv walks the whole environment with strchr each time -- it
@@ -3026,9 +3036,100 @@ void xbox_PresentPace(void)
     }
 }
 
+/* ── The other executor ──────────────────────────────────────────────
+ *
+ * nv2a_pb_exec_upstream.c is xboxrecomp v0.16.0's executor, built beside this
+ * one with its entry points renamed nv2a_up_*. It takes over every method when
+ * RECOMP_GPU=upstream, or once a game project registers a render back end,
+ * which only it feeds. Then this file only forwards: none of its own state is
+ * touched, so the D3D11 path is exactly as it was. The public names of
+ * upstream's other entry points (nv2a_backend.h, the flip hold) live here and
+ * forward the same way. */
+extern void nv2a_up_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern void nv2a_up_exec_report(void);
+extern void nv2a_up_exec_walk_begin(void);
+extern int  nv2a_up_exec_flip_pacing(void);
+extern int  nv2a_up_exec_flip_poll(void);
+extern void nv2a_up_set_semaphore_target(uint32_t guest_va);
+extern void nv2a_up_backend_register(const Nv2aBackend *backend);
+extern int  nv2a_up_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+
+static volatile int s_upstream = -1;
+
+static int exec_upstream(void)
+{
+    if (s_upstream < 0) {
+        const char *e = getenv("RECOMP_GPU");
+        s_upstream = e && strcmp(e, "upstream") == 0;
+        if (s_upstream)
+            fprintf(stderr, "  [GPU] RECOMP_GPU=upstream: the v0.16.0 executor"
+                            " (nv2a_pb_exec_upstream.c) runs the pushbuffer\n");
+    }
+    return s_upstream;
+}
+
+void nv2a_backend_register(const Nv2aBackend *backend)
+{
+    if (backend && s_upstream != 1) {
+        s_upstream = 1;
+        fprintf(stderr, "  [GPU] render back end registered: the v0.16.0"
+                        " executor (nv2a_pb_exec_upstream.c) runs the pushbuffer\n");
+    }
+    nv2a_up_backend_register(backend);
+}
+
+int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+{
+    return nv2a_up_backend_decode_texture(tex, argb_out);
+}
+
+/* BACK_END_WRITE_SEMAPHORE_RELEASE's target (nv2a_backend.h). Both
+ * executors write the release there; 0, the default, writes nothing. */
+static uint32_t s_sem_va;
+
+void nv2a_pb_set_semaphore_target(uint32_t guest_va)
+{
+    s_sem_va = guest_va;
+    nv2a_up_set_semaphore_target(guest_va);
+}
+
+void nv2a_pb_exec_walk_begin(void)
+{
+    if (exec_upstream())
+        nv2a_up_exec_walk_begin();
+}
+
+/* RECOMP_FLIP_PACING (the flip hold) is the upstream executor's. This one
+ * paces in xbox_PresentPace and the FLIP_STALL wait, so with it the hold is
+ * off whatever the switch says. */
+int nv2a_pb_exec_flip_pacing(void)
+{
+    if (exec_upstream())
+        return nv2a_up_exec_flip_pacing();
+    {
+        static volatile int said;
+        const char *e = getenv("RECOMP_FLIP_PACING");
+        if (!said && e && *e && strcmp(e, "0") != 0) {
+            said = 1;
+            fprintf(stderr, "  [GPU] RECOMP_FLIP_PACING=%s ignored: the flip"
+                            " hold needs RECOMP_GPU=upstream\n", e);
+        }
+    }
+    return 0;
+}
+
+int nv2a_pb_exec_flip_poll(void)
+{
+    return exec_upstream() ? nv2a_up_exec_flip_poll() : 0;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+    if (exec_upstream()) {
+        nv2a_up_exec_method(subch, method, param);
+        return;
+    }
     if (!inited) {
         inited = 1;
         s_gpu.min_x = s_gpu.min_y = 1e30f;
@@ -3154,6 +3255,35 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+        /* XDK D3D's KickOff ends every kick with method 0x0310 on subchannel
+         * 5, ((pushbuffer address * 8 | fence & 0x1F) << 2) | wrap & 3, and
+         * the GPU latches it into PGRAPH 0x400B10, where D3D waits for the
+         * kick's fence bits. Under the DMA walk (RECOMP_PB_WALK=dma) the
+         * executor latches it, as upstream's does (its comment there has
+         * the whole story); with nv2a_pb_run, the default, 0x400B10 is
+         * xbox_memory_layout.c's (RECOMP_FENCE_EXACT). With a mirrored fence
+         * and no semaphore target the latch carries the mirror's fence bits,
+         * which is what a GPU that had consumed everything would report. */
+        if (subch == 5 && method == 0x0310) {
+            extern int nv2a_pb_dma_walk(void);
+            if (nv2a_pb_dma_walk()) {
+                extern volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
+                extern uint32_t xbox_Nv2aFenceWordVa(void);
+                volatile uint32_t *r = xbox_Nv2aRegPtr(0x400B10);
+                if (!r)
+                    return;
+                if (!s_sem_va) {
+                    uint32_t va = xbox_Nv2aFenceWordVa();
+                    if (va) {
+                        uint32_t sem = *(volatile uint32_t *)
+                                       ((uint8_t *)xbox_GetMemoryOffset() + va);
+                        param = (param & ~0x7Cu) | ((sem & 0x1Fu) << 2);
+                    }
+                }
+                *r = param;
+                return;
+            }
+        }
         /* RECOMP_PB_SUBCH=<n>: the first n methods sent to the 2D classes. */
         static int subch_left = -1;
         if (subch_left < 0) {
@@ -3172,11 +3302,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     if (method == 0x1D70) {
         /* BACK_END_WRITE_SEMAPHORE_RELEASE: D3D's fence. Released here, as
-         * the walk executes it, for the fence mirror to report. */
+         * the walk executes it, for the fence mirror to report -- and into
+         * the semaphore word itself when a project named it
+         * (nv2a_pb_set_semaphore_target). SET_SEMAPHORE_OFFSET is not added:
+         * in X-Men Legends it held 0xFF000000 at times. */
         extern volatile uint32_t g_nv2a_sem_released;
         extern volatile int g_nv2a_sem_seen;
         g_nv2a_sem_released = param;
         g_nv2a_sem_seen = 1;
+        if (s_sem_va)
+            *(volatile uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + s_sem_va) = param;
     }
     if (method == 0x1D6C || method == 0x1D70 || method == 0x1D74 || method == 0x1D7C) {
         static int said;
@@ -3769,6 +3904,10 @@ static void peek_chain(void)
 
 void nv2a_pb_exec_report(void)
 {
+    if (exec_upstream()) {
+        nv2a_up_exec_report();
+        return;
+    }
     nv2a_d3d11_report();
     peek_addresses();
     peek_chain();

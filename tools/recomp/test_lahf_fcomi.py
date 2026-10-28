@@ -33,6 +33,10 @@ from tools.recomp.lifter import _lahf_from_flags, _make_condition  # noqa: E402
 
 # x86 truth after FCOMI/FUCOMI: (ZF, PF, CF); SF is cleared.
 TRUTH = {-1: (0, 0, 1), 0: (1, 0, 0), 1: (0, 0, 0), 2: (1, 1, 1)}
+# The low EFLAGS byte for each outcome, which the lifted compare leaves in _fa
+# (RECOMP_FCMP_CC >> 8) since the upstream v0.16 merge; lahf and the jccs
+# read it there.
+FA = {cmp: (zf << 6) | (pf << 2) | cf for cmp, (zf, pf, cf) in TRUTH.items()}
 
 
 def _expected_ah(cmp):
@@ -63,7 +67,7 @@ def _find_cc():
 def test_lahf_is_lifted_after_fucomip():
     stmt = _lahf_from_flags("fucomip", [])
     assert stmt is not None, "lahf after fucomip must be lifted, not dropped"
-    assert "g_fp_cmp" in stmt and stmt.startswith("eax = ")
+    assert "_fa" in stmt and stmt.startswith("eax = ")
 
 
 def test_lahf_without_setter_falls_back():
@@ -82,9 +86,11 @@ def test_lahf_and_fpu_jcc_match_hardware():
     lahf_expr = re.sub(r"/\*.*?\*/", "", lahf)
 
     lines = ["#include <stdio.h>", "#include <stdint.h>",
-             "static uint32_t eax; static int g_fp_cmp;",
+             "static uint32_t eax, _fa; static int g_fp_cmp;",
              "int main(void) { int bad = 0; int cmps[4] = {-1, 0, 1, 2};",
-             " for (int i = 0; i < 4; i++) { g_fp_cmp = cmps[i]; eax = 0xDEAD00EFu;",
+             "  unsigned fa[4] = {%uu, %uu, %uu, %uu};" % (FA[-1], FA[0], FA[1], FA[2]),
+             " for (int i = 0; i < 4; i++) { g_fp_cmp = cmps[i]; _fa = fa[i];"
+             " eax = 0xDEAD00EFu;",
              "  " + lahf_expr,
              '  printf("ah %d %u\\n", g_fp_cmp, (eax >> 8) & 0xFFu);',
              "  if ((eax & 0xFFFF00FFu) != 0xDEAD00EFu) bad = 1;"]
