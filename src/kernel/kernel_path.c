@@ -7,6 +7,12 @@
  *   T:\               -> <save_dir>/TitleData/
  *   U:\               -> <save_dir>/UserData/
  *   Z:\               -> <save_dir>/Cache/
+ *   \Device\Harddisk0\Partition1\ -> <hdd_dir>/ (E:, UDATA and TDATA)
+ *
+ * RECOMP_SAVE_DIR replaces save_dir and RECOMP_HDD_DIR replaces hdd_dir,
+ * which is the game dir unless set. Together they give a run a console's
+ * writable storage of its own -- saves, caches, partition images -- so a test
+ * run can never change the player's saves.
  *
  * The Win32 build emits UTF-16 paths (for CreateFileW); the Linux build
  * emits UTF-8 paths with '/' separators (for open()).
@@ -34,16 +40,21 @@ static int match_prefix(const char* path, const char* prefix)
 }
 
 /* A device-path translation rule, shared by both backends. */
+#define TO_GAME 0
+#define TO_SAVE 1
+#define TO_HDD  2
 typedef struct {
     const char* prefix;     /* Xbox path prefix (backslash form)         */
-    int         to_save;    /* 1 = under save_dir, 0 = under game_dir    */
+    int         to_save;    /* TO_SAVE, TO_HDD, or TO_GAME (game_dir)    */
     const char* sub_win;    /* sub-directory, Win32 backslash form       */
     const char* sub_posix;  /* sub-directory, POSIX slash form           */
 } path_rule;
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
-    { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
+    /* E:, the game and save partition: UDATA and TDATA. The game dir unless
+     * RECOMP_HDD_DIR moves it. */
+    { "\\Device\\Harddisk0\\Partition1\\",    TO_HDD, NULL,    NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
      * Without these the path layer reported "Unrecognized Xbox path" and
@@ -152,6 +163,24 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     return 0;
 }
 
+/*
+ * Is this a path on the disc (\Device\CdRom0\, D:\, or a drive letter the
+ * title linked there)? The disc is read-only media, which the host copy of
+ * its files is not; kernel_file.c opens these read-only whatever access the
+ * title asked for.
+ */
+int xbox_path_is_disc(const char* xbox_path)
+{
+    char linked[512];
+    if (!xbox_path)
+        return 0;
+    if (resolve_symlink(xbox_path, linked, sizeof(linked)))
+        xbox_path = linked;
+    return match_prefix(xbox_path, "\\Device\\CdRom0\\")
+        || match_prefix(xbox_path, "D:\\")
+        || match_prefix(xbox_path, "\\??\\D:\\");
+}
+
 /* ======================================================================== */
 /* Shared by both backends, for the same reason as xbox_LastFileError: the
  * bridge calls it unconditionally, and a _WIN32-only definition breaks every
@@ -172,6 +201,7 @@ const wchar_t *xbox_LastHostPath(void)
 
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
+static WCHAR s_hdd_dir[MAX_PATH];
 static BOOL  s_initialized = FALSE;
 
 /*
@@ -269,6 +299,11 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     WCHAR save_base[MAX_PATH];
+    const char *env_save = getenv("RECOMP_SAVE_DIR");
+    const char *env_hdd = getenv("RECOMP_HDD_DIR");
+
+    if (env_save && *env_save)
+        save_dir = env_save;
 
     /* The fallbacks used to name Burnout 3 specifically, so any other title
      * that passed NULL silently pointed its game dir and its saves at another
@@ -300,6 +335,18 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     len = wcslen(s_save_dir);
     if (len > 0 && s_save_dir[len - 1] == L'\\')
         s_save_dir[len - 1] = L'\0';
+
+    if (env_hdd && *env_hdd) {
+        MultiByteToWideChar(CP_UTF8, 0, env_hdd, -1, s_hdd_dir, MAX_PATH);
+        len = wcslen(s_hdd_dir);
+        if (len > 0 && s_hdd_dir[len - 1] == L'\\')
+            s_hdd_dir[len - 1] = L'\0';
+        /* An empty one is a console with nothing saved yet; the title makes
+         * UDATA and TDATA itself, but only inside a directory that exists. */
+        SHCreateDirectoryExW(NULL, s_hdd_dir, NULL);
+    } else {
+        wcscpy_s(s_hdd_dir, MAX_PATH, s_game_dir);
+    }
 
     /* Create the save-side directories. T:/U:/Z: map into subdirectories of
      * save_dir, and a title that opens a file there with a create disposition
@@ -360,6 +407,9 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
 
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
+    /* Always printed: where a run keeps its saves is the first thing to check
+     * when a run's progress (or a test's) turns up somewhere unexpected. */
+    fprintf(stderr, "  [PATH] saves: hdd=%S storage=%S\n", s_hdd_dir, s_save_dir);
 }
 
 /* The host path the last translation produced.
@@ -407,7 +457,8 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         skip = match_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
-            base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
+            base_dir  = s_rules[i].to_save == TO_SAVE ? s_save_dir
+                      : s_rules[i].to_save == TO_HDD  ? s_hdd_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_win;
             goto translate;
         }
@@ -522,6 +573,7 @@ translate:
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
+static char s_hdd_dir[MAX_PATH];
 static BOOL s_initialized = FALSE;
 
 /* Strip a single trailing '/' (but never the root '/'). */
@@ -555,6 +607,12 @@ static void mkdir_p(const char* path)
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
+    const char* env_save = getenv("RECOMP_SAVE_DIR");
+    const char* env_hdd = getenv("RECOMP_HDD_DIR");
+
+    if (env_save && *env_save)
+        save_dir = env_save;
+
     if (game_dir) {
         snprintf(s_game_dir, sizeof(s_game_dir), "%s", game_dir);
     } else {
@@ -581,6 +639,14 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
 
     strip_trailing_slash(s_game_dir);
     strip_trailing_slash(s_save_dir);
+
+    if (env_hdd && *env_hdd) {
+        snprintf(s_hdd_dir, sizeof(s_hdd_dir), "%s", env_hdd);
+        strip_trailing_slash(s_hdd_dir);
+        mkdir_p(s_hdd_dir);
+    } else {
+        snprintf(s_hdd_dir, sizeof(s_hdd_dir), "%s", s_game_dir);
+    }
 
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
@@ -610,7 +676,8 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         skip = match_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
-            base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
+            base_dir  = s_rules[i].to_save == TO_SAVE ? s_save_dir
+                      : s_rules[i].to_save == TO_HDD  ? s_hdd_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_posix;
             goto translate;
         }

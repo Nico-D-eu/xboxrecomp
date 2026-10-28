@@ -29,6 +29,9 @@
 #include <fnmatch.h>
 #endif
 
+/* kernel_path.c: is the path on the (read-only) disc? */
+int xbox_path_is_disc(const char *xbox_path);
+
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
 static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
@@ -104,13 +107,24 @@ static DWORD xbox_access_to_win32(ACCESS_MASK Access)
     return result;
 }
 
-/* Convert Xbox share access to Win32 */
-static DWORD xbox_share_to_win32(ULONG Share)
+/* Convert Xbox share access to Win32.
+ *
+ * A read-only open always lets others read as well. On the console nothing
+ * else could open the disc, so titles open their archives with no sharing at
+ * all; passed through, that locks every file the game has open against any
+ * other process -- a second instance (a test run next to someone's play
+ * session) failed its first archive open with a sharing violation and the
+ * title fell back to its launcher. Write access keeps the title's own share
+ * mode, so saves still exclude each other exactly as they did. */
+static DWORD xbox_share_to_win32(ULONG Share, DWORD win32_access)
 {
     DWORD result = 0;
     if (Share & 0x01) result |= FILE_SHARE_READ;
     if (Share & 0x02) result |= FILE_SHARE_WRITE;
     if (Share & 0x04) result |= FILE_SHARE_DELETE;
+    if (!(win32_access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA
+                          | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | DELETE)))
+        result |= FILE_SHARE_READ;
     return result;
 }
 
@@ -144,6 +158,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     WCHAR win_path[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+    DWORD access;
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
@@ -153,6 +168,20 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
+
+    /* The disc is read-only media; its host copy is not. Amped 2 opens
+     * shaders\shaders.res on the disc for read AND write with no sharing --
+     * harmless on a console, where nothing can write a DVD and no other
+     * process exists, but here it held an exclusive write handle on a game
+     * file, and a second instance could not open it at all. A disc file is
+     * opened read-only whatever the title asked for: the open still
+     * succeeds as it did, and only an actual write fails, as on a DVD. */
+    access = xbox_access_to_win32(DesiredAccess);
+    if (CreateDisposition == XBOX_FILE_OPEN && !ObjectAttributes->RootDirectory
+            && xbox_path_is_disc(get_xbox_path(ObjectAttributes)))
+        access = (access & ~(GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA
+                             | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | DELETE))
+                 | GENERIC_READ;
 
     /* A partition device opened as a directory.
      *
@@ -181,17 +210,15 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             CreateDirectoryW(win_path, NULL);
-        h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
-            xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        h = CreateFileW(win_path, access, xbox_share_to_win32(ShareAccess, access),
+            NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
         if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
-        h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
-            xbox_share_to_win32(ShareAccess), NULL,
-            xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+        h = CreateFileW(win_path, access, xbox_share_to_win32(ShareAccess, access),
+            NULL, xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
     }
 
     if (h == INVALID_HANDLE_VALUE) {

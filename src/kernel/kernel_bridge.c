@@ -3356,12 +3356,15 @@ static void bridge_NtCreateFile(void)
     {
         extern uint32_t xbox_LastFileError(void);
         uint32_t _e = g_eax ? xbox_LastFileError() : 0u;
+        /* Access and share go with it: a sharing violation is decided by
+         * both opens' masks, and the line is the only place they show. */
         if (g_eax)
-            fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s)\n",
+            fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s; access 0x%08X share 0x%X)\n",
                     g_eax, _e,
                     _e == 32u ? " ERROR_SHARING_VIOLATION"
                   : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
-                  : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
+                  : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "",
+                    access, share);
         else
             fprintf(stderr, "  [FILE] -> 0x%08X\n", g_eax);
     }
