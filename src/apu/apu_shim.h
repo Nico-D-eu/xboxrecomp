@@ -48,11 +48,7 @@ static inline int64_t qemu_clock_get_us(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    /* Split, not count * 1e6 / freq: on POSIX the counter is CLOCK_MONOTONIC
-     * in nanoseconds (freq 1e9), and the product overflows int64 after about
-     * 2.5 hours of host uptime and the clock jumps. */
-    return (int64_t)(count.QuadPart / freq.QuadPart) * 1000000LL +
-           (int64_t)(count.QuadPart % freq.QuadPart) * 1000000LL / freq.QuadPart;
+    return (int64_t)(count.QuadPart * 1000000LL / freq.QuadPart);
 }
 #endif
 
@@ -97,40 +93,56 @@ static inline void qemu_thread_join(QemuThread *t) {
  * We access Xbox RAM via a global pointer, same as NV2A.
  * ============================================================ */
 
-extern uint8_t *g_apu_ram_ptr; /* the init's ram_ptr: guest RAM, or the
-                                  contiguous window (see mcpx_apu_phys) */
-extern uint8_t *g_apu_lowram_ptr; /* low RAM when ram_ptr is the window */
-/* Where a physical address the title handed the APU lives. See apu_core.c. */
-uint8_t *mcpx_apu_phys(uint64_t addr);
-/* Which case of mcpx_apu_phys resolved an address, for trace lines. */
-const char *mcpx_apu_phys_class(uint64_t addr);
+extern uint8_t *g_apu_ram_ptr;    /* the contiguous window (physical RAM) */
+extern uint8_t *g_apu_lowram_ptr; /* low RAM, for pages the title handed out
+                                     from ordinary memory */
+extern volatile uint8_t g_xbox_phys_lowram[];   /* kernel_memory.c */
+extern uint32_t g_xbox_contig_size, g_xbox_ram_top, g_xbox_phys_mask;   /* kernel.h */
+
+/* Physical address -> host pointer, in whichever store the page came from
+ * (see g_xbox_phys_lowram). */
+static inline uint8_t *apu_phys(hwaddr addr) {
+    /* Above the window (64-128 MB at retail size) is ordinary memory
+     * (MmGetPhysicalAddress, XBOX_PHYS_LOWRAM_BASE in kernel.h); below it,
+     * the window -- or, for an address handed out before the split or by a
+     * title that masks to the RAM size, whichever store the page was last
+     * asked for from. */
+    uint32_t p = (uint32_t)addr & g_xbox_phys_mask;
+    if (p >= g_xbox_contig_size && g_apu_lowram_ptr) {
+        uint32_t o = p - g_xbox_contig_size;
+        return g_apu_lowram_ptr + (o < g_xbox_ram_top ? o : o & 0x03FFFFFFu);
+    }
+    p &= g_xbox_contig_size - 1u;
+    return ((g_apu_lowram_ptr && g_xbox_phys_lowram[p >> 12]) ? g_apu_lowram_ptr
+                                                               : g_apu_ram_ptr) + p;
+}
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint32_t *)mcpx_apu_phys(addr);
+    return *(uint32_t *)apu_phys(addr);
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint16_t *)mcpx_apu_phys(addr);
+    return *(uint16_t *)apu_phys(addr);
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint8_t *)mcpx_apu_phys(addr);
+    return *(uint8_t *)apu_phys(addr);
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
-    *(uint32_t *)mcpx_apu_phys(addr) = val;
+    *(uint32_t *)apu_phys(addr) = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
-    *(uint16_t *)mcpx_apu_phys(addr) = val;
+    *(uint16_t *)apu_phys(addr) = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
-    *(uint8_t *)mcpx_apu_phys(addr) = val;
+    *(uint8_t *)apu_phys(addr) = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */
@@ -372,7 +384,7 @@ static struct {
 } g_config = {
     .audio = {
         .volume_limit = 1.0f,
-        .hrtf = true,       /* xemu's default */
+        .hrtf = false,
         .vp = { .num_workers = 1 },
     },
 };

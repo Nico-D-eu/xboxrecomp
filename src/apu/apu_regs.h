@@ -29,7 +29,6 @@
 #   define NV_PAPU_ISTS_FETINTSTS                             (1 << 4)
 #   define NV_PAPU_ISTS_FENINTSTS                             (1 << 5)
 #   define NV_PAPU_ISTS_FEVINTSTS                             (1 << 6)
-#   define NV_PAPU_ISTS_SSLINTSTS                             (1 << 3)
 #define NV_PAPU_IEN                                      0x00001004
 #define NV_PAPU_FECTL                                    0x00001100
 #   define NV_PAPU_FECTL_FEMETHMODE                         0x000000E0
@@ -55,7 +54,6 @@
 #define NV_PAPU_SECTL                                    0x00002000
 #   define NV_PAPU_SECTL_XCNTMODE                           0x00000018
 #       define NV_PAPU_SECTL_XCNTMODE_OFF                       0
-#define NV_PAPU_SSL                                      0x00002008
 #define NV_PAPU_XGSCNT                                   0x0000200C
 #define NV_PAPU_VPVADDR                                  0x0000202C
 #define NV_PAPU_VPSGEADDR                                0x00002030
@@ -336,10 +334,6 @@
 #define NUM_MIXBINS 32
 
 #define ADPCM_SAMPLES_PER_BLOCK 64 // FIXME: Should be 65? Check interpolation
-/* The largest samples-per-block value an ADPCM voice may use: the
- * descriptor's field is 5 bits plus one. Sized for all of it, so no voice
- * is refused (a refused stream voice never posts its SSL-done). */
-#define ADPCM_MAX_BLOCKS 32
 
 #define MCPX_HW_MAX_PRD_ENTRIES_PER_SSL     16
 #define MCPX_HW_SSLS_PER_VOICE              2

@@ -41,33 +41,21 @@
  * RECOMP_APU_DSP_ACK=<addr>[,<addr>...] clears those guest dwords once per APU
  * frame, which is what "the command completed" looks like to the title.
  *
- * RECOMP_APU_DSP_ACK=auto, the default when the variable is unset, finds the
- * doorbell from what the title programs; "0" or "off" turns the ack off.
- * The XDK DSOUND GP program takes its commands through the first page of
- * the GP's scratch space: a 2 KB command FIFO, then a header whose dword at
- * +0x810 is the doorbell the host writes and the DSP program clears (the
- * DSOUND submit of every XDK title seen spins on <block>+0x810). The
- * scratch pages are what NV_PAPU_GPSADDR's scatter-gather table maps -- 8
- * bytes an entry, the physical page in the first dword, as xemu's apu.c
- * scratch_rw walks it -- so the doorbell is SGE[0] + 0x810 wherever the
- * contiguous allocator put the block. A fixed address moves with allocation
- * order (reserving physical page 0 moved one title's by a page); this does
- * not. Wreckless fits too: its doorbell 0x014F8810 is the first page of the
- * scratch its GPSADDR table (0x01504000) maps, not the table itself, which
- * is where the earlier note here looked.
- *
  * ponytail: this is a handshake acknowledgement, not a DSP. It says every
  * command succeeded instantly and computes nothing, so anything whose *result*
  * the title reads back will still be wrong. The real fix is DSP56300 emulation
  * in the GP/EP; this exists so audio init stops blocking everything behind it.
+ *
+ * The address is not derivable from the APU registers: GPSADDR/GPFADDR/
+ * EPSADDR/EPFADDR point at the DSP's own scratch and frame memory, while the
+ * command block is a DirectSound heap allocation. On Wreckless the registers
+ * read 0x01504000 / 0x014EC000 / 0x0151C000 / 0x014F0000 and the doorbell is at
+ * 0x014F8810 -- inside none of them. So it has to be observed: run with
+ * RECOMP_WATCHDOG_SECS and the spin shows up as ebx plus the poll offset.
  */
 #define APU_DSP_ACK_MAX 8
-#define GP_DOORBELL_OFFSET 0x810u
 static uint32_t s_dsp_ack[APU_DSP_ACK_MAX];
 static int s_dsp_ack_count = -1;
-static int s_dsp_ack_auto;                /* =auto: derive from GPSADDR */
-static uint32_t s_dsp_ack_auto_page;      /* the page last reported */
-static volatile int s_gp_in_reset;        /* last GPRST write held the GP */
 
 static void dsp_ack_init(void)
 {
@@ -76,15 +64,7 @@ static void dsp_ack_init(void)
 
     s_dsp_ack_count = 0;
     if (!spec || !*spec)
-        spec = "auto";                    /* default: derive it */
-    if (!strcmp(spec, "0") || !strcmp(spec, "off"))
         return;
-    if (!strcmp(spec, "auto")) {
-        s_dsp_ack_auto = 1;
-        fprintf(stderr, "[APU] DSP doorbell ack: auto (GP scratch page 0"
-                        " + 0x%X, from GPSADDR)\n", GP_DOORBELL_OFFSET);
-        return;
-    }
     strncpy(buf, spec, sizeof buf - 1);
     buf[sizeof buf - 1] = 0;
     for (p = buf; *p && s_dsp_ack_count < APU_DSP_ACK_MAX; ) {
@@ -136,48 +116,7 @@ static float mcpx_apu_reverb_send(void)
     return g;
 }
 
-/* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
- * in xemu's gp_write. Nothing else models the GP, so this is kept for the
- * =auto ack alone. Before the first write the GP counts as running: a title
- * that never touches GPRST keeps its ack. */
-void mcpx_apu_dsp_gprst_write(uint32_t val)
-{
-    const uint32_t run = NV_PAPU_GPRST_GPRST | NV_PAPU_GPRST_GPDSPRST;
-    int held = (val & run) != run;
-
-    if (held != s_gp_in_reset && s_dsp_ack_auto)
-        fprintf(stderr, "[APU] GPRST 0x%X: GP %s; DSP doorbell ack %s\n",
-                val, held ? "held in reset" : "running",
-                held ? "paused" : "resumed");
-    s_gp_in_reset = held;
-}
-
-/* The doorbell for =auto: SGE[0] of the GP scratch table + 0x810, re-read on
- * every poll, so the slot always lies in the page the table names now. NULL
- * while GPSADDR is unset, the table's first entry names no page, or the GP
- * is held in reset: a title that tears DirectSound down frees the scratch,
- * and a dword cleared there after that would land in whatever reuses the
- * page. */
-static uint32_t *dsp_ack_auto_slot(MCPXAPUState *d)
-{
-    uint32_t sge = qatomic_read(&d->regs[NV_PAPU_GPSADDR]), page;
-
-    if (!sge || s_gp_in_reset)
-        return NULL;
-    page = *(const uint32_t *)mcpx_apu_phys(sge);
-    if (!page || (page & 0xFFF))
-        return NULL;                       /* table not filled in yet */
-    if (page != s_dsp_ack_auto_page) {
-        s_dsp_ack_auto_page = page;
-        fprintf(stderr, "[APU] DSP doorbell: GP scratch SGE table 0x%08X maps"
-                        " page 0x%08X (%s); doorbell at physical 0x%08X\n",
-                sge, page, mcpx_apu_phys_class(page),
-                page + GP_DOORBELL_OFFSET);
-    }
-    return (uint32_t *)(mcpx_apu_phys(page) + GP_DOORBELL_OFFSET);
-}
-
-void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
+static void dsp_ack_frame(MCPXAPUState *d)
 {
     int i;
 
@@ -185,16 +124,6 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
         dsp_ack_init();
     if (!d->ram_ptr)
         return;
-    if (s_dsp_ack_auto) {
-        uint32_t *slot = dsp_ack_auto_slot(d);
-        if (slot && *slot) {
-            static int shown;
-            if (shown++ < 3)
-                fprintf(stderr, "[APU] DSP doorbell (auto): command 0x%08X"
-                                " acknowledged\n", *slot);
-            *slot = 0;
-        }
-    }
     for (i = 0; i < s_dsp_ack_count; i++) {
         uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
         if (*slot) {
@@ -209,15 +138,6 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 
 void mcpx_apu_dsp_init(MCPXAPUState *d)
 {
-    /* The doorbell ack's state is file-static, so it outlives an instance:
-     * a GP the last instance held in reset would leave this one's ack
-     * paused, and the RECOMP_APU_DSP_ACK setting would never be read again.
-     * Start from what a fresh process has. */
-    s_dsp_ack_count = -1;                  /* re-read on the first poll */
-    s_dsp_ack_auto = 0;
-    s_dsp_ack_auto_page = 0;
-    s_gp_in_reset = 0;
-
     /* Allocate minimal DSP state for GP and EP.
      * We need these to exist so reset doesn't crash,
      * but they won't actually run DSP programs. */
@@ -231,17 +151,6 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
     d->ep.realtime = false;
 
     fprintf(stderr, "[APU] DSP GP/EP initialized (STUBBED - passthrough mode)\n");
-}
-
-/* Called after the frame thread is joined. Only mcpx_apu_reset_locked
- * (currently uncalled) reads this state, and it would run on that thread.
- * Safe to call twice. */
-void mcpx_apu_dsp_finalize(MCPXAPUState *d)
-{
-    free(d->gp.dsp);
-    free(d->ep.dsp);
-    d->gp.dsp = NULL;
-    d->ep.dsp = NULL;
 }
 
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
@@ -265,8 +174,9 @@ static inline float apu_soft_limit(float x)
     return x < 0 ? -a : a;
 }
 float g_apu_mix_peak;
-/* The per-voice RECOMP_APU_STATS sums (g_apu_voice_*) are defined in apu_vp.c,
- * which writes them, so tests/apu_vp builds the VP on its own. */
+double g_apu_voice_dc[256], g_apu_voice_nyq[256], g_apu_voice_sq[256];
+float g_apu_voice_rate[256];
+unsigned long g_apu_voice_n[256];
 unsigned long g_apu_bin_n;
 
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
@@ -288,8 +198,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
-    /* The doorbell ack (mcpx_apu_dsp_ack_poll) runs from the frame thread
-     * on every pass, trapped front end or not, no longer from here. */
+    dsp_ack_frame(d);
 
     /* Per-bin energy for RECOMP_APU_STATS (printed by apu_core.c). */
     for (int b = 0; b < NUM_MIXBINS && b < 32; b++)
