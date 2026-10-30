@@ -266,6 +266,15 @@ volatile long g_disp_health_timeouts;
  * lock across a whole DPC pass gave (see dispatch_lock_level). */
 static volatile LONG s_disp_dpc;
 #define XBOX_DPC_HOLD_WAIT_MS 20u
+/* A title's way to see a stall from the inside: called by the raise that
+ * gives up on the lock, for the first three, with the holder still holding
+ * it -- so a snapshot of every thread (Amped 2's main.c) shows what the
+ * holder is stuck on. A give-up is rare in a healthy run. 0 = none. */
+void (*g_xbox_stall_hook)(unsigned long owner_tid, unsigned long waiter_tid,
+                          unsigned long long held_ms);
+/* The same snapshot for a stall seen elsewhere (the APU output's stale-loop
+ * check), with a line saying why. 0 = none. */
+void (*g_xbox_snapshot_hook)(const char *why);
 
 int xbox_DispatchLockAcquire(unsigned timeout_ms)
 {
@@ -317,6 +326,9 @@ int xbox_DispatchLockAcquire(unsigned timeout_ms)
                         " without it\n", (long)owner, s_disp_dpc ? " (a DPC)" : "",
                         GetTickCount64() - t0, guest, (long)me, g_xbox_kernel_caller);
                 fflush(stderr);
+                if (g_xbox_stall_hook && s_disp_timeouts <= 3)
+                    g_xbox_stall_hook((unsigned long)owner, (unsigned long)me,
+                                      GetTickCount64() - t0);
             }
             return 0;
         }

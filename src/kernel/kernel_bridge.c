@@ -2937,14 +2937,23 @@ static void bridge_KeInsertQueueDpc(void)
     g_eax = (uint32_t)xbox_DpcQueue(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2));
 }
 
-/* Cancel a queued DPC: take it out of the queue if it is still there. */
+/* Cancel a queued DPC: take it out of the queue if it is still there.
+ * RECOMP_DPC_REMOVE=0: the stub this replaced (FALSE, nothing cancelled),
+ * for A/B runs -- on the console a DPC runs as soon as the IRQL drops, while
+ * here it waits for the timer thread's next pass, so a cancel can catch one
+ * the console would already have run. The first few cancels are logged. */
 static void bridge_KeRemoveQueueDpc(void)
 {
     uint32_t dpc = STACK_ARG(0);
     LONG i;
+    static int on = -1;
 
     g_eax = 0;
-    if (!dpc)
+    if (on < 0) {
+        const char *e = getenv("RECOMP_DPC_REMOVE");
+        on = !(e && *e == '0');
+    }
+    if (!dpc || !on)
         return;
     dpc_lock();
     if (BRIDGE_MEM8(dpc + 2)) {
@@ -2955,6 +2964,15 @@ static void bridge_KeRemoveQueueDpc(void)
         g_eax = 1;
     }
     LeaveCriticalSection(&g_dpc_lock);
+    if (g_eax) {
+        static volatile LONG said;
+        if (InterlockedIncrement(&said) <= 4) {
+            fprintf(stderr, "  [DPC] KeRemoveQueueDpc cancelled dpc 0x%08X"
+                    " (routine 0x%08X) for guest 0x%08X\n", dpc,
+                    BRIDGE_MEM32(dpc + 12), g_xbox_kernel_caller);
+            fflush(stderr);
+        }
+    }
 }
 
 /* Call a connected interrupt service routine.
@@ -3595,6 +3613,20 @@ static int dpc_pop(PendingDpc *d)
  * the lock for the whole pass, and the acquire is recursive. Past 20 ms the
  * DPC runs without it, as it used to. (The default loop's DPCs; the paced
  * loop's go through the gate, kernel_drain_dpcs_gated.) */
+/* For the slow-DPC lines: the CPU this thread has used, in millions of
+ * cycles. Next to the wall time it tells a DPC that was busy from one that
+ * was not running at all (descheduled, or blocked in the host). */
+static unsigned long long dpc_thread_mcycles(void)
+{
+#ifdef _WIN32
+    ULONG64 c = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &c);
+    return (unsigned long long)(c / 1000000u);
+#else
+    return 0;
+#endif
+}
+
 static void kernel_run_dpc_at_dispatch(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
 {
     extern int  xbox_DispatchLockAcquireForDpc(unsigned timeout_ms);
@@ -3602,6 +3634,7 @@ static void kernel_run_dpc_at_dispatch(uint32_t dpc_va, uint32_t arg1, uint32_t 
     extern int  xbox_DispatchLockEnabled(void);
     int got = xbox_DispatchLockEnabled() && xbox_DispatchLockAcquireForDpc(20);
     ULONGLONG t0 = GetTickCount64(), ms;
+    unsigned long long c0 = dpc_thread_mcycles();
     g_in_dpc = 1;
     kernel_run_dpc(dpc_va, arg1, arg2);
     g_in_dpc = 0;
@@ -3612,9 +3645,11 @@ static void kernel_run_dpc_at_dispatch(uint32_t dpc_va, uint32_t arg1, uint32_t 
     if (ms >= 50) {
         static volatile LONG said;
         if (InterlockedIncrement(&said) <= 16) {
-            fprintf(stderr, "  [DPC] routine 0x%08X (dpc 0x%08X) ran %llu ms%s\n",
+            fprintf(stderr, "  [DPC] routine 0x%08X (dpc 0x%08X) ran %llu ms%s,"
+                    " %llu Mcycles on its thread\n",
                     dpc_va ? BRIDGE_MEM32(dpc_va + 12) : 0, dpc_va, ms,
-                    got ? " holding the dispatch lock" : "");
+                    got ? " holding the dispatch lock" : "",
+                    dpc_thread_mcycles() - c0);
             fflush(stderr);
         }
     }
@@ -11591,7 +11626,13 @@ static void kernel_thunk_dispatch_body(void)
         /* A kernel call inside a DPC that takes long holds the dispatch
          * lock all that time, and every raising thread waits on it: name
          * it, with its first arguments. */
-        ULONGLONG t0 = GetTickCount64(), ms;
+        /* The performance counter, not GetTickCount64: that moves in 15.6 ms
+         * steps, so any call that straddles one read as 15 ms, and a busy
+         * DPC "took 15 ms" in one trivial call per tick. */
+        LARGE_INTEGER q0, q1, qf;
+        ULONGLONG ms;
+        unsigned long long c0 = dpc_thread_mcycles();
+        uint32_t ret = BRIDGE_MEM32(g_esp);
         uint32_t a0 = BRIDGE_MEM32(g_esp + 4), a1 = BRIDGE_MEM32(g_esp + 8);
         uint32_t a2 = BRIDGE_MEM32(g_esp + 12);
         /* RtlEnterCriticalSection (277) may wait for a guest thread, which
@@ -11599,6 +11640,7 @@ static void kernel_thunk_dispatch_body(void)
          * xbox_DispatchLockSuspend). RECOMP_DPC_CS_KEEP_LOCK=1: the old way. */
         static int keep = -1;
         if (keep < 0) keep = getenv("RECOMP_DPC_CS_KEEP_LOCK") != NULL;
+        QueryPerformanceCounter(&q0);
         if (ordinal == 277 && !keep) {
             extern int  xbox_DispatchLockSuspend(void);
             extern void xbox_DispatchLockResume(int depth, int dpc);
@@ -11608,13 +11650,17 @@ static void kernel_thunk_dispatch_body(void)
         } else {
             bridge();
         }
-        ms = GetTickCount64() - t0;
+        QueryPerformanceCounter(&q1);
+        QueryPerformanceFrequency(&qf);
+        ms = (ULONGLONG)((q1.QuadPart - q0.QuadPart) * 1000 / qf.QuadPart);
         if (ms >= 10) {
             static volatile LONG said;
             if (InterlockedIncrement(&said) <= 16)
                 fprintf(stderr, "  [DPC] kernel ordinal %lu took %llu ms in a DPC"
-                        " (args 0x%08X 0x%08X 0x%08X)\n",
-                        (unsigned long)ordinal, ms, a0, a1, a2);
+                        " (args 0x%08X 0x%08X 0x%08X, from 0x%08X), %llu Mcycles"
+                        " on its thread\n",
+                        (unsigned long)ordinal, ms, a0, a1, a2, ret,
+                        dpc_thread_mcycles() - c0);
         }
     } else if (bridge) {
         bridge();
