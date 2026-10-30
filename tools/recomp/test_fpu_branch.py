@@ -123,19 +123,17 @@ int main(void){
 
 
 def test_idiom_semantics_compiled():
-    import shutil
-    cc = shutil.which("clang") or shutil.which("gcc") \
-        or (r"C:\Program Files\LLVM\bin\clang.exe"
-            if os.path.exists(r"C:\Program Files\LLVM\bin\clang.exe") else None)
+    from tools.recomp.c_fixture import compiler, command
+    cc = compiler()
     if not cc:
-        print("  SKIP no C compiler")
-        return
+        import pytest
+        pytest.skip('no C compiler on PATH')
     with tempfile.TemporaryDirectory() as tmp:
         c = os.path.join(tmp, "t.c")
         open(c, "w").write(C_HELPER)
         exe = os.path.join(tmp, "t.exe")
-        r = subprocess.run([cc, "-w", c, "-o", exe], capture_output=True, text=True)
-        assert r.returncode == 0, r.stderr[-1500:]
+        r = subprocess.run(command(cc, [c], exe), cwd=tmp, capture_output=True, text=True)
+        assert r.returncode == 0, (r.stdout + r.stderr)[-1500:]
         r = subprocess.run([exe], capture_output=True, text=True)
         assert r.returncode == 0 and r.stdout.startswith("OK"), r.stdout + r.stderr
         print("     " + r.stdout.strip())
@@ -157,33 +155,33 @@ def test_arith_honors_operands():
 
     # fmul [mem]: st0 *= mem, NO pop
     o = lift("fmul", [mem], "dword ptr [0xK]")
-    assert "fp_top() = fp_top() * MEMF(0xK)" in o and "fp_pop" not in o, o
+    assert "fp_top() = RECOMP_FP_PC(fp_top() * MEMF(0xK))" in o and "fp_pop" not in o, o
     # fadd st(0), st(0): double st0, no pop
     o = lift("fadd", [st0, st0], "st(0), st(0)")
-    assert "fp_top() = fp_top() + fp_top()" in o and "fp_pop" not in o, o
+    assert "fp_top() = RECOMP_FP_PC(fp_top() + fp_top())" in o and "fp_pop" not in o, o
     # faddp: st1 += st0, pop
     o = lift("faddp", [], "")
-    assert "fp_st1() = fp_st1() + fp_top(); fp_pop();" in o, o
+    assert "fp_st1() = RECOMP_FP_PC(fp_st1() + fp_top()); fp_pop();" in o, o
     # faddp st(1): capstone reports the pop form as ONE operand. Must target
     # st(i) and pop -- NOT st0 without a pop (that broke normalize's sum of
     # squares and gave Halo a 1/sqrt(2)-scaled camera basis).
     o = lift("faddp", [st1], "st(1)")
-    assert "fp_st1() = fp_st1() + fp_top(); fp_pop();" in o, o
+    assert "fp_st1() = RECOMP_FP_PC(fp_st1() + fp_top()); fp_pop();" in o, o
     # faddp st(2): st(2) = st(2) + st0, pop
     o = lift("faddp", [_Op("st2", type="reg", reg="st(2)")], "st(2)")
-    assert "g_fp_stack[(g_fp_top + 2) & 7] = g_fp_stack[(g_fp_top + 2) & 7] + fp_top(); fp_pop();" in o, o
+    assert "g_fp_stack[(g_fp_top + 2) & 7] = RECOMP_FP_PC(g_fp_stack[(g_fp_top + 2) & 7] + fp_top()); fp_pop();" in o, o
     # fmul st(3): non-pop single operand stays st0 *= st(3), no pop
     o = lift("fmul", [_Op("st3", type="reg", reg="st(3)")], "st(3)")
-    assert "fp_top() = fp_top() * g_fp_stack[(g_fp_top + 3) & 7]" in o and "fp_pop" not in o, o
+    assert "fp_top() = RECOMP_FP_PC(fp_top() * g_fp_stack[(g_fp_top + 3) & 7])" in o and "fp_pop" not in o, o
     # fmulp st(1): st1 *= st0, pop
     o = lift("fmulp", [st1], "st(1)")
-    assert "fp_st1() = fp_st1() * fp_top(); fp_pop();" in o, o
+    assert "fp_st1() = RECOMP_FP_PC(fp_st1() * fp_top()); fp_pop();" in o, o
     # fsubr [mem]: st0 = mem - st0 (reversed)
     o = lift("fsubr", [mem], "dword ptr [0xK]")
-    assert "fp_top() = MEMF(0xK) - fp_top()" in o, o
+    assert "fp_top() = RECOMP_FP_PC(MEMF(0xK) - fp_top())" in o, o
     # fdivrp st(1), st(0): st1 = st0 / st1, pop
     o = lift("fdivrp", [st1, st0], "st(1), st(0)")
-    assert "fp_st1() = fp_top() / fp_st1(); fp_pop();" in o, o
+    assert "fp_st1() = RECOMP_FP_PC(fp_top() / fp_st1()); fp_pop();" in o, o
 
 
 def test_fcom_pop_counts():

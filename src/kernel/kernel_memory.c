@@ -10,7 +10,7 @@
  */
 
 #include "kernel.h"
-#include "xbox_memory_layout.h"   /* g_xbox_total_ram, XBOX_DEVKIT_RAM */
+#include "xbox_memory_layout.h"   /* g_xbox_total_ram, XBOX_DEVKIT_RAM, xbox_PhysNoteRamName */
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -257,6 +257,10 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
         return (ULONG_PTR)pa;
     }
     if (va < g_xbox_ram_top) {
+        /* Upstream's record of the same fact, for the APU's resolver: the
+         * title meant RAM here (xbox_PhysNoteRamName says why the APU needs
+         * to know). Kept up whether or not the numbers below are split. */
+        xbox_PhysNoteRamName(va);
         if (va < XBOX_DEVKIT_RAM) {
             phys_note_store(va, 1, va);
             g_xbox_phys_lowram[va >> 12] = 1;

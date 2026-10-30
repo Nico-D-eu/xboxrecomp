@@ -210,6 +210,49 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         }
     }
 
+    /* The stale-loop dropout: the music stops being fed and its stream voice
+     * keeps wrapping round the old data, so the output repeats exactly, 4 s
+     * apart, with silence where nothing was written (diag 2026-10-30,
+     * p17f_4, ab1B_6_1: 1 run in 10, never before the v0.16 sync). Hash
+     * each 100 ms of output and compare it with the block 4 s earlier;
+     * three non-silent matches in a row are no coincidence. Once a run, it
+     * says so and asks for a snapshot of every thread (g_xbox_snapshot_hook)
+     * while the feeder is still stuck. */
+    {
+        enum { BLOCK = 4800, LAG = 40, RING = 64 };
+        static uint32_t ring[RING], h = 2166136261u, frames;
+        static unsigned blocks, run, said;
+        static int nonzero;
+        int i, n = copy_samples * XA2_CHANNELS;
+        for (i = 0; i < n; i += XA2_CHANNELS) {
+            uint32_t v = (uint16_t)samples[i] | ((uint32_t)(uint16_t)samples[i + 1] << 16);
+            h = (h ^ v) * 16777619u;
+            nonzero |= v != 0;
+            if (++frames == BLOCK) {
+                uint32_t mine = nonzero ? (h | 1u) : 0;
+                if (blocks >= LAG && mine && ring[(blocks - LAG) % RING] == mine)
+                    run++;
+                else
+                    run = 0;
+                ring[blocks % RING] = mine;
+                blocks++;
+                frames = 0;
+                nonzero = 0;
+                h = 2166136261u;
+                if (run == 3 && !said) {
+                    extern void (*g_xbox_snapshot_hook)(const char *why);
+                    said = 1;
+                    fprintf(stderr, "  [AUDIO] the output repeats itself 4 s back"
+                            " (a stream voice replaying stale data) at %.1f s\n",
+                            blocks / 10.0);
+                    fflush(stderr);
+                    if (g_xbox_snapshot_hook)
+                        g_xbox_snapshot_hook("the output repeats 4 s back");
+                }
+            }
+        }
+    }
+
     /* RECOMP_AUDIO_METER=1: the output's peak and how often it was non-silent,
      * every ~5 s -- whether anything the title plays reaches the speakers,
      * on a machine nobody is listening to. */

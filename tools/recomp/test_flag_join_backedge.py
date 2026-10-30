@@ -25,8 +25,10 @@ until it left mapped memory, taking the process with it. Settling the flag
 state to a fixed point before emitting gives the jcc its comparison back.
 
 The second property matters as much: when the predecessors genuinely
-disagree, the fallback must stay. Inheriting the wrong flags is worse than
-inheriting none, because the branch then looks right and goes the wrong way.
+disagree, neither one's flags may be inherited. Inheriting the wrong flags is
+worse than inheriting none, because the branch then looks right and goes the
+wrong way. Such a join now has each edge evaluate the condition itself into a
+variable of the join (translator._edge_flag_plan) instead of the fallback.
 """
 
 import os

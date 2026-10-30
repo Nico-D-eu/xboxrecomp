@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>   /* ptrdiff_t */
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -196,4 +197,21 @@ void recomp_unimpl(const char *text, uint32_t va)
         fflush(stderr);
     }
     if (stop) abort();
+}
+
+/* ── Guessed sites reached ───────────────────────────────────────────────
+ *
+ * With RECOMP_COVERAGE defined for the build (CMake:
+ * add_compile_definitions(RECOMP_COVERAGE)), every unresolved-call stub and
+ * every `_flags` fallback condition calls this the first time it runs; see
+ * RECOMP_REACHED in recomp_types.h. Each line names a site whose generated
+ * code is a guess and that a real run depends on: a stub means a missed
+ * function (seed it), a flags site a condition the lifter could not trace. */
+void recomp_reached(int kind, uint32_t va)
+{
+    /* 1 = RECOMP_REACHED_STUB, 2 = RECOMP_REACHED_FLAGS (recomp_types.h,
+     * which this file does not include). */
+    fprintf(stderr, "[REACHED] %s 0x%08X\n",
+            kind == 1 ? "unresolved-stub" : "flags-fallback", va);
+    fflush(stderr);
 }

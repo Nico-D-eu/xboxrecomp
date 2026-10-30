@@ -1185,3 +1185,4 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
     }
     LeaveCriticalSection(&g_mixer_cs);
 }
+

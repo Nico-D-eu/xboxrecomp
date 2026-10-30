@@ -398,6 +398,12 @@ void xbox_kernel_init(void)
     uint32_t thunk_base = 0;
     uint32_t thunk_count = 0;
 
+    /* The thread that owns the main TIB (kernel_hal.c, irql_publish). */
+    {
+        extern DWORD g_xbox_main_thread_id;
+        g_xbox_main_thread_id = GetCurrentThreadId();
+    }
+
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
     g_log_cs_init = TRUE;

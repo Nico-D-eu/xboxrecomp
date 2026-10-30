@@ -62,7 +62,7 @@ class FpuLifterTest(unittest.TestCase):
 
         self.assertEqual(
             Lifter().lift_instruction(instruction),
-            ["fp_top() = fp_top() / MEMF(0x123456); "
+            ["fp_top() = RECOMP_FP_PC(fp_top() / MEMF(0x123456)); "
              "/* fdiv dword ptr [0x00123456] */"],
         )
 
@@ -72,7 +72,7 @@ class FpuLifterTest(unittest.TestCase):
 
         self.assertEqual(
             Lifter().lift_instruction(instruction),
-            ["fp_top() = fp_top() * fp_st1(); /* fmul st(1) */"],
+            ["fp_top() = RECOMP_FP_PC(fp_top() * fp_st1()); /* fmul st(1) */"],
         )
 
     def test_translated_functions_share_runtime_fpu_state(self):

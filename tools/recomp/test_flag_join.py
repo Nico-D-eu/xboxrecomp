@@ -87,10 +87,14 @@ def test_zero_flag_join_across_registers():
 
 
 def test_zero_flag_join_does_not_answer_sign():
-    # same shape with js at the join: SF is not merged
+    # same shape with js at the join: SF is not merged into the marker (the
+    # join's js is evaluated on each edge instead; see
+    # test_marker_join_evaluates_what_it_cannot_answer_on_each_edge)
+    from tools.recomp.lifter import _make_condition
+    assert _make_condition('js', '__zf_from_fa', []) is None
     code = _translate(bytes.fromhex('85c97404' '85f6eb06' '81ce00000080'
                                     '7802' '31ff' 'c3'))
-    assert '_flags /* js' in code, code
+    assert '(_fa == 0)' not in code and '(_fa != 0)' not in code, code
 
 
 def test_sbb_signed_relations_use_the_exact_result():
@@ -108,3 +112,90 @@ def test_unreachable_padding_is_not_a_predecessor():
     code = _translate(bytes.fromhex('39cf' '7d06' '31c0' 'eb08' '8d36' '8d3f'
                                     '7502' '31ff' 'c3'))
     assert '_flags /* jne' not in code, code
+
+
+def translate(image):
+    config._install([config.Section('.text', BASE, len(image), 0, len(image), True)],
+                    entry_point=BASE, kernel_thunk_addr=BASE, origin='flag-join-test')
+    db = {BASE: {'start': hex(BASE), 'end': BASE + len(image), '_addr': BASE, 'size': len(image)}}
+    return FunctionTranslator(image, db).translate_function(BASE, db[BASE])
+
+
+def test_float_compares_with_swapped_operands_join():
+    # A clamp whose direction depends on a sign (T()NY, 0x001CE755):
+    # test cl,cl; jle alt; comiss xmm3,xmm0; jmp join;
+    # alt: comiss xmm0,xmm3; join: jbe skip; movaps xmm0,xmm3; skip: ret
+    code = translate(bytes.fromhex('84c97e050f2fd8eb030f2fc376030f28c3c3'))
+    assert 'if ((_fca <= _fcb || (_fca != _fca || _fcb != _fcb)))' in code, code
+    assert 'if (_flags' not in code, code
+
+
+def test_fcomi_family_joins():
+    # fld st0; fcomip st1 on one edge, fucomip st1 on the other, then ja.
+    # test cl,cl; jle alt; fcomip st(1); jmp join; alt: fucomip st(1); join: ja skip; nop; skip: ret
+    code = translate(bytes.fromhex('84c97e04dff1eb02dfe97701' + '90c3'))
+    assert 'if ((!(_fa & 1u) && !(_fa & 0x40u)) /* fucompi */)' in code, code
+    assert 'if (_flags' not in code, code
+
+
+def test_float_and_integer_compares_are_not_merged():
+    a = Operand(type='reg', reg='eax')
+    b = Operand(type='reg', reg='edx')
+    x = Operand(type='reg', reg='xmm0')
+    y = Operand(type='reg', reg='xmm1')
+    assert _merge_flag_states([('comiss', [x, y]), ('cmp', [a, b])]) is None
+    assert _merge_flag_states([('comiss', [x, y]), ('fcomip', [])]) is None
+
+
+def test_mixed_setters_evaluate_the_join_on_each_edge():
+    # test ecx,ecx; jz alt; sub eax,1; jmp join; alt: cmp eax,1;
+    # join: jne out; nop; out: ret
+    # A result snapshot (sub) meets a compare snapshot (cmp): the states do
+    # not merge, and the join used to read the never-assigned _flags.
+    # (With `test eax,eax` on the alt edge both leave ZF's value in _fa,
+    # and the join merges to `_fa != 0` instead: test_zero_flag_join_*.)
+    code = translate(bytes.fromhex('85c97405' '83e801' 'eb03' '83f801' '7501' '90' 'c3'))
+    assert 'if (_jf_0001000C /* jne' in code, code
+    assert 'if (_flags' not in code, code
+    # the sub edge sets it before its jmp, the cmp edge before falling in
+    assert ('_jf_0001000C = ((_fa != 0)) ? 1 : 0; /* flags of this edge */\n'
+            '    goto loc_0001000C;') in code, code
+    tail = code.index('_jf_0001000C = (CMP_NE(_fa, _fb)) ? 1 : 0; /* flags of this edge */')
+    assert code.index('loc_00010009:') < tail < code.index('loc_0001000C:'), code
+    assert 'int _jf_0001000C = 0;' in code, code
+
+
+def test_mixed_zero_flag_setters_merge_at_the_join():
+    # The same shape with `test eax,eax` on the alt edge: sub and test both
+    # leave the value ZF tests in _fa, so the join answers jne itself.
+    code = translate(bytes.fromhex('85c9740583e801eb0285c0750190c3'))
+    assert 'if ((_fa != 0)' in code, code
+    assert '_jf_' not in code and 'if (_flags' not in code, code
+
+
+def test_edges_read_snapshots_across_a_move_at_the_join():
+    # neg eax on one edge, cmp ebx,1 on the other, then the join moves eax
+    # before its je. Both edges read their snapshot, not eax.
+    # test ecx,ecx; jz alt; neg eax; jmp join; alt: cmp ebx,1;
+    # join: mov eax,1; je out; nop; out: ret
+    code = translate(bytes.fromhex('85c97404' 'f7d8' 'eb03' '83fb01'
+                                   'b801000000' '7401' '90' 'c3'))
+    assert code.count('_jf_0001000B = ((_fa == 0)) ? 1 : 0;') == 1, code
+    assert code.count('_jf_0001000B = (CMP_EQ(_fa, _fb)) ? 1 : 0;') == 1, code
+    assert 'if (_jf_0001000B /* je' in code, code
+
+
+def test_marker_join_evaluates_what_it_cannot_answer_on_each_edge():
+    # D3D 0x0031E1E0 shape with js at the join: test esi,esi and
+    # or esi,80000000h merge to ZF-from-_fa, which has no SF. The edges have.
+    code = translate(bytes.fromhex('85c97404' '85f6eb06' '81ce00000080'
+                                   '7802' '31ff' 'c3'))
+    assert 'if (_jf_0001000E /* js' in code, code
+    assert 'if (_flags' not in code, code
+    assert 'RECOMP_REACHED' not in code, code
+
+
+def test_a_join_with_an_unknown_predecessor_is_not_guessed():
+    from tools.recomp.translator import _edge_flag_plan
+    assert _edge_flag_plan(None, set(), {}) is None
+    assert _edge_flag_plan(None, {1, 2}, {1: ('cmp', []), 2: None}) is None

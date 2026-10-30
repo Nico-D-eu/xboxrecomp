@@ -12,16 +12,21 @@
  */
 
 #include "kernel.h"
+#include "kernel_missing.h"
+#include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include "platform/host_time.h"
 #if defined(_WIN32)
 #include <intrin.h>
+#endif
 
 /* Called before the process exits by a path that skips atexit (ExitProcess,
  * _exit): the host sets it when its logs are buffered, so the last lines --
- * usually the ones that matter -- reach the file. */
+ * usually the ones that matter -- reach the file. (Defined on every host now:
+ * the exit paths below call it, and upstream builds POSIX hosts too.) */
 void (*g_xbox_flush_logs)(void);
-#endif
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma intrinsic(_ReturnAddress)
 #define IRQL_CALLER() _ReturnAddress()
@@ -43,6 +48,71 @@ void (*g_xbox_flush_logs)(void);
  * ============================================================================ */
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
+
+/* The current IRQL, where guest code reads it: KPCR.Irql, fs:[0x24].
+ *
+ * The XDK does not always ask the kernel. DirectSound's lock
+ * (sub_002F4175 in Burnout 3) reads fs:[0x24] directly and skips its
+ * critical section at raised IRQL, because a DPC must never block. Nothing
+ * wrote that byte, so it read 0 everywhere: DirectSound's DPC took the
+ * critical section, blocked against the thread that held it, and the title
+ * froze with IRQL raised on the blocked thread. Every change of
+ * g_current_irql is published here. */
+extern RECOMP_TLS uint32_t g_fs_base;
+/* The offset lifted code adds to every guest address; host code that reads
+ * guest memory on its behalf uses the same one. */
+extern ptrdiff_t g_xbox_mem_offset;
+
+/* Set by the lower that gave the one-CPU gate back (irql_track_gated): the
+ * release point runs once the new level is written, below. */
+static XBOX_THREAD_LOCAL int t_release_due;
+static void irql_release_due(void);
+
+/* The thread that owns XBOX_TIB_MAIN: the one that ran xbox_kernel_init and
+ * goes on to run the title's entry point (set in kernel_thunks.c).
+ *
+ * Every guest thread has a TIB of its own (bridge_thread_main, the timer
+ * thread), but a device-model thread -- the OHCI and APU models delivering an
+ * ISR at device IRQL -- never asked for one: its g_fs_base is still the
+ * thread-local default, XBOX_TIB_MAIN, the main thread's. Publishing there
+ * wrote the ISR's level into the MAIN thread's KPCR.Irql while it ran
+ * unraised, so for that moment it read as being at DIRQL: DirectSound's lock
+ * on it skipped its critical section (see above) and raced the thread that
+ * held it. Amped 2 after the v0.16 merge: XACT corrupting its state
+ * (sub_003153FE writing through -1), deadlocks in ML1, and KeBugCheck 0xA.
+ * Only the owner of a KPCR writes its IRQL. */
+DWORD g_xbox_main_thread_id;
+
+/* And only under the one-CPU gate (RECOMP_DISPATCH_GATE), by default.
+ *
+ * What DirectSound does with the byte -- skip its critical section at raised
+ * IRQL -- is only safe if a thread at DISPATCH really has the processor to
+ * itself, as on the console, and as the gate makes it here. Without the gate
+ * (Amped 2's default: guest threads run in parallel, and a raised thread
+ * holds the dispatch lock, which keeps out DPCs and other raised threads but
+ * not passive ones) the raised thread skipped the lock while a passive
+ * thread was inside it. Amped 2 after the v0.16 merge: music stopping after
+ * ~30 s in a level, crackle, freezes, and crashes in DirectSound
+ * (sub_00296B62) and XACT (sub_00028A90). Nothing was published before the
+ * merge, and that played for hours. RECOMP_IRQL_PUBLISH=1 publishes without
+ * the gate, =0 never. */
+int xbox_DispatchGateOn(void);
+
+static void irql_publish(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_IRQL_PUBLISH");
+        on = (e && *e) ? *e != '0' : xbox_DispatchGateOn();
+    }
+    if (on && g_fs_base
+            && (g_fs_base != XBOX_TIB_MAIN
+                || GetCurrentThreadId() == g_xbox_main_thread_id))
+        *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base
+                              + 0x24) = (uint8_t)g_current_irql;
+    if (t_release_due)
+        irql_release_due();
+}
 
 /* How many threads are holding IRQL at or above DISPATCH_LEVEL.
  *
@@ -101,8 +171,14 @@ int xbox_IrqlTransitions(void)
  * name: these are host addresses inside the recompiled image, so nm resolves
  * them to the generated function, which is the guest function. */
 #define IRQL_HOLDERS 8
-static struct { volatile LONG tid; void *ra; uint32_t guest; } s_holders[IRQL_HOLDERS];
+static struct {
+    volatile LONG tid;
+    void *ra;
+    uint32_t guest;                 /* the guest caller of the kernel call */
+    uint32_t guest_ra, guest_esp;   /* the host ra only ever names the bridge */
+} s_holders[IRQL_HOLDERS];
 extern XBOX_THREAD_LOCAL uint32_t g_xbox_kernel_caller;   /* kernel_bridge.c (RECOMP_TLS) */
+extern RECOMP_TLS uint32_t g_esp;
 
 static void irql_holder_add(void *ra)
 {
@@ -113,6 +189,9 @@ static void irql_holder_add(void *ra)
         if (InterlockedCompareExchange(&s_holders[i].tid, me, 0) == 0) {
             s_holders[i].ra = ra;
             s_holders[i].guest = g_xbox_kernel_caller;
+            s_holders[i].guest_esp = g_esp;
+            s_holders[i].guest_ra = g_esp
+                ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
             return;
         }
 }
@@ -136,8 +215,10 @@ void xbox_IrqlDumpHolders(void)
     for (i = 0; i < IRQL_HOLDERS; i++) {
         LONG t = InterlockedCompareExchange(&s_holders[i].tid, 0, 0);
         if (t)
-            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p\n",
-                    (unsigned long)t, s_holders[i].ra);
+            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p, "
+                    "guest ret %08X (esp %08X)\n",
+                    (unsigned long)t, s_holders[i].ra,
+                    s_holders[i].guest_ra, s_holders[i].guest_esp);
     }
     fflush(stderr);
 }
@@ -185,6 +266,15 @@ volatile long g_disp_health_timeouts;
  * lock across a whole DPC pass gave (see dispatch_lock_level). */
 static volatile LONG s_disp_dpc;
 #define XBOX_DPC_HOLD_WAIT_MS 20u
+/* A title's way to see a stall from the inside: called by the raise that
+ * gives up on the lock, for the first three, with the holder still holding
+ * it -- so a snapshot of every thread (Amped 2's main.c) shows what the
+ * holder is stuck on. A give-up is rare in a healthy run. 0 = none. */
+void (*g_xbox_stall_hook)(unsigned long owner_tid, unsigned long waiter_tid,
+                          unsigned long long held_ms);
+/* The same snapshot for a stall seen elsewhere (the APU output's stale-loop
+ * check), with a line saying why. 0 = none. */
+void (*g_xbox_snapshot_hook)(const char *why);
 
 int xbox_DispatchLockAcquire(unsigned timeout_ms)
 {
@@ -236,6 +326,9 @@ int xbox_DispatchLockAcquire(unsigned timeout_ms)
                         " without it\n", (long)owner, s_disp_dpc ? " (a DPC)" : "",
                         GetTickCount64() - t0, guest, (long)me, g_xbox_kernel_caller);
                 fflush(stderr);
+                if (g_xbox_stall_hook && s_disp_timeouts <= 3)
+                    g_xbox_stall_hook((unsigned long)owner, (unsigned long)me,
+                                      GetTickCount64() - t0);
             }
             return 0;
         }
@@ -309,13 +402,18 @@ void xbox_DispatchLockRelease(void)
  * lock for a whole DPC pass, ran into something only a thread queued on the
  * lock could provide, and the two waited each other out to the 250 ms
  * timeout ("held by tid ... raised from exe+0x0" is the timer thread). At 1,
- * a DPC takes it only where its own code raises, as on the console. */
+ * a DPC takes it only where its own code raises, as on the console.
+ *
+ * Upstream's one-CPU gate (RECOMP_DISPATCH_GATE=1, below) is the same
+ * exclusion built another way. With the gate on, this lock defaults to 0 so
+ * the two never nest in opposite orders; RECOMP_DISPATCH_LOCK set explicitly
+ * still wins (untested together). */
 static int dispatch_lock_level(void)
 {
     static int lvl = -1;
     if (lvl < 0) {
         const char *e = getenv("RECOMP_DISPATCH_LOCK");
-        lvl = e && *e ? atoi(e) : 1;
+        lvl = e && *e ? atoi(e) : (xbox_DispatchGateOn() ? 0 : 1);
     }
     return lvl;
 }
@@ -363,17 +461,692 @@ int xbox_DispatchLockEnabled(void)
     return dispatch_lock_level();
 }
 
-static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+/* Whether this thread is in g_irql_raised_count. The count moves on this
+ * flag, not on the edge alone, so a thread can never be counted twice or
+ * taken off a count it was never on. */
+static XBOX_THREAD_LOCAL int t_irql_counted;
+
+/* The single-processor DISPATCH_LEVEL guarantee: while one thread (or a DPC)
+ * is at DISPATCH_LEVEL or above, no other thread and no DPC runs on the
+ * console's one CPU. Titles build their locks on that. DirectSound's lock
+ * takes a critical section at PASSIVE_LEVEL and then raises, and its DPC
+ * skips the critical section because it is at
+ * DISPATCH_LEVEL: the raise is what keeps the DPC out of the voice lists a
+ * thread is editing, and keeps a thread out while the DPC walks them.
+ *
+ * Here threads run in parallel and the level is only a number, so the DPC
+ * (on the timer thread) walked a voice list a thread was relinking, found a
+ * node pointing back into the list, and looped there forever at DISPATCH:
+ * the IRQL depth stuck at one, every APU interrupt sat out the hold-off, the
+ * front end stayed trapped and a level load never finished (Proton, about
+ * 1 run in 20 once the title's stream threads woke on every vblank).
+ *
+ * So the transition to DISPATCH_LEVEL takes one process-wide gate and the
+ * transition back releases it: thread raises and DPCs are serialized, as on
+ * the console. Device interrupt service routines are delivered holding it
+ * when it is free and run by its holder when it is not (xbox_IrqPost), never
+ * beside the holder: on hardware they preempt DISPATCH-level code, which
+ * stays frozen until they return.
+ * Recursive, so a thread already through it (a DPC that raises again) never
+ * waits on itself.
+ *
+ * Opt-in: RECOMP_DISPATCH_GATE=1. It changes when DPCs and device interrupts
+ * run, which is a scheduling change for every title, and one B3 run in a
+ * few stalled at its first movie with it. Off, the gate is not there: an
+ * entry is free, raises take nothing, the timer thread runs DPCs and timer
+ * routines as it always did, and the device models hold their interrupts
+ * off on the raised-IRQL count (xbox_IrqlBlocksInterrupts). */
+static int s_gate_on;                          /* RECOMP_DISPATCH_GATE */
+static void irq_config_once(void);
+
+int xbox_DispatchGateOn(void)
 {
-    int was = (old_level >= DISPATCH_LEVEL);
+    irq_config_once();
+    return s_gate_on;
+}
+
+static CRITICAL_SECTION s_dispatch_gate;
+static INIT_ONCE s_dispatch_gate_once = INIT_ONCE_STATIC_INIT;
+static XBOX_THREAD_LOCAL int t_dispatch_gate_held;
+/* Every entry this thread has made into the gate, whoever made it: a raise,
+ * a DPC drain, KeSynchronizeExecution, a device model's delivery. Non-zero
+ * means this thread is the holder, which is what a safe point asks before it
+ * runs a posted interrupt (see xbox_IrqPost). */
+static XBOX_THREAD_LOCAL int t_gate_depth;
+static volatile LONG s_gate_owner;
+
+static BOOL CALLBACK dispatch_gate_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&s_dispatch_gate);
+    return TRUE;
+}
+
+static void dispatch_gate_once(void)
+{
+    InitOnceExecuteOnce(&s_dispatch_gate_once, dispatch_gate_init, NULL, NULL);
+}
+
+static void gate_entered(void)
+{
+    if (t_gate_depth++ == 0)
+        InterlockedExchange(&s_gate_owner, (LONG)GetCurrentThreadId());
+}
+
+static int gate_try(void)
+{
+    dispatch_gate_once();
+    if (!TryEnterCriticalSection(&s_dispatch_gate))
+        return 0;
+    gate_entered();
+    return 1;
+}
+
+static void gate_enter(void)
+{
+    dispatch_gate_once();
+    EnterCriticalSection(&s_dispatch_gate);
+    gate_entered();
+}
+
+static void gate_leave_raw(void)
+{
+    if (--t_gate_depth == 0)
+        InterlockedExchange(&s_gate_owner, 0);
+    LeaveCriticalSection(&s_dispatch_gate);
+}
+
+unsigned long xbox_DispatchGateOwner(void)
+{
+    return (unsigned long)InterlockedCompareExchange(&s_gate_owner, 0, 0);
+}
+
+/* For device models delivering an ISR, and KeSynchronizeExecution. On the
+ * console an ISR runs with the one CPU to itself: the code it interrupted is
+ * frozen. DirectSound counts on that: its DPC raises a counter around each
+ * voice callback and the ISR leaves the voice lists alone while it is set,
+ * a check-then-act that is only safe when the two never run at once. So an
+ * ISR is delivered holding the gate when it is free, and posted to the
+ * holder when it is not (xbox_IrqPost). With the gate off these succeed
+ * and take nothing, so their callers run as they did before it. */
+int xbox_DispatchGateTryEnter(void)
+{
+    if (!xbox_DispatchGateOn())
+        return 1;
+    return gate_try();
+}
+
+void xbox_DispatchGateEnter(void)
+{
+    if (xbox_DispatchGateOn())
+        gate_enter();
+}
+
+static void irq_release_point(void);
+
+/* The release is a safe point: what was posted while this thread held the
+ * gate runs here, before anyone else can take it. */
+void xbox_DispatchGateLeave(void)
+{
+    if (!xbox_DispatchGateOn())
+        return;
+    xbox_IrqSafePoint();
+    gate_leave_raw();
+    if (t_gate_depth == 0)
+        irq_release_point();
+}
+
+/* ============================================================================
+ * Device interrupts on the gate holder
+ *
+ * On the console an interrupt runs on the one CPU between two instructions
+ * of whatever it interrupted, and that code is frozen until it returns. The
+ * device models here run on their own host threads, so an interrupt that
+ * found the gate held used to be held off for a while (the APU 50 frames,
+ * OHCI 500 polls) and then run anyway, beside the holder; the vblank never
+ * waited at all. DSOUND's interrupt appends a voice to the list its DPC is
+ * draining, with no linked check: run beside the DPC it inserted one node
+ * twice, the node pointed at itself, and the DPC looped on it forever (a
+ * results screen that never came back).
+ *
+ * So a busy gate makes the model post the line instead, and the holder runs
+ * the routine on its own thread at its next safe point: a kernel call, or
+ * the gate's release before it is let go. Those are where guest code
+ * already calls into the host, outside any guest read-modify-write. A
+ * serviced MMIO trap is not one: it runs inside a signal handler (POSIX) or
+ * a vectored handler (Windows). A guest loop at DISPATCH that polls memory
+ * for the interrupt's effect without a kernel call never reaches one; the
+ * wait log below names its holder.
+ * ============================================================================ */
+
+/* A bit per XBOX_IRQ_* line. */
+static volatile LONG s_irq_pending;
+static void (*volatile s_irq_run[XBOX_IRQ_LINES])(void);
+static uint64_t s_irq_post_ns[XBOX_IRQ_LINES]; /* when the bit went up */
+static XBOX_THREAD_LOCAL int t_in_isr;
+static void (*s_irq_post_hook)(int line);
+static void (*s_irq_release_hook)(void);   /* tests: the lower's window */
+static int s_irq_mode;          /* RECOMP_IRQ_SAFE_POINTS, under the gate */
+static int s_irq_force;
+static int s_dpc_on;            /* RECOMP_DPC_ON_RAISE, under the gate */
+/* A thread that runs guest code (guest-main, a spawned worker): the only
+ * kind that drains queued DPCs at its raise and release (dpc_run_here). */
+static XBOX_THREAD_LOCAL int t_guest_thread;
+static XBOX_THREAD_LOCAL int t_in_dpc;
+static uint64_t s_irq_wait_ns;
+static const char *const s_irq_names[XBOX_IRQ_LINES] = { "vblank", "apu", "ohci" };
+
+static struct {
+    volatile LONG posted[XBOX_IRQ_LINES], on_holder[XBOX_IRQ_LINES],
+                  second_try[XBOX_IRQ_LINES], forced[XBOX_IRQ_LINES],
+                  ungated[XBOX_IRQ_LINES],
+                  max_wait_us[XBOX_IRQ_LINES], wait_logs, refused;
+} s_irq;
+/* Safe points the holder reached with something pending but could not run
+ * it at (inside an ISR, above DISPATCH_LEVEL, no worker stack): the "kernel
+ * calls" in the wait log. */
+static volatile LONG s_irq_points_refused;
+static uint64_t s_irq_last_log_ns;
+
+/* RECOMP_DISPATCH_GATE turns the gate on, and with it the two things that
+ * need a holder: interrupts posted to it and run at its safe points
+ * (RECOMP_IRQ_SAFE_POINTS=0 turns that off again), and queued DPCs drained
+ * on the guest thread at its raise and release (RECOMP_DPC_ON_RAISE=0 leaves
+ * them to the timer thread). Without the gate both are off whatever they
+ * say: a post has nobody to run it, and a drain at a raise is only atomic
+ * against the timer thread's because the gate orders the two. */
+static void irq_config(void)
+{
+    const char *v;
+
+    v = getenv("RECOMP_DISPATCH_GATE");
+    s_gate_on = (v && *v) ? atoi(v) != 0 : 0;
+    v = getenv("RECOMP_IRQ_SAFE_POINTS");
+    s_irq_mode = s_gate_on && ((v && *v) ? atoi(v) != 0 : 1);
+    v = getenv("RECOMP_IRQ_SAFE_FORCE");
+    s_irq_force = (v && *v && *v != '0');
+    v = getenv("RECOMP_IRQ_SAFE_MS");
+    s_irq_wait_ns = (uint64_t)((v && *v) ? strtoul(v, NULL, 0) : 250u)
+                    * 1000000ull;
+    v = getenv("RECOMP_DPC_ON_RAISE");
+    s_dpc_on = s_gate_on && ((v && *v) ? atoi(v) != 0 : 1);
+    if (s_gate_on) {
+        fprintf(stderr, "  [IRQ] one-CPU DISPATCH gate on (RECOMP_DISPATCH_GATE),"
+                " DPCs on raise %s\n", s_dpc_on ? "on" : "off");
+        fflush(stderr);
+    }
+    if (s_gate_on && (!s_irq_mode || s_irq_force)) {
+        fprintf(stderr, "  [IRQ] safe points %s%s\n",
+                s_irq_mode ? "on" : "off (RECOMP_IRQ_SAFE_POINTS=0: interrupts "
+                                    "run beside the gate holder after a "
+                                    "hold-off)",
+                s_irq_force ? ", RECOMP_IRQ_SAFE_FORCE=1: delivered beside the "
+                              "holder past RECOMP_IRQ_SAFE_MS" : "");
+        fflush(stderr);
+    }
+}
+
+/* Read once, by whichever thread asks first: the device models' threads,
+ * the timer thread and the title's ask at once at boot, and a plain lazy
+ * init let one of them see the gate on with safe points still unset. The
+ * INIT_ONCE completes with a release, and every check below goes through
+ * it (one acquire load once done). */
+static INIT_ONCE s_irq_config_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK irq_config_run(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    irq_config();
+    return TRUE;
+}
+
+static void irq_config_once(void)
+{
+    InitOnceExecuteOnce(&s_irq_config_once, irq_config_run, NULL, NULL);
+}
+
+/* Tests only, single-threaded: the environment changed under them. */
+void xbox_IrqReloadConfig(void)
+{
+    irq_config_once();
+    irq_config();
+}
+
+int xbox_IrqSafePointsOn(void)
+{
+    irq_config_once();
+    return s_irq_mode;
+}
+
+int xbox_DpcOnRaise(void)
+{
+    irq_config_once();
+    return s_dpc_on;
+}
+
+void xbox_DpcMarkGuestThread(void)
+{
+    t_guest_thread = 1;
+}
+
+void xbox_IrqSetHandler(int line, void (*run)(void))
+{
+    if (line >= 0 && line < XBOX_IRQ_LINES)
+        s_irq_run[line] = run;
+}
+
+void xbox_IrqSetPostHook(void (*hook)(int line))
+{
+    s_irq_post_hook = hook;
+}
+
+void xbox_IrqSetReleaseHook(void (*hook)(void))
+{
+    s_irq_release_hook = hook;
+}
+
+static void irq_note_wait(int line, uint64_t posted_ns)
+{
+    long us = (long)((xbox_HostNowNs() - posted_ns) / 1000u);
+    LONG cur;
+
+    while (us > (cur = s_irq.max_wait_us[line]))
+        if (InterlockedCompareExchange(&s_irq.max_wait_us[line], us, cur) == cur)
+            break;
+}
+
+/* The holder's recompiled register state. A safe point at a thunk sits
+ * before the bridge reads its arguments, so everything the generated code
+ * keeps in these across a call is put back. g_fs_base stays: the
+ * routine runs on the holder's TIB, as on the console's one CPU (a device
+ * model's thread as holder: see irq_release_point). */
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp;
+extern RECOMP_TLS uint32_t g_seh_ebp, g_eflags;
+extern RECOMP_TLS int g_df, g_fp_top, g_fp_cmp;
+extern RECOMP_TLS double g_fp_stack[8];
+extern RECOMP_TLS uint16_t g_fp_control_word, g_fp_cc;
+extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
+extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
+extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
+
+typedef struct {
+    uint32_t eax, ecx, edx, ebx, esi, edi, ebp, esp, seh_ebp, eflags;
+    int df, fp_top, fp_cmp;
+    double fp[8];
+    uint16_t fp_cw, fp_cc;
+    RecompXmm xmm[8];
+    RecompMmx mm[8];
+} IrqRegs;
+
+static void irq_regs_save(IrqRegs *r)
+{
+    r->eax = g_eax; r->ecx = g_ecx; r->edx = g_edx; r->ebx = g_ebx;
+    r->esi = g_esi; r->edi = g_edi; r->ebp = g_ebp; r->esp = g_esp;
+    r->seh_ebp = g_seh_ebp; r->eflags = g_eflags; r->df = g_df;
+    r->fp_top = g_fp_top; r->fp_cmp = g_fp_cmp;
+    memcpy(r->fp, g_fp_stack, sizeof r->fp);
+    r->fp_cw = g_fp_control_word; r->fp_cc = g_fp_cc;
+    r->xmm[0] = g_xmm0; r->xmm[1] = g_xmm1; r->xmm[2] = g_xmm2; r->xmm[3] = g_xmm3;
+    r->xmm[4] = g_xmm4; r->xmm[5] = g_xmm5; r->xmm[6] = g_xmm6; r->xmm[7] = g_xmm7;
+    r->mm[0] = g_mm0; r->mm[1] = g_mm1; r->mm[2] = g_mm2; r->mm[3] = g_mm3;
+    r->mm[4] = g_mm4; r->mm[5] = g_mm5; r->mm[6] = g_mm6; r->mm[7] = g_mm7;
+}
+
+static void irq_regs_restore(const IrqRegs *r)
+{
+    g_eax = r->eax; g_ecx = r->ecx; g_edx = r->edx; g_ebx = r->ebx;
+    g_esi = r->esi; g_edi = r->edi; g_ebp = r->ebp; g_esp = r->esp;
+    g_seh_ebp = r->seh_ebp; g_eflags = r->eflags; g_df = r->df;
+    g_fp_top = r->fp_top; g_fp_cmp = r->fp_cmp;
+    memcpy(g_fp_stack, r->fp, sizeof r->fp);
+    g_fp_control_word = r->fp_cw; g_fp_cc = r->fp_cc;
+    g_xmm0 = r->xmm[0]; g_xmm1 = r->xmm[1]; g_xmm2 = r->xmm[2]; g_xmm3 = r->xmm[3];
+    g_xmm4 = r->xmm[4]; g_xmm5 = r->xmm[5]; g_xmm6 = r->xmm[6]; g_xmm7 = r->xmm[7];
+    g_mm0 = r->mm[0]; g_mm1 = r->mm[1]; g_mm2 = r->mm[2]; g_mm3 = r->mm[3];
+    g_mm4 = r->mm[4]; g_mm5 = r->mm[5]; g_mm6 = r->mm[6]; g_mm7 = r->mm[7];
+}
+
+/* Queued DPCs, run on the guest thread that owns "the processor at
+ * DISPATCH". On the console a DPC queued by an ISR runs when the processor
+ * drops below DISPATCH, before the interrupted thread resumes. DirectSound
+ * counts on that: its ISR appends an idle voice to the list its DPC drains
+ * with no linked check, since the title cannot Play that voice again before
+ * the DPC has run. Here the queue used to wait for the timer thread's next
+ * pass (up to 10 ms, longer while a title thread was at DISPATCH); the title
+ * re-Played the voice in that window, the APU re-trapped the same handle,
+ * the second insert left the node pointing at itself and the DPC looped on
+ * it forever (a title hung on a level transition, reproducibly). So a
+ * guest thread drains at its raise to DISPATCH, before its
+ * critical region, and at its release point. Registers come back as after
+ * a posted routine: the raise's bridge has read its argument and writes its
+ * result afterwards. Never inside a posted ISR (the exit path drains) or
+ * inside another drain (a routine's own raises); never on a device-model
+ * thread, whose DSOUND DPC could wait on that very thread (a trapped
+ * front-end method cleared by the APU frame thread). */
+static void dpc_run_here(void)
+{
+    IrqRegs saved;
+
+    if (!xbox_DpcPending() || !t_guest_thread || t_in_dpc || t_in_isr)
+        return;
+    if (!xbox_DpcOnRaise())
+        return;
+    irq_regs_save(&saved);
+    t_in_dpc = 1;
+    /* The routines run without the guest CPU (RECOMP_GUEST_LOCK), as on the
+     * timer thread: a DPC never takes it. This drain runs under the gate,
+     * and taking the CPU here could wait on a holder polling memory for
+     * this very DPC's result, while the timer thread's own drain waits for
+     * the gate: a cycle. The one-CPU gate is
+     * what a DPC's body is atomic against; passive code on another thread
+     * may see its intermediate state, as it may on the timer thread. */
+    xbox_DpcDrainHere();
+    t_in_dpc = 0;
+    irq_regs_restore(&saved);
+}
+
+/* Run one posted line here, on the holder. 0 when no worker stack was free
+ * (the caller puts the bit back). */
+static int irq_run_line(int line)
+{
+    void (*run)(void) = s_irq_run[line];
+    IrqRegs saved;
+    int slot, irql;
+
+    if (!run)
+        return 1;                       /* nothing to run it with: dropped */
+    slot = xbox_worker_stack_alloc();
+    if (slot < 0) {
+        static volatile LONG said;
+        if (!InterlockedExchange(&said, 1)) {
+            fprintf(stderr, "  [IRQ] no worker stack for the %s interrupt on "
+                    "the holder; it stays pending\n", s_irq_names[line]);
+            fflush(stderr);
+        }
+        return 0;
+    }
+    irq_note_wait(line, s_irq_post_ns[line]);
+    irq_regs_save(&saved);
+    g_esp = XBOX_WORKER_STACK_TOP(slot);
+    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
+    t_in_isr = 1;
+    irql = xbox_IrqlEnterInterrupt(16);
+    run();
+    xbox_IrqlLeaveInterrupt(irql);
+    t_in_isr = 0;
+    irq_regs_restore(&saved);
+    xbox_worker_stack_free(slot);
+    InterlockedIncrement(&s_irq.on_holder[line]);
+    return 1;
+}
+
+static void irq_run_pending(void)
+{
+    LONG p;
+
+    /* What is posted while a routine runs is run when it returns, here. */
+    while ((p = InterlockedExchange(&s_irq_pending, 0)) != 0) {
+        int line;
+        for (line = 0; line < XBOX_IRQ_LINES; line++) {
+            if (!(p & (1L << line)))
+                continue;
+            p &= ~(1L << line);
+            if (!irq_run_line(line)) {
+                InterlockedOr(&s_irq_pending, p | (1L << line));
+                InterlockedIncrement(&s_irq_points_refused);
+                return;
+            }
+        }
+    }
+}
+
+/* One relaxed load when nothing is pending, which is nearly always. Runs
+ * only on the gate holder, below the device level and outside a routine it
+ * is already running: a CPU at device IRQL takes no interrupt, and a
+ * routine's own kernel calls do not nest another. */
+void xbox_IrqSafePoint(void)
+{
+    if (!s_irq_pending)
+        return;
+    if (!t_gate_depth)
+        return;
+    if (t_in_isr || g_current_irql > DISPATCH_LEVEL) {
+        InterlockedIncrement(&s_irq_points_refused);
+        return;
+    }
+    irq_run_pending();
+}
+
+/* After a full release: a post that landed between the release's safe point
+ * and the leave saw the gate held, and its poster's second try may have come
+ * before the leave too. Take the gate back and run it. Once, so a line that
+ * cannot run (no worker stack) does not spin here.
+ *
+ * The releasing thread can be a device model's (the APU frame thread or the
+ * OHCI controller thread, after a gated delivery of their own), and then
+ * the routine runs on that thread's TIB. That is no different from the
+ * models' own deliveries, which have always run ISRs on a TIB of the
+ * delivering thread (xbox_AllocThreadTib), and from the vblank on the timer
+ * thread: an ISR here never had a guest-scheduled TIB, and no XDK ISR reads
+ * thread-local state. The holder rule is what matters, and this thread holds
+ * the gate while the routine runs. */
+static void irq_release_point(void)
+{
+    /* A full-barrier read, not a plain one: the leave just before is a
+     * release only, and on arm64 a plain load may be satisfied before the
+     * unlock is seen. A poster that tried the gate in that gap and found it
+     * held would then post a bit this check had already missed, and the
+     * line would wait for the next holder's safe point. */
+    LONG pending = InterlockedCompareExchange(&s_irq_pending, 0, 0);
+
+    if ((!pending && !(t_guest_thread && xbox_DpcPending()))
+        || t_in_isr || g_current_irql > DISPATCH_LEVEL)
+        return;
+    if (!gate_try())
+        return;                         /* the new holder has it now */
+    irq_run_pending();
+    /* What those routines queued, and what was queued while this thread
+     * held the gate: the ISR-exit path of a posted interrupt. */
+    dpc_run_here();
+    gate_leave_raw();
+}
+
+static void irql_release_due(void)
+{
+    t_release_due = 0;
+    irq_release_point();
+}
+
+/* The holder has reached no safe point for RECOMP_IRQ_SAFE_MS with something
+ * pending: name it, and again every second while it lasts. The interrupt
+ * waits; on hardware it would preempt the holder, but here that is the
+ * concurrent run this whole scheme exists to prevent. */
+static void irq_wait_check(uint64_t now)
+{
+    LONG p = s_irq_pending;
+    uint64_t oldest = 0;
+    unsigned long tid;
+    char names[64];
+    size_t used = 0;
+    int line, i;
+
+    if (!p)
+        return;
+    names[0] = 0;
+    for (line = 0; line < XBOX_IRQ_LINES; line++)
+        if (p & (1L << line)) {
+            if (!oldest || s_irq_post_ns[line] < oldest)
+                oldest = s_irq_post_ns[line];
+            used += (size_t)snprintf(names + used, sizeof names - used, "%s%s",
+                                     used ? "," : "", s_irq_names[line]);
+        }
+    if (!oldest || now - oldest < s_irq_wait_ns)
+        return;
+    if (s_irq_last_log_ns >= oldest && now - s_irq_last_log_ns < 1000000000ull)
+        return;
+    s_irq_last_log_ns = now;
+    InterlockedIncrement(&s_irq.wait_logs);
+    tid = xbox_DispatchGateOwner();
+    fprintf(stderr, "  [IRQ] wait: %s pending %.0f ms; gate holder tid %lu"
+            " has reached no safe point (%ld refused)",
+            names, (double)(now - oldest) / 1e6, tid,
+            (long)s_irq_points_refused);
+    for (i = 0; i < IRQL_HOLDERS; i++)
+        if ((unsigned long)s_holders[i].tid == tid && tid)
+            fprintf(stderr, ", raised from host %p, guest ret %08X",
+                    s_holders[i].ra, s_holders[i].guest_ra);
+    fprintf(stderr, "%s\n", s_irq_force ? "; RECOMP_IRQ_SAFE_FORCE delivers it"
+                                        : "; a guest loop here makes no "
+                                          "kernel call");
+    fflush(stderr);
+}
+
+/* A device model's interrupt. With the gate free the caller delivers it
+ * holding the gate, as before. Held: the line is posted for the holder, and
+ * the gate tried once more, which closes the window where the holder
+ * released between the first try and the post with no safe point left to
+ * see the bit. A set bit coalesces repeats, as a latched line does. */
+int xbox_IrqPost(int line)
+{
+    LONG bit = 1L << line, was;
+    uint64_t now;
+
+    if (!xbox_DispatchGateOn())
+        return XBOX_IRQ_UNGATED;        /* no gate, nobody to post to */
+    if (gate_try())
+        goto gated;
+    if (!xbox_IrqSafePointsOn())
+        return XBOX_IRQ_UNGATED;
+    if (s_irq_post_hook)
+        s_irq_post_hook(line);
+    now = xbox_HostNowNs();
+    was = InterlockedOr(&s_irq_pending, bit);
+    if (!(was & bit)) {
+        s_irq_post_ns[line] = now;
+        InterlockedIncrement(&s_irq.posted[line]);
+    }
+    if (gate_try()) {
+        if (InterlockedAnd(&s_irq_pending, ~bit) & bit) {
+            InterlockedIncrement(&s_irq.second_try[line]);
+            irq_note_wait(line, s_irq_post_ns[line]);
+            return XBOX_IRQ_GATED;
+        }
+        xbox_DispatchGateLeave();       /* someone ran it in between */
+        return XBOX_IRQ_POSTED;
+    }
+    irq_wait_check(now);
+    if (s_irq_force && (was & bit) && now - s_irq_post_ns[line] >= s_irq_wait_ns
+        && (InterlockedAnd(&s_irq_pending, ~bit) & bit)) {
+        InterlockedIncrement(&s_irq.forced[line]);
+        return XBOX_IRQ_UNGATED;
+    }
+    return XBOX_IRQ_POSTED;
+
+gated:
+    /* A post of this line still pending is this delivery. */
+    if (xbox_IrqSafePointsOn() && (InterlockedAnd(&s_irq_pending, ~bit) & bit))
+        irq_note_wait(line, s_irq_post_ns[line]);
+    return XBOX_IRQ_GATED;
+}
+
+void xbox_IrqStatsGet(XboxIrqStats *out, int reset)
+{
+    int i;
+
+#define IRQ_TAKE(f) (reset ? InterlockedExchange(&(f), 0) : (f))
+    for (i = 0; i < XBOX_IRQ_LINES; i++) {
+        out->posted[i] = IRQ_TAKE(s_irq.posted[i]);
+        out->on_holder[i] = IRQ_TAKE(s_irq.on_holder[i]);
+        out->second_try[i] = IRQ_TAKE(s_irq.second_try[i]);
+        out->forced[i] = IRQ_TAKE(s_irq.forced[i]);
+        out->ungated[i] = IRQ_TAKE(s_irq.ungated[i]);
+        out->max_wait_us[i] = IRQ_TAKE(s_irq.max_wait_us[i]);
+    }
+    out->wait_logs = IRQ_TAKE(s_irq.wait_logs);
+    out->refused = IRQ_TAKE(s_irq_points_refused);
+#undef IRQ_TAKE
+}
+
+void xbox_IrqNoteUngated(int line)
+{
+    static volatile LONG said[XBOX_IRQ_LINES];
+    unsigned long tid = xbox_DispatchGateOwner();
+
+    if (!tid)
+        return;                         /* nobody to run beside */
+    InterlockedIncrement(&s_irq.ungated[line]);
+    if (InterlockedIncrement(&said[line]) <= 20) {
+        fprintf(stderr, "  [IRQ] %s ISR runs ungated beside gate holder"
+                " tid %lu (from tid %lu)\n", s_irq_names[line], tid,
+                (unsigned long)GetCurrentThreadId());
+        fflush(stderr);
+    }
+}
+
+void xbox_IrqReport(void)
+{
+    XboxIrqStats s;
+    long any = 0;
+    int i;
+
+    xbox_IrqStatsGet(&s, 1);
+    if (!xbox_IrqSafePointsOn()) {
+        if (s.ungated[0] | s.ungated[1] | s.ungated[2]) {
+            fprintf(stderr, "  [IRQ] ungated ISRs beside the gate holder"
+                    " vbl/apu/ohci %ld/%ld/%ld\n",
+                    s.ungated[0], s.ungated[1], s.ungated[2]);
+            fflush(stderr);
+        }
+        return;
+    }
+    for (i = 0; i < XBOX_IRQ_LINES; i++)
+        any |= s.posted[i] | s.on_holder[i] | s.forced[i] | s.ungated[i];
+    if (!any && !s.wait_logs)
+        return;
+    fprintf(stderr, "  [IRQ] posted vbl/apu/ohci %ld/%ld/%ld, run on holder"
+            " %ld/%ld/%ld, poster's retry %ld/%ld/%ld, forced %ld/%ld/%ld,"
+            " ungated %ld/%ld/%ld,"
+            " longest wait %.2f/%.2f/%.2f ms, wait logs %ld, refused %ld\n",
+            s.posted[0], s.posted[1], s.posted[2],
+            s.on_holder[0], s.on_holder[1], s.on_holder[2],
+            s.second_try[0], s.second_try[1], s.second_try[2],
+            s.forced[0], s.forced[1], s.forced[2],
+            s.ungated[0], s.ungated[1], s.ungated[2],
+            s.max_wait_us[0] / 1000.0, s.max_wait_us[1] / 1000.0,
+            s.max_wait_us[2] / 1000.0, s.wait_logs, s.refused);
+    fflush(stderr);
+}
+
+static void irql_track_gated(KIRQL old_level, KIRQL new_level, void *ra,
+                             int gate)
+{
     int now = (new_level >= DISPATCH_LEVEL);
+    /* With the gate off the count moves on the edge, as it did before the
+     * gate: the hold-off it drives is the one the device models had. */
+    int was = xbox_DispatchGateOn() ? t_irql_counted
+                                    : (old_level >= DISPATCH_LEVEL);
     LONG d;
 
     if (now == was)
         return;
+    /* The lower that gives the gate back is a safe point, taken while this
+     * thread still holds it and is still at its level. */
+    if (!now && t_dispatch_gate_held)
+        xbox_IrqSafePoint();
+    t_irql_counted = now;
 
-    if (now && dispatch_lock_on())
+    /* Ours (the dispatch lock, default on) for a raise and a DPC's bracket;
+     * upstream's gate (RECOMP_DISPATCH_GATE=1, opt-in) likewise. An ISR's
+     * bracket (gate == 0, the device level) takes neither: on the console
+     * an ISR preempts DISPATCH-level code. With the gate on the lock is off
+     * unless RECOMP_DISPATCH_LOCK asks for it (dispatch_lock_level). */
+    if (now && gate && dispatch_lock_on())
         s_disp_held = xbox_DispatchLockAcquire(250);
+    if (now && gate && xbox_DispatchGateOn()) {
+        gate_enter();
+        t_dispatch_gate_held = 1;
+    }
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
     if (!now && s_disp_held) {
@@ -385,6 +1158,20 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
         irql_holder_add(ra);
     else
         irql_holder_drop();
+    if (!now && t_dispatch_gate_held) {
+        t_dispatch_gate_held = 0;
+        if (s_irq_release_hook)
+            s_irq_release_hook();
+        /* A post caught between the safe point above and this leave saw the
+         * gate held twice. The release point that takes it runs only once
+         * the caller has written the new level back (irql_publish): run
+         * here, the routine's own raise to 16 would be counted against a
+         * level that is still the old one. Without it the vblank waited for
+         * its next tick, up to 16.7 ms. */
+        gate_leave_raw();
+        if (!t_gate_depth)
+            t_release_due = 1;
+    }
 
     /* RECOMP_IRQL_TRACE prints the first few transitions. The pairing is what
      * matters: a raise to 2 followed by a lower from 2 nets out, and a lower
@@ -398,6 +1185,59 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
                 now ? "raise" : "lower", old_level, new_level, (long)d);
         fflush(stderr);
     }
+}
+
+static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+{
+    irql_track_gated(old_level, new_level, ra, 1);
+}
+
+/* Bracket a host-delivered ISR or DPC.
+ *
+ * The kernel's interrupt and DPC dispatchers put the processor back at the
+ * interrupted IRQL when the routine returns, whatever the routine left it at.
+ * The host threads that deliver interrupts and drain DPCs here had no such
+ * epilogue, so a routine that returned at DISPATCH_LEVEL left its thread
+ * there and the global depth at one -- and every later USB interrupt then
+ * sat out the forced-delivery timeout, a pad polled twice a second.
+ *
+ * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
+ * DPC, the device level for an ISR -- and code checks: see irql_publish. */
+int xbox_IrqlEnterInterrupt(int level)
+{
+    int saved = (int)g_current_irql;
+    if (g_current_irql != (KIRQL)level) {
+        /* A DPC (DISPATCH_LEVEL) goes through the gate; a device ISR does
+         * not (see s_dispatch_gate). */
+        irql_track_gated(g_current_irql, (KIRQL)level, IRQL_CALLER(),
+                         level <= DISPATCH_LEVEL);
+        g_current_irql = (KIRQL)level;
+        irql_publish();
+    }
+    return saved;
+}
+
+void xbox_IrqlLeaveInterrupt(int saved)
+{
+    if (g_current_irql != (KIRQL)saved) {
+        irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER());
+        g_current_irql = (KIRQL)saved;
+        irql_publish();
+    }
+}
+
+/* Whether this thread is at DISPATCH_LEVEL or above, or holds the one-CPU
+ * gate: while it is, no DPC can run, so a wait on this thread must not hand
+ * the guest CPU on in the hope of one (kernel_guest_cpu.c). */
+int xbox_IrqlThisThreadBlocksDpcs(void)
+{
+    return t_irql_counted || t_dispatch_gate_held
+           || g_current_irql >= DISPATCH_LEVEL;
+}
+
+int xbox_IrqlCurrent(void)
+{
+    return (int)g_current_irql;
 }
 
 /*
@@ -416,6 +1256,13 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 
     irql_track(old, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
+    irql_publish();
+    /* This thread now owns the processor at DISPATCH or above (any raise
+     * that crosses DISPATCH from below, to a device IRQL too): what an ISR
+     * queued runs before the caller's critical region, as it would have run
+     * before the caller resumed on the console. */
+    if (old < DISPATCH_LEVEL && NewIrql >= DISPATCH_LEVEL)
+        dpc_run_here();
     return old;
 }
 
@@ -425,33 +1272,50 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
  */
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
+    KIRQL old;
+
     if (NewIrql > g_current_irql) {
-        /* A lower that raises the count.
-         *
-         * irql_track works on the edge, so this call crosses the boundary
-         * upwards and increments. The pair that would bring it back down has
-         * already happened, so the depth is now permanently one too high --
-         * and the count is what every device model reads before delivering.
-         * One of these ends interrupts for the rest of the run.
-         *
-         * Loud rather than a filtered warning because of that consequence:
-         * the symptom is a device going silent minutes later, with nothing
-         * connecting it back to here. */
+        /* A lower that would raise. The title's own pairs never do this;
+         * one that does is restoring a level it read from somewhere other
+         * than its matching raise. With the gate on, take the level it asks
+         * for but never count it: a raise counted here has no lower to undo
+         * it, so it would hold the gate, and the count every device model
+         * reads, for the rest of the run. A thread already counted stays
+         * counted until it really lowers. With the gate off it is counted
+         * as a raise, as before the gate, and the depth stays one too high:
+         * loud, because the symptom is a device going quiet much later. */
         static volatile LONG n;
+        int gated = xbox_DispatchGateOn();
         if (InterlockedIncrement(&n) <= 20) {
             fprintf(stderr, "  [IRQLBUG] tid %lu KfLowerIrql(%d) while at %d"
-                    " -- counted as a raise, depth is now stuck\n",
+                    " -- %s\n",
                     (unsigned long)GetCurrentThreadId(),
-                    (int)NewIrql, (int)g_current_irql);
+                    (int)NewIrql, (int)g_current_irql,
+                    gated ? "level set, not counted as a raise"
+                          : "counted as a raise, depth is now stuck");
             fflush(stderr);
         }
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
             g_current_irql, NewIrql);
+        if (gated) {
+            g_current_irql = NewIrql;
+            irql_publish();
+            return;
+        }
     }
 
-    irql_track(g_current_irql, NewIrql, IRQL_CALLER());
+    old = g_current_irql;
+    irql_track(old, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
+    irql_publish();
+    /* Down from a device level to DISPATCH: the thread keeps the gate, and
+     * the interrupts the level held off are taken now, as the console takes
+     * them at the lower. The thunk's safe point came before this, still at
+     * the old level, and the guest may go on at DISPATCH with no kernel call.
+     * A lower below DISPATCH takes them at its release point instead. */
+    if (old > DISPATCH_LEVEL && NewIrql == DISPATCH_LEVEL)
+        xbox_IrqSafePoint();
 }
 
 /*
@@ -463,6 +1327,9 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 
     irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
     g_current_irql = DISPATCH_LEVEL;
+    irql_publish();
+    if (old < DISPATCH_LEVEL)
+        dpc_run_here();
     return old;
 }
 
@@ -618,11 +1485,15 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
 {
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheck: code=0x%08X ***", BugCheckCode);
+    fprintf(stderr, "[EXIT] KeBugCheck 0x%08X\n", (unsigned)BugCheckCode);
 
 #ifdef _DEBUG
     DebugBreak();
 #endif
 
+    /* ExitProcess skips atexit. Guest code calls this, never from inside
+     * the report's lock, so the summary's list write may take it. */
+    xbox_missing_summary("bugcheck");
     if (g_xbox_flush_logs) g_xbox_flush_logs();
     ExitProcess(BugCheckCode);
 }
@@ -637,11 +1508,15 @@ VOID __stdcall xbox_KeBugCheckEx(
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheckEx: code=0x%08X, params=(0x%p, 0x%p, 0x%p, 0x%p) ***",
         BugCheckCode, (void*)Param1, (void*)Param2, (void*)Param3, (void*)Param4);
+    fprintf(stderr, "[EXIT] KeBugCheckEx 0x%08X\n", (unsigned)BugCheckCode);
 
 #ifdef _DEBUG
     DebugBreak();
 #endif
 
+    /* ExitProcess skips atexit. Guest code calls this, never from inside
+     * the report's lock, so the summary's list write may take it. */
+    xbox_missing_summary("bugcheck");
     if (g_xbox_flush_logs) g_xbox_flush_logs();
     ExitProcess(BugCheckCode);
 }
@@ -688,6 +1563,9 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "HalReturnToFirmware: routine=%u (exiting)", Routine);
+    /* stderr too: the kernel log file is rewritten on every run, so a title
+     * that ends itself otherwise leaves no trace in the run's own log. */
+    fprintf(stderr, "[EXIT] HalReturnToFirmware routine=%u\n", (unsigned)Routine);
     if (g_xbox_flush_logs) g_xbox_flush_logs();
     ExitProcess(0);
 }
@@ -695,6 +1573,7 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 VOID __stdcall xbox_HalInitiateShutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
+    fprintf(stderr, "[EXIT] HalInitiateShutdown\n");
     if (g_xbox_flush_logs) g_xbox_flush_logs();
     ExitProcess(0);
 }
@@ -1245,25 +2124,75 @@ uint64_t xbox_ReadTimeStampCounter(void)
 /* ============================================================================
  * Port I/O
  *
- * The lifter turns `in`/`out` into these. Titles reach very few ports: the
- * kernel owns the SMBus and PCI configuration, so what is left is what the
- * D3D library reads directly.
+ * The lifter turns `in`/`out` into these: xbox_PortIn((uint16_t)port, size)
+ * and xbox_PortOut((uint16_t)port, value, size), size 1, 2 or 4 bytes (the
+ * prototypes are in templates/runtime/recomp_types.h). Titles reach very few
+ * ports: the MCPX decodes I/O space, its ACPI/PM block sits at 0x8000 and
+ * SMBus at 0xC000, and the kernel exports cover SMBus and PCI configuration,
+ * so what is left is the odd pin the D3D library reads directly.
  *
- * 0x80C0 is in the ACPI block's GPIO range, and bit 5 there is the TV
- * encoder's field pin. D3D's vblank handler (0x00322390 in Amped 2) and its
- * ISR read it to know which field is being scanned, and GetDisplayFieldStatus
- * reports that field. XMV starts a movie only on an even field, so a pin that
- * never moves keeps every movie at its first frame. It alternates with the
- * vblank count here, as AvSendTVEncoderOption's field does, so the two agree.
+ * 0x80C0 is the first GPIO register of the ACPI block, and bit 5 there is
+ * the TV encoder's field pin. D3D's vblank handler (0x00322390 in Amped 2)
+ * and its ISR read it to know which field is being scanned (the ISR stores
+ * !bit5 in [device+0x1DF8]), and GetDisplayFieldStatus reports that field.
+ * XMV starts a movie only on an even field, so a pin that never moves keeps
+ * every movie at its first frame (Amped 2; Burnout 3's EA intro waited on its
+ * loading screen indefinitely). It alternates with the vblank count here, as
+ * AvSendTVEncoderOption's field does, so the two agree.
+ *
+ * Before the first vblank (or with RECOMP_VBLANK off) the count is 0, and
+ * then the pin toggles on every read instead (upstream's answer): a reader
+ * waiting for either field still sees it; nothing is implied about vblank
+ * delivery. Once vblanks run, the pin is the count's parity and holds still
+ * between them, however often it is read.
+ *
+ * Every other port reads 0 and is logged on first use, once per port.
  * ========================================================================= */
+static int port_first_use(uint32_t port, int is_out)
+{
+    static uint32_t seen[32];
+    static volatile LONG nseen;
+    uint32_t key = (port & 0xFFFFu) | (is_out ? 0x10000u : 0u);
+    LONG i, n = nseen;
+
+    for (i = 0; i < n && i < 32; i++)
+        if (seen[i] == key)
+            return 0;
+    i = InterlockedIncrement(&nseen) - 1;
+    if (i < 32)
+        seen[i] = key;
+    return i < 32;
+}
+
+/* RECOMP_STUB_LOG=1: an unresolved-call stub names itself the first time it
+ * runs (RECOMP_STUB_HIT in recomp_stubs_unresolved.c calls this once per
+ * stub), with the return address on the guest stack -- for a tail jump, the
+ * caller's caller. Here rather than in the generated file, which cannot
+ * include <stdio.h> next to a title's Ghidra-named CRT functions. */
+void xbox_StubHit(uint32_t va, uint32_t ret, uint32_t esp)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_STUB_LOG");
+        on = e && *e && *e != '0';
+    }
+    if (!on)
+        return;
+    fprintf(stderr, "[STUB] unresolved 0x%08X reached, return 0x%08X esp 0x%08X\n",
+            (unsigned)va, (unsigned)ret, (unsigned)esp);
+    fflush(stderr);
+}
+
 uint32_t xbox_PortIn(uint16_t port, int size)
 {
-    extern volatile long g_xbox_vblank_count;
-    static volatile long logged;
-
-    if (port == 0x80C0)
-        return (g_xbox_vblank_count & 1) ? 0x20u : 0u;
-    if (InterlockedIncrement(&logged) <= 8) {
+    if (port == 0x80C0) {
+        static volatile LONG reads;
+        uint32_t n = xbox_VblankCount();   /* g_xbox_vblank_count */
+        if (!n)
+            n = (uint32_t)InterlockedIncrement(&reads);
+        return (n & 1u) ? 0x20u : 0u;
+    }
+    if (port_first_use(port, 0)) {
         fprintf(stderr, "  [PORT] in %d byte(s) from 0x%04X: unmodelled, reads 0\n",
                 size, port);
         fflush(stderr);
@@ -1273,11 +2202,71 @@ uint32_t xbox_PortIn(uint16_t port, int size)
 
 void xbox_PortOut(uint16_t port, uint32_t value, int size)
 {
-    static volatile long logged;
-
-    if (InterlockedIncrement(&logged) <= 8) {
+    if (port_first_use(port, 1)) {
         fprintf(stderr, "  [PORT] out %d byte(s) 0x%X to 0x%04X: ignored\n",
                 size, value, port);
         fflush(stderr);
+    }
+}
+
+/* =========================================================================
+ * cpuid
+ *
+ * The Xbox CPU is a 733 MHz Coppermine-based Pentium III with MMX, FXSR and
+ * SSE, and that is what is reported by default. Leaf 1 eax 0x683 is family
+ * 6, model 8 (Coppermine), stepping 3: one of the Coppermine signatures in
+ * Intel's Pentium III Processor Specification Update. Which stepping the
+ * console ships is not documented, so software should key on family and
+ * model only. The max basic leaf is 2 and there are no extended leaves.
+ * Leaf 1's edx is the P3 feature set (FPU..CMOV, PAT, PSE-36, MMX, FXSR,
+ * SSE).
+ *
+ * Leaf 2 gives the P6 TLB and 16 KB 4-way L1 descriptors (0x01-0x04, 0x08,
+ * 0x0C). The L2 byte is 0, the null descriptor: the console's 128 KB L2 is
+ * reported to be 8-way, and the SDM's 128 KB 32-byte-line descriptor (0x41)
+ * says 4-way, so no L2 is described rather than a wrong one.
+ *
+ * A leaf above the maximum, extended ones included, returns the highest
+ * basic leaf's data: Intel SDM vol. 2A, CPUID, "If a value entered for
+ * CPUID.EAX is higher than the maximum input value for basic or extended
+ * function for that processor then the data for the highest basic
+ * information leaf is returned." So 0x80000000 reads eax 0x03020101, below
+ * 0x80000001, which is how software learns there are no extended leaves.
+ *
+ * RECOMP_CPUID_NO_SIMD=1 is an opt-out for a title whose MMX or SSE paths
+ * do not lift correctly: it clears MMX, FXSR and SSE together (bits 23-25),
+ * so the title takes its scalar path. Masking only MMX would describe a CPU
+ * with SSE but no MMX, which never existed: SSE's integer extensions use
+ * the MMX registers, and FXSAVE/FXRSTOR arrived with SSE to save that state.
+ * ========================================================================= */
+void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4])
+{
+    static int no_simd = -1;
+
+    if (no_simd < 0) {
+        const char *e = getenv("RECOMP_CPUID_NO_SIMD");
+        no_simd = e && *e && *e != '0';
+    }
+    (void)subleaf;
+    out[0] = out[1] = out[2] = out[3] = 0;
+    if (leaf > 2)
+        leaf = 2;
+    switch (leaf) {
+    case 0:
+        out[0] = 2;
+        out[1] = 0x756E6547u;   /* "Genu" */
+        out[3] = 0x49656E69u;   /* "ineI" */
+        out[2] = 0x6C65746Eu;   /* "ntel" */
+        break;
+    case 1:
+        out[0] = 0x00000683u;
+        out[3] = 0x0383F9FFu;
+        if (no_simd)
+            out[3] &= ~0x03800000u;     /* MMX, FXSR, SSE */
+        break;
+    default:
+        out[0] = 0x03020101u;
+        out[3] = 0x0C040800u;   /* L1 D, DTLB 4M, L1 I, no L2 */
+        break;
     }
 }

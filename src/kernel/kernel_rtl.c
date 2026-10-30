@@ -515,6 +515,9 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         xbox_guest_backtrace(10);
         fflush(stderr);
     }
+    /* Contended: the holder is a guest thread that needs the CPU to leave
+     * it (RECOMP_GUEST_LOCK), so tell the waiters the CPU is free now. */
+    xbox_GuestCpuBlocked();
     EnterCriticalSection(cs);
     xbox_cs_note_owner(cs);
     if (g_cs_contention_reports <= 16) {
@@ -570,6 +573,7 @@ ULONG __stdcall xbox_RtlNtStatusToDosError(NTSTATUS Status)
         case STATUS_NOT_SUPPORTED:              return ERROR_NOT_SUPPORTED;
         case STATUS_CANCELLED:                  return ERROR_CANCELLED;
         case STATUS_ALREADY_COMMITTED:          return ERROR_COMMITMENT_LIMIT;
+        case STATUS_CONFLICTING_ADDRESSES:      return ERROR_INVALID_ADDRESS;
         default:
             /* Fall back to RtlNtStatusToDosError from ntdll if available */
             xbox_log(XBOX_LOG_WARN, XBOX_LOG_RTL,

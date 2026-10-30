@@ -3197,13 +3197,14 @@ static void present_overlay_tick(void)
 /* ── Debug overlay ───────────────────────────────────────────────────────
  *
  * F3 (fb_present.c) or RECOMP_GPU_HUD=1: a small box in the top-left corner
- * of the window -- frame rate, render size, texture pack and file overlays.
+ * of the window -- frame rate, render size, texture pack and file overlays,
+ * and the build (RECOMP_BUILD_VERSION, which the game project sets).
  * The text is drawn with GDI into a 32-bit DIB twice a second, uploaded to
  * a texture, and blended over the presented frame, so it shows in
  * RECOMP_GPU_SHOT_PRESENT shots but never in the title's own surfaces. */
 volatile long g_xbox_hud_on = -1;       /* -1: not read from the env yet */
 #define HUD_W 560
-#define HUD_H 72
+#define HUD_H 90
 static ID3D11Texture2D *s_hud_tex;
 static ID3D11ShaderResourceView *s_hud_srv;
 static uint32_t s_hud_frames, s_hud_last;
@@ -3229,8 +3230,9 @@ static void hud_draw(uint32_t rw, uint32_t rh)
         s_hud_frames = 0;
         s_hud_last = now;
         if (g_xbox_hud_on && s_hud_ps) {
-            char text[768];
+            char text[896];
             const char *ov = getenv("RECOMP_OVERLAY_DIR");
+            const char *ver = getenv("RECOMP_BUILD_VERSION");
             uint32_t i;
             if (!dc) {
                 BITMAPINFO bi;
@@ -3252,11 +3254,13 @@ static void hud_draw(uint32_t rw, uint32_t rh)
             snprintf(text, sizeof text,
                      "%.1f fps   game %ux%u x%d%s%s\n"
                      "texture pack: %u replaced, %u not in the pack\n"
-                     "overlays: %s",
+                     "overlays: %s\n"
+                     "build: %s",
                      s_hud_fps, rw, rh, gpu_scale(),
                      s_blit_fxaa_ps ? "   FXAA" : "",
                      getenv("RECOMP_GPU_ANISO") ? "   aniso" : "",
-                     s_pack_loaded, s_pack_misses, ov && *ov ? ov : "none");
+                     s_pack_loaded, s_pack_misses, ov && *ov ? ov : "none",
+                     ver && *ver ? ver : "unknown");
             if (px && !s_hud_tex) {
                 D3D11_TEXTURE2D_DESC td;
                 memset(&td, 0, sizeof td);
