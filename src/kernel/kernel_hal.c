@@ -83,13 +83,27 @@ static void irql_release_due(void);
  * Only the owner of a KPCR writes its IRQL. */
 DWORD g_xbox_main_thread_id;
 
+/* And only under the one-CPU gate (RECOMP_DISPATCH_GATE), by default.
+ *
+ * What DirectSound does with the byte -- skip its critical section at raised
+ * IRQL -- is only safe if a thread at DISPATCH really has the processor to
+ * itself, as on the console, and as the gate makes it here. Without the gate
+ * (Amped 2's default: guest threads run in parallel, and a raised thread
+ * holds the dispatch lock, which keeps out DPCs and other raised threads but
+ * not passive ones) the raised thread skipped the lock while a passive
+ * thread was inside it. Amped 2 after the v0.16 merge: music stopping after
+ * ~30 s in a level, crackle, freezes, and crashes in DirectSound
+ * (sub_00296B62) and XACT (sub_00028A90). Nothing was published before the
+ * merge, and that played for hours. RECOMP_IRQL_PUBLISH=1 publishes without
+ * the gate, =0 never. */
+int xbox_DispatchGateOn(void);
+
 static void irql_publish(void)
 {
     static int on = -1;
     if (on < 0) {
-        /* RECOMP_IRQL_PUBLISH=0: never write KPCR.Irql (A/B). */
         const char *e = getenv("RECOMP_IRQL_PUBLISH");
-        on = !(e && *e == '0');
+        on = (e && *e) ? *e != '0' : xbox_DispatchGateOn();
     }
     if (on && g_fs_base
             && (g_fs_base != XBOX_TIB_MAIN
