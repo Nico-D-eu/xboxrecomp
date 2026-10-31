@@ -1211,10 +1211,18 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          * the executor's time. Keyed on the block's bytes as well as its
          * address, so a texture rewritten in place (a render target reused,
          * a streamed mip) never returns stale texels.
-         * ponytail: single-threaded executor, so a plain static table. */
-        static NV_TLS struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
-                        uint32_t px[16]; } cache[4096];
+         * ponytail: single-threaded executor, so a plain static table.
+         *
+         * Allocated on first use, per thread: as a 384 KB thread-local array
+         * it made every thread's static TLS larger than the 256 KB stack SDL
+         * gives its PulseAudio hotplug thread, so glibc refused that thread
+         * and SDL_OpenAudioDevice waited for it for ever (Linux). */
+        typedef struct { uintptr_t key; uint32_t fmt; uint64_t raw[2];
+                         uint32_t px[16]; } DxtCacheEntry;
+        static NV_TLS DxtCacheEntry *cache;
         uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
+        if (!cache && !(cache = (DxtCacheEntry *)calloc(4096, sizeof *cache)))
+            return 0;
         uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
         const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
         uintptr_t key = (uintptr_t)blk;
