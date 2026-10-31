@@ -1645,6 +1645,7 @@ static int             s_consumer_idle, s_threaded;
 static pthread_mutex_t s_cmd_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_cmd_wake = PTHREAD_COND_INITIALIZER;
 static uint32_t        s_flips_queued, s_flips_done;
+static void            pace_display(void);
 static Nv2aVpState     s_rvp;                     /* render-side copies */
 static Nv2aCombiner    s_rcomb;
 
@@ -1902,6 +1903,7 @@ static void *render_thread(void *unused)
             break;
         }
         case PKT_FLIP:
+            pace_display();
             do_flip(((const PktFlip *)h)->color_va);
             __atomic_add_fetch(&s_flips_done, 1, __ATOMIC_RELEASE);
             break;
@@ -1975,6 +1977,38 @@ void nv2a_gl_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color, uint32_t
     p->color = color;
     p->zclear = zclear;
     cmd_commit(p->h.bytes);
+}
+
+/* At most one flip per sixtieth of a second on the render thread, as
+ * nv2a_d3d11.c's pace_display: the executor follows through
+ * nv2a_gl_frames_in_flight. The window's vsync does not pace the guest
+ * here (it presents on its own thread), so without this the title ran at
+ * whatever the GPU managed, 150-175 fps under WSLg. RECOMP_FLIP_NOWAIT
+ * turns it off. */
+static void pace_display(void)
+{
+    static const uint64_t frame = 1000000000ull / 60;
+    static uint64_t due;
+    static int off = -1;
+    uint64_t now;
+
+    if (off < 0)
+        off = getenv("RECOMP_FLIP_NOWAIT") != NULL;
+    if (off)
+        return;
+    now = now_ns();
+    while (due && now < due) {
+        uint64_t left = due - now;
+        if (left > 2000000) {                     /* sleep to ~1 ms short */
+            struct timespec ts = { 0, (long)(left - 1000000) };
+            nanosleep(&ts, NULL);
+        } else {
+            sched_yield();
+        }
+        now = now_ns();
+    }
+    /* Keep the 60 Hz schedule through a late frame; resync after a stall. */
+    due = (due && now - due < 2 * frame) ? due + frame : now + frame;
 }
 
 void nv2a_gl_flip(uint32_t color_va)
