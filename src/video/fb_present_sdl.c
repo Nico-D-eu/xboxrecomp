@@ -61,6 +61,7 @@ struct fb_slot {
     uint8_t *px;
     size_t   cap;
     uint32_t bpp;
+    uint32_t w, h;          /* FB_W x FB_H, or a GPU back end's frame size */
 };
 
 /* What the window takes from SDL, and gives back on every way out. */
@@ -149,7 +150,45 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
     for (y = 0; y < FB_H; y++)
         memcpy(s->px + (size_t)y * FB_W * bpp, src + (size_t)y * pitch,
                (size_t)FB_W * bpp);
+    s->w = FB_W;
+    s->h = FB_H;
     publish(bpp);
+}
+
+/* A finished frame from a GPU back end (nv2a_gl.c): A8R8G8B8 rows, top row
+ * first, at the size it was drawn. Same slots and wake-up as a flip. */
+void xbox_FramebufferWindowPresentArgb(const void *px, uint32_t w, uint32_t h,
+                                       uint32_t row_pitch)
+{
+    struct fb_slot *s;
+    size_t need;
+    uint32_t y;
+
+    if (!px || !w || !h || w > 8192 || h > 8192)
+        return;
+    if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST))
+        return;
+    __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_running, __ATOMIC_SEQ_CST)) {
+        s = &s_slot[s_back];
+        need = (size_t)w * h * 4;
+        if (s->cap < need) {
+            uint8_t *n = (uint8_t *)realloc(s->px, need);
+            if (n) {
+                s->px = n;
+                s->cap = need;
+            }
+        }
+        if (s->cap >= need) {
+            for (y = 0; y < h; y++)
+                memcpy(s->px + (size_t)y * w * 4,
+                       (const uint8_t *)px + (size_t)y * row_pitch, (size_t)w * 4);
+            s->w = w;
+            s->h = h;
+            publish(4);
+        }
+    }
+    __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
 }
 
 /* Called by the pushbuffer executor when the title flips. */
@@ -318,7 +357,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     SDL_Window *win;
     SDL_Renderer *ren;
     SDL_Texture *tex = NULL;
-    uint32_t tex_bpp = 0;
+    uint32_t tex_bpp = 0, tex_w = 0, tex_h = 0, fw = FB_W, fh = FB_H;
     uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
     const char *e;
     int vsync, scale, quit = 0, guest_done = 0, dirty = 1;
@@ -442,23 +481,32 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             shown_seq = seq;
             px = s_slot[s_front].px;
             bpp = s_slot[s_front].bpp;
-            pitch = FB_W * bpp;
+            fw = s_slot[s_front].w;
+            fh = s_slot[s_front].h;
+            pitch = fw * bpp;
         } else if (!shown_seq && s_fb_va && s_fb_pitch) {
             /* No flip yet: the display surface, as the GDI window reads it. */
             bpp = s_fb_pitch / FB_W;
             pitch = s_fb_pitch;
+            fw = FB_W;
+            fh = FB_H;
             if (bpp == 2 || bpp == 4)
                 px = (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
         }
         if (px) {
-            if (!tex || bpp != tex_bpp) {
+            if (!tex || bpp != tex_bpp || fw != tex_w || fh != tex_h) {
                 if (tex)
                     SDL_DestroyTexture(tex);
                 tex = SDL_CreateTexture(ren, bpp == 4 ? SDL_PIXELFORMAT_RGB888
                                                       : SDL_PIXELFORMAT_RGB565,
                                         SDL_TEXTUREACCESS_STREAMING,
-                                        (int)FB_W, (int)FB_H);
+                                        (int)fw, (int)fh);
                 tex_bpp = bpp;
+                tex_w = fw;
+                tex_h = fh;
+                /* A GPU back end's frame is the title's own size (1280x720
+                 * in HD modes): letterbox to that shape, not to 640x480. */
+                SDL_RenderSetLogicalSize(ren, (int)fw, (int)fh);
             }
             if (tex)
                 SDL_UpdateTexture(tex, NULL, px, (int)pitch);

@@ -4333,14 +4333,25 @@ void nv2a_d3d11_report(void)
 
 #else  /* !_WIN32 */
 
-int  nv2a_d3d11_active(void) { return 0; }
-void nv2a_d3d11_draw(const Nv2aHwDraw *d) { (void)d; }
+/* No Direct3D here: the executor's hardware path is the OpenGL back end
+ * (nv2a_gl.c, RECOMP_GPU=gl), under the same entry points. */
+extern int  nv2a_gl_active(void);
+extern void nv2a_gl_draw(const Nv2aHwDraw *d);
+extern void nv2a_gl_clear(const Nv2aHwDraw *d, uint32_t f, uint32_t c, uint32_t z);
+extern void nv2a_gl_flip(uint32_t va);
+extern int  nv2a_gl_frames_in_flight(void);
+extern void nv2a_gl_report(void);
+extern void nv2a_gl_zpass(int enable);
+extern void nv2a_gl_get_report(uint32_t va, uint32_t va_alt);
+
+int  nv2a_d3d11_active(void) { return nv2a_gl_active(); }
+void nv2a_d3d11_draw(const Nv2aHwDraw *d) { nv2a_gl_draw(d); }
 void nv2a_d3d11_clear(const Nv2aHwDraw *d, uint32_t f, uint32_t c, uint32_t z)
-{ (void)d; (void)f; (void)c; (void)z; }
-void nv2a_d3d11_flip(uint32_t va) { (void)va; }
-int  nv2a_d3d11_frames_in_flight(void) { return -1; }
-void nv2a_d3d11_report(void) {}
-void nv2a_d3d11_zpass(int enable) { (void)enable; }
-void nv2a_d3d11_get_report(uint32_t va, uint32_t va_alt) { (void)va; (void)va_alt; }
+{ nv2a_gl_clear(d, f, c, z); }
+void nv2a_d3d11_flip(uint32_t va) { nv2a_gl_flip(va); }
+int  nv2a_d3d11_frames_in_flight(void) { return nv2a_gl_frames_in_flight(); }
+void nv2a_d3d11_report(void) { nv2a_gl_report(); }
+void nv2a_d3d11_zpass(int enable) { nv2a_gl_zpass(enable); }
+void nv2a_d3d11_get_report(uint32_t va, uint32_t va_alt) { nv2a_gl_get_report(va, va_alt); }
 
 #endif

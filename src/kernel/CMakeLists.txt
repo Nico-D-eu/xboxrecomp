@@ -32,6 +32,7 @@ set(KERNEL_SOURCES
     nv2a_combiner.c
     nv2a_hlsl.c
     nv2a_d3d11.c
+    nv2a_gl.c               # the executor's OpenGL back end (POSIX; empty on Windows)
     nv2a_flip_hold.c
     nv2a_vsh_interp.c
 )
@@ -52,9 +53,14 @@ if(WIN32)
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt d3d11 d3dcompiler dxguid)
 else()
-    # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
+    # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto,
+    # and SDL2 + epoxy for the executor's OpenGL back end (nv2a_gl.c).
     find_package(OpenSSL REQUIRED)
+    find_package(SDL2 REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(EPOXY REQUIRED IMPORTED_TARGET epoxy)
     target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+    target_link_libraries(xbox_kernel PRIVATE SDL2::SDL2 PkgConfig::EPOXY)
 endif()
 
 if(MSVC)
