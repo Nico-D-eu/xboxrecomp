@@ -324,9 +324,8 @@ static void do_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color, uint32
  * decoder. NV2A's state values are GL's own enums (compare functions,
  * stencil ops, blend factors and equations), so they go to GL unchanged.
  *
- * Not yet: volume textures, shadow maps (depth textures read as passing),
- * CPU-written pixels under a surface, texture packs, visibility counts,
- * anisotropy, render scale. */
+ * Not yet: volume textures, CPU-written pixels under a surface, texture
+ * packs, anisotropy, render scale. */
 
 static const uint8_t *guest(void)
 {
@@ -1612,7 +1611,8 @@ static void do_flip(uint32_t color_va)
  *
  * RECOMP_GPU_THREAD=0 does the GL work on the executor's thread. */
 
-enum { PKT_WRAP = 1, PKT_DRAW, PKT_CLEAR, PKT_FLIP, PKT_VP_PROG, PKT_VP_CONST, PKT_COMB };
+enum { PKT_WRAP = 1, PKT_DRAW, PKT_CLEAR, PKT_FLIP, PKT_VP_PROG, PKT_VP_CONST, PKT_COMB,
+       PKT_ZPASS, PKT_REPORT };
 
 typedef struct { uint32_t type, bytes; } PktHdr;        /* bytes includes this */
 
@@ -1637,6 +1637,7 @@ typedef struct {
     float    constants[NV2A_VP_CONSTANTS][4];
 } PktVpConst;
 typedef struct { PktHdr h; Nv2aCombiner comb; } PktComb;
+typedef struct { PktHdr h; uint32_t a; } PktVis;   /* ZPASS: enable; REPORT: slot */
 
 #define CMD_RING_BYTES (64u << 20)
 static uint8_t        *s_cmd;
@@ -1646,6 +1647,10 @@ static pthread_mutex_t s_cmd_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_cmd_wake = PTHREAD_COND_INITIALIZER;
 static uint32_t        s_flips_queued, s_flips_done;
 static void            pace_display(void);
+static void            vis_poll(void);
+static int             s_vis_pending;
+static void            do_zpass(int on);
+static void            do_get_report(uint32_t va);
 static Nv2aVpState     s_rvp;                     /* render-side copies */
 static Nv2aCombiner    s_rcomb;
 
@@ -1850,6 +1855,10 @@ static void *render_thread(void *unused)
 
         if (tail == __atomic_load_n(&s_cmd_head, __ATOMIC_ACQUIRE)) {
             struct timespec ts;
+            if (s_vis_pending) {     /* a title may be waiting on one */
+                glFlush();
+                vis_poll();
+            }
             overlay_tick();          /* a movie playing over no flips */
             pthread_mutex_lock(&s_cmd_lock);
             __atomic_store_n(&s_consumer_idle, 1, __ATOMIC_RELEASE);
@@ -1906,6 +1915,13 @@ static void *render_thread(void *unused)
             pace_display();
             do_flip(((const PktFlip *)h)->color_va);
             __atomic_add_fetch(&s_flips_done, 1, __ATOMIC_RELEASE);
+            vis_poll();
+            break;
+        case PKT_ZPASS:
+            do_zpass((int)((const PktVis *)h)->a);
+            break;
+        case PKT_REPORT:
+            do_get_report(((const PktVis *)h)->a);
             break;
         default:
             break;
@@ -2017,6 +2033,7 @@ void nv2a_gl_flip(uint32_t color_va)
 
     if (!s_threaded) {
         do_flip(color_va);
+        vis_poll();
         return;
     }
     __atomic_add_fetch(&s_flips_queued, 1, __ATOMIC_RELEASE);
@@ -2027,10 +2044,181 @@ void nv2a_gl_flip(uint32_t color_va)
     cmd_commit(p->h.bytes);
 }
 
-/* Visibility tests are not counted yet: reports stay as the guest left
- * them, which reads as "hidden" (no lens flares). */
-void nv2a_gl_zpass(int enable) { (void)enable; }
-void nv2a_gl_get_report(uint32_t va, uint32_t va_alt) { (void)va; (void)va_alt; }
+/* ── Visibility tests ─────────────────────────────────────────────────────
+ *
+ * As nv2a_d3d11.c (see its notes there): D3D's visibility test is
+ * SET_ZPASS_PIXEL_COUNT_ENABLE 1, the draws, the enable 0 and GET_REPORT
+ * into a 16-byte slot whose last word D3D set to 0xFFFFFFFF. Amped 2 draws
+ * each floodlight's glow and lens flare only when its test saw pixels; with
+ * the slot left pending they never showed. Each test is a GL_SAMPLES_PASSED
+ * query, read back without a stall once the GPU has it. */
+typedef struct {
+    GLuint   q;
+    uint32_t va;
+    int      state;        /* 0 free, 1 counting, 2 ended, 3 reported */
+} VisQuery;
+#define VIS_SLOTS 256
+static VisQuery s_vis[VIS_SLOTS];
+static VisQuery *s_vis_open, *s_vis_last;
+
+/* The last count for each slot, by address: what a report says at once,
+ * before its own query has come back (see nv2a_gl_get_report). */
+#define VIS_CACHE 1024
+static volatile uint32_t s_vis_cache_va[VIS_CACHE], s_vis_cache_n[VIS_CACHE];
+
+static uint32_t vis_cache_slot(uint32_t va)
+{
+    return ((va >> 4) * 2654435761u) & (VIS_CACHE - 1);
+}
+
+static void vis_write(uint32_t va, uint64_t samples)
+{
+    uint32_t *s, k = vis_cache_slot(va);
+    uint64_t now = now_ns();
+    if (!guest_ok(va, 16))
+        return;
+    s = (uint32_t *)(guest() + va);
+    s[0] = (uint32_t)now;
+    s[1] = (uint32_t)(now >> 32);
+    s[2] = (uint32_t)samples;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    s[3] = 0;                                      /* done */
+    s_vis_cache_va[k] = va;
+    s_vis_cache_n[k] = s[2];
+    {   /* RECOMP_VIS_TRACE: the first few, then a tally every 2000 */
+        static int said, trace = -1;
+        static unsigned n, nz, maxv;
+        if (trace < 0)
+            trace = getenv("RECOMP_VIS_TRACE") != NULL;
+        if (trace) {
+            if (said < 6) {
+                said++;
+                fprintf(stderr, "  [GL] visibility report at %08X: %u pixels\n", va, s[2]);
+            }
+            n++;
+            if (s[2]) nz++;
+            if (s[2] > maxv) maxv = s[2];
+            if (n == 2000) {
+                fprintf(stderr, "  [GL] visibility: %u of 2000 reports saw pixels (max %u)\n",
+                        nz, maxv);
+                n = nz = maxv = 0;
+            }
+        }
+    }
+}
+
+static void vis_poll(void)
+{
+    int i;
+    if (!s_vis_pending)
+        return;
+    for (i = 0; i < VIS_SLOTS; i++) {
+        VisQuery *v = &s_vis[i];
+        GLint ready = 0;
+        GLuint64 n = 0;
+        if (v->state < 2)
+            continue;
+        glGetQueryObjectiv(v->q, GL_QUERY_RESULT_AVAILABLE, &ready);
+        if (!ready)
+            continue;
+        glGetQueryObjectui64v(v->q, GL_QUERY_RESULT, &n);
+        if (v->state == 3)
+            vis_write(v->va, n);
+        v->state = 0;
+        s_vis_pending--;
+    }
+}
+
+static void do_zpass(int on)
+{
+    int i;
+    if (s_vis_open) {                              /* close a test left open */
+        glEndQuery(GL_SAMPLES_PASSED);
+        s_vis_open->state = 2;
+        s_vis_pending++;
+        s_vis_last = s_vis_open;
+        s_vis_open = NULL;
+    }
+    if (!on)
+        return;
+    vis_poll();
+    for (i = 0; i < VIS_SLOTS && s_vis[i].state; i++)
+        ;
+    if (i == VIS_SLOTS) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [GL] more than %d visibility tests in flight\n", VIS_SLOTS);
+        return;
+    }
+    if (!s_vis[i].q)
+        glGenQueries(1, &s_vis[i].q);
+    glBeginQuery(GL_SAMPLES_PASSED, s_vis[i].q);
+    s_vis[i].state = 1;
+    s_vis_open = &s_vis[i];
+    s_vis_last = NULL;
+}
+
+static void do_get_report(uint32_t va)
+{
+    VisQuery *v = s_vis_last;
+    s_vis_last = NULL;
+    if (!v || v->state != 2) {
+        vis_write(va, 0);          /* a report with no test behind it */
+        return;
+    }
+    v->va = va;
+    v->state = 3;
+}
+
+static void queue_vis(uint32_t type, uint32_t a)
+{
+    PktVis *p = (PktVis *)cmd_reserve(align16(sizeof *p));
+    p->h.type = type;
+    p->h.bytes = align16(sizeof *p);
+    p->a = a;
+    cmd_commit(p->h.bytes);
+}
+
+void nv2a_gl_zpass(int enable)
+{
+    if (!s_threaded) {
+        do_zpass(enable);
+        return;
+    }
+    queue_vis(PKT_ZPASS, (uint32_t)enable);
+}
+
+void nv2a_gl_get_report(uint32_t va, uint32_t va_alt)
+{
+    uint8_t *g = (uint8_t *)guest();
+    uint32_t slot = 0;
+
+    /* The slot is the reading D3D marked pending (last word 0xFFFFFFFF):
+     * the offset's bit 24 is shared with the report type. Nothing marked
+     * pending is not a report D3D asked for; write nowhere then. */
+    if (guest_ok(va, 16) && *(volatile uint32_t *)(g + va + 12) == 0xFFFFFFFFu)
+        slot = va;
+    else if (guest_ok(va_alt, 16) && *(volatile uint32_t *)(g + va_alt + 12) == 0xFFFFFFFFu)
+        slot = va_alt;
+    if (!slot)
+        return;
+    /* Complete it now with the slot's last count: the query comes back
+     * frames later, and a slot the title finds still pending counts as
+     * not visible. The real count replaces this when it arrives. */
+    {
+        uint32_t *s = (uint32_t *)(g + slot), k = vis_cache_slot(slot);
+        s[0] = s[1] = 0;
+        s[2] = s_vis_cache_va[k] == slot ? s_vis_cache_n[k] : 0;
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        s[3] = 0;
+    }
+    if (!s_threaded) {
+        do_get_report(slot);
+        vis_poll();
+        return;
+    }
+    queue_vis(PKT_REPORT, slot);
+}
 
 /* Frames queued and not yet drawn, which the executor keeps small;
  * -1 without a render thread. */
