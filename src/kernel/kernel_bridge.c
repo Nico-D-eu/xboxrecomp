@@ -4143,6 +4143,7 @@ static void kernel_timer_loop_ns(void)
         /* Wakeable: KeInsertQueueDpc ends it, so a DPC that no guest thread
          * drains at a raise runs now rather than at the next edge. */
         xbox_HostTimerSleepNs(wait);
+        timer_health(0);   /* the [HEALTH] line, as the default loop prints it */
         kernel_vblank_tick_ns(xbox_HostNowNs(), &vbl_next);
         busy = kernel_drain_dpcs_gated(&ran);   /* deferred work, before due timers */
         now_ms = kernel_timer_clock_ms();
