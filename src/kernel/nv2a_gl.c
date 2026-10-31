@@ -76,6 +76,7 @@ static uint64_t   s_rep_draw, s_rep_tex, s_rep_flip;
 /* RECOMP_GL_PROFILE=1: the draw split into sections (prepare and program,
  * targets, vertices, indices, uniforms, textures, state, the draw call). */
 static uint64_t   s_ns_part[8], s_rep_part[8];
+static uint64_t   s_ns_ring_wait, s_rep_ring_wait;   /* in fence waits (part of the draws) */
 static int        s_profile = -1;
 
 static uint64_t now_ns(void)
@@ -458,7 +459,9 @@ static void ring_init(GlRing *r, GLenum target, uint32_t size)
 static void ring_enter(GlRing *r, uint32_t k)
 {
     if (r->fence[k]) {
+        uint64_t t0 = now_ns();
         glClientWaitSync(r->fence[k], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+        s_ns_ring_wait += now_ns() - t0;
         glDeleteSync(r->fence[k]);
         r->fence[k] = 0;
     }
@@ -984,7 +987,8 @@ static void draw_impl(const Nv2aHwDraw *d)
     Nv2aHlslVsParams vsd;
     Nv2aHlslPsParams psd;
     uint32_t nstreams = 0, i, a, lo = 0xFFFFFFFFu, hi = 0, nidx, count, w, h, total;
-    uint32_t vb_at = 0, ib_at = 0, at = 0;
+    uint32_t vb_at = 0, ib_at = 0, at = 0, idx_bytes = 4;
+    GLenum idx_type = GL_UNSIGNED_INT;
     uint64_t mark = 0, tnow;
 #define MARK(k) do { if (s_profile) { tnow = now_ns(); s_ns_part[k] += tnow - mark; mark = tnow; } } while (0)
 
@@ -1106,7 +1110,17 @@ static void draw_impl(const Nv2aHwDraw *d)
         ibuf_cap = nidx;
     }
     emit_tris(d->prim, d->idx, d->idx_count, lo, ibuf);
-    if (!ring_put(&s_iring, ibuf, nidx * 4, 4, &ib_at)) {
+    /* 16-bit indices when the range allows (nearly always): half the bytes
+     * into the ring, whose GPU-visible memory is the slow part to write. */
+    if (count <= 0x10000u) {
+        uint16_t *s16 = (uint16_t *)ibuf;
+        uint32_t k;
+        for (k = 0; k < nidx; k++)
+            s16[k] = (uint16_t)ibuf[k];          /* in place: k * 2 <= k * 4 */
+        idx_type = GL_UNSIGNED_SHORT;
+        idx_bytes = 2;
+    }
+    if (!ring_put(&s_iring, ibuf, nidx * idx_bytes, 4, &ib_at)) {
         s_skipped++;
         return;
     }
@@ -1260,7 +1274,7 @@ static void draw_impl(const Nv2aHwDraw *d)
 
     MARK(6);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_iring.buf);
-    glDrawElements(GL_TRIANGLES, (GLsizei)nidx, GL_UNSIGNED_INT, (const void *)(uintptr_t)ib_at);
+    glDrawElements(GL_TRIANGLES, (GLsizei)nidx, idx_type, (const void *)(uintptr_t)ib_at);
     MARK(7);
 #undef MARK
     {
@@ -1417,7 +1431,9 @@ void nv2a_gl_report(void)
                 fprintf(stderr, " %.2f", (double)(s_ns_part[k] - s_rep_part[k]) / n / 1e6);
                 s_rep_part[k] = s_ns_part[k];
             }
-            fprintf(stderr, "\n");
+            fprintf(stderr, "; %.2f of it waiting for the GPU at ring fences\n",
+                    (double)(s_ns_ring_wait - s_rep_ring_wait) / n / 1e6);
+            s_rep_ring_wait = s_ns_ring_wait;
         }
     }
 }
