@@ -325,8 +325,8 @@ static void do_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color, uint32
  * decoder. NV2A's state values are GL's own enums (compare functions,
  * stencil ops, blend factors and equations), so they go to GL unchanged.
  *
- * Not yet: volume textures, CPU-written pixels under a surface, texture
- * packs, anisotropy, render scale. */
+ * Not yet: volume textures, CPU-written pixels under a surface,
+ * anisotropy, render scale. */
 
 static const uint8_t *guest(void)
 {
