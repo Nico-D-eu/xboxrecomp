@@ -187,10 +187,7 @@ static GlSurface *surface(GlSurface *tab, uint32_t va, uint32_t w, uint32_t h, i
     }
     s_att_valid = 0;
     if (e->obj) {
-        if (color)
-            glDeleteTextures(1, &e->obj);
-        else
-            glDeleteRenderbuffers(1, &e->obj);
+        glDeleteTextures(1, &e->obj);
         e->obj = 0;
     }
     if (color) {
@@ -203,9 +200,15 @@ static GlSurface *surface(GlSurface *tab, uint32_t va, uint32_t w, uint32_t h, i
         /* One level: complete under any sampler, mipmapped ones too. */
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     } else {
-        glGenRenderbuffers(1, &e->obj);
-        glBindRenderbuffer(GL_RENDERBUFFER, e->obj);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, (GLsizei)w, (GLsizei)h);
+        /* A texture, not a renderbuffer: a title samples its depth surfaces
+         * as shadow maps (the shader compares, stage tz<n>). */
+        glGenTextures(1, &e->obj);
+        glBindTexture(GL_TEXTURE_2D, e->obj);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, (GLsizei)w, (GLsizei)h, 0,
+                     GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
     }
     e->va = va;
     e->w = w;
@@ -254,8 +257,8 @@ static int bind_targets(const Nv2aHwDraw *d, int want_color, int want_depth,
         glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                                rt ? rt->obj : 0, 0);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
-                                  GL_RENDERBUFFER, ds ? ds->obj : 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D,
+                               ds ? ds->obj : 0, 0);
         glDrawBuffer(rt ? GL_COLOR_ATTACHMENT0 : GL_NONE);
         s_att_color = rt ? rt->obj : 0;
         s_att_depth = ds ? ds->obj : 0;
@@ -1232,7 +1235,24 @@ static void draw_impl(const Nv2aHwDraw *d)
         if (!t->enabled)
             continue;
         if (t->color >= 0x2A && t->color <= 0x31) {
-            psd.tsc[i][3] = 4.0f;            /* a shadow map: read as passing, for now */
+            /* A depth texture -- a shadow map: the depth surface drawn at
+             * that address, on unit 12+i, compared in the shader (tsc.w 3);
+             * with no such surface, everything passes (tsc.w 4). */
+            GlSurface *z = surface_find(s_depth, t->va);
+            int swz = t->color <= 0x2D;
+            int d16 = t->color == 0x2C || t->color == 0x2D || t->color == 0x30 || t->color == 0x31;
+            psd.tdz[i][0] = 1.0f / (d16 ? 65535.0f : 16777215.0f);
+            psd.tdz[i][1] = (float)d->shadow_func;
+            psd.tsc[i][2] = 0.0f;
+            psd.tsc[i][3] = 4.0f;
+            if (z && z->va != d->zeta_va) {
+                psd.tsc[i][0] = swz ? 1.0f : 1.0f / (float)z->w;
+                psd.tsc[i][1] = swz ? 1.0f : 1.0f / (float)z->h;
+                psd.tsc[i][3] = 3.0f;
+                glActiveTexture(GL_TEXTURE0 + 12 + i);
+                glBindTexture(GL_TEXTURE_2D, z->obj);
+                glBindSampler(12 + i, sampler_for(t, 1));
+            }
             continue;
         }
         src_rt = surface_find(s_color, t->va);
