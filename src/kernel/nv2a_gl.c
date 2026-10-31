@@ -77,6 +77,7 @@ static uint64_t   s_rep_draw, s_rep_tex, s_rep_flip;
  * targets, vertices, indices, uniforms, textures, state, the draw call). */
 static uint64_t   s_ns_part[8], s_rep_part[8];
 static uint64_t   s_ns_ring_wait, s_rep_ring_wait;   /* in fence waits (part of the draws) */
+static uint64_t   s_vb_bytes, s_rep_vb_bytes;         /* vertex data streamed */
 static int        s_profile = -1;
 
 static uint64_t now_ns(void)
@@ -431,6 +432,11 @@ typedef struct {
 static GlRing   s_vring, s_iring, s_uring;
 static GLint    s_ubo_align = 256;
 static uint32_t s_vsc_epoch;
+/* The parameter blocks bound now, and the ring epoch they were written in
+ * (~0: none yet). */
+static Nv2aHlslVsParams s_last_vsd;
+static Nv2aHlslPsParams s_last_psd;
+static uint32_t s_vsd_epoch = ~0u, s_psd_epoch = ~0u;
 static int      s_persistent;
 
 static void ring_init(GlRing *r, GLenum target, uint32_t size)
@@ -506,6 +512,22 @@ static void ring_reserve(GlRing *r, uint32_t n)
     }
     r->pos = 0;
     r->epoch++;
+}
+
+/* Persistent rings: n bytes at the next offset aligned to align (*at), for
+ * the caller to write. NULL on a ring without a mapping. */
+static uint8_t *ring_alloc(GlRing *r, uint32_t n, uint32_t align, uint32_t *at)
+{
+    uint32_t p;
+
+    if (!r->map || n + align > r->size)
+        return NULL;
+    ring_reserve(r, n + align);
+    p = (r->pos + align - 1) / align * align;
+    ring_move(r, r->pos, p + n);
+    r->pos = p + n;
+    *at = p;
+    return r->map + p;
 }
 
 /* n bytes from src at the next offset aligned to align (*at). */
@@ -1060,30 +1082,42 @@ static void draw_impl(const Nv2aHwDraw *d)
         st[i].at = total;
         total += ((count - 1) * st[i].stride + st[i].end + 16 + 15) & ~15u;
     }
-    if (vbuf_cap < total) {
-        uint8_t *n = (uint8_t *)realloc(vbuf, total);
-        if (!n)
-            return;
-        vbuf = n;
-        vbuf_cap = total;
-    }
-    for (i = 0; i < nstreams; i++) {
-        uint32_t span = (count - 1) * st[i].stride + st[i].end;
-        uint32_t src = st[i].base + lo * st[i].stride;
-        uint32_t avail = span;
-        if (d->inline_base)
-            avail = src >= d->inline_bytes ? 0 : (src + span > d->inline_bytes ? d->inline_bytes - src : span);
-        else if (!guest_ok(src, span)) {
+    for (i = 0; i < nstreams; i++)
+        if (!d->inline_base && !guest_ok(st[i].base + lo * st[i].stride,
+                                         (count - 1) * st[i].stride + st[i].end)) {
             s_skipped++;
             return;
         }
-        memcpy(vbuf + st[i].at, mem + src, avail);
-        memset(vbuf + st[i].at + avail, 0, span - avail + 16);
+    /* Straight into a persistent ring; through a staging copy otherwise. */
+    {
+        uint8_t *dst = ring_alloc(&s_vring, total ? total : 16, 16, &vb_at);
+        if (!dst) {
+            if (vbuf_cap < total) {
+                uint8_t *n = (uint8_t *)realloc(vbuf, total);
+                if (!n)
+                    return;
+                vbuf = n;
+                vbuf_cap = total;
+            }
+            dst = vbuf;
+        }
+        for (i = 0; i < nstreams; i++) {
+            uint32_t span = (count - 1) * st[i].stride + st[i].end;
+            uint32_t src = st[i].base + lo * st[i].stride;
+            uint32_t avail = span;
+            if (d->inline_base)
+                avail = src >= d->inline_bytes ? 0
+                      : (src + span > d->inline_bytes ? d->inline_bytes - src : span);
+            memcpy(dst + st[i].at, mem + src, avail);
+            memset(dst + st[i].at + avail, 0, span - avail + 16);
+        }
+        s_vb_bytes += total;
+        if (dst == vbuf && !ring_put(&s_vring, vbuf, total ? total : 16, 16, &vb_at)) {
+            s_skipped++;
+            return;
+        }
     }
-    if (!ring_put(&s_vring, vbuf, total ? total : 16, 16, &vb_at)) {
-        s_skipped++;
-        return;
-    }
+    glBindBuffer(GL_ARRAY_BUFFER, s_vring.buf);
     for (a = 0; a < 16; a++) {
         const Nv2aHwAttr *at = &d->attr[a];
         uint32_t bytes, mode, s;
@@ -1153,11 +1187,17 @@ static void draw_impl(const Nv2aHwDraw *d)
      * ranges already bound pointing into the storage it replaced. */
     ring_reserve(&s_uring, sizeof vsd + sizeof psd + sizeof d->vp->constants
                            + 3u * (uint32_t)s_ubo_align);
-    if (!ring_put(&s_uring, &vsd, sizeof vsd, (uint32_t)s_ubo_align, &at)) {
-        s_skipped++;
-        return;
+    /* Consecutive draws mostly share their parameters: a block equal to the
+     * one bound, in storage the ring has not wrapped over, stays bound. */
+    if (s_vsd_epoch != s_uring.epoch || memcmp(&vsd, &s_last_vsd, sizeof vsd) != 0) {
+        if (!ring_put(&s_uring, &vsd, sizeof vsd, (uint32_t)s_ubo_align, &at)) {
+            s_skipped++;
+            return;
+        }
+        glBindBufferRange(GL_UNIFORM_BUFFER, 1, s_uring.buf, at, sizeof vsd);
+        s_last_vsd = vsd;
+        s_vsd_epoch = s_uring.epoch;
     }
-    glBindBufferRange(GL_UNIFORM_BUFFER, 1, s_uring.buf, at, sizeof vsd);
     /* The constants only when they changed -- or the ring was replaced
      * under the range still bound. */
     if (d->use_vp && (d->vp != s_vsc_owner || d->vp->constants_gen != s_vsc_gen
@@ -1229,11 +1269,15 @@ static void draw_impl(const Nv2aHwDraw *d)
         smp = sampler_for(t, 16);
         glBindSampler(cube ? 4 + i : i, smp);
     }
-    if (!ring_put(&s_uring, &psd, sizeof psd, (uint32_t)s_ubo_align, &at)) {
-        s_skipped++;
-        return;
+    if (s_psd_epoch != s_uring.epoch || memcmp(&psd, &s_last_psd, sizeof psd) != 0) {
+        if (!ring_put(&s_uring, &psd, sizeof psd, (uint32_t)s_ubo_align, &at)) {
+            s_skipped++;
+            return;
+        }
+        glBindBufferRange(GL_UNIFORM_BUFFER, 2, s_uring.buf, at, sizeof psd);
+        s_last_psd = psd;
+        s_psd_epoch = s_uring.epoch;
     }
-    glBindBufferRange(GL_UNIFORM_BUFFER, 2, s_uring.buf, at, sizeof psd);
 
     MARK(5);
     /* Fixed function: NV2A's values are GL's enums. */
@@ -1431,9 +1475,12 @@ void nv2a_gl_report(void)
                 fprintf(stderr, " %.2f", (double)(s_ns_part[k] - s_rep_part[k]) / n / 1e6);
                 s_rep_part[k] = s_ns_part[k];
             }
-            fprintf(stderr, "; %.2f of it waiting for the GPU at ring fences\n",
-                    (double)(s_ns_ring_wait - s_rep_ring_wait) / n / 1e6);
+            fprintf(stderr, "; %.2f of it waiting for the GPU at ring fences;"
+                            " %.0f KB of vertices a frame\n",
+                    (double)(s_ns_ring_wait - s_rep_ring_wait) / n / 1e6,
+                    (double)(s_vb_bytes - s_rep_vb_bytes) / n / 1024.0);
             s_rep_ring_wait = s_ns_ring_wait;
+            s_rep_vb_bytes = s_vb_bytes;
         }
     }
 }
