@@ -48,7 +48,12 @@ static inline int64_t qemu_clock_get_us(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (int64_t)(count.QuadPart * 1000000LL / freq.QuadPart);
+    /* Whole seconds and the rest, as qemu_shim.h does: count * 10^6
+     * overflows 64 bits once the counter passes 9.2e12 -- after 2.5 hours
+     * of uptime where it counts nanoseconds (POSIX), and the APU's frame
+     * clock then went negative and its pacing slept for good. */
+    return (int64_t)(count.QuadPart / freq.QuadPart) * 1000000LL
+         + (int64_t)(count.QuadPart % freq.QuadPart) * 1000000LL / freq.QuadPart;
 }
 #endif
 
