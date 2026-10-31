@@ -1329,11 +1329,12 @@ static size_t   s_pbo_cap[2];
 static GLsync   s_pbo_fence[2];
 static int      s_pbo_next;
 
-/* RECOMP_GL_SHOT=<n>: every n-th frame as gl_shot_<frame>.ppm in the
- * working directory. */
+/* RECOMP_GL_SHOT=<n>: every n-th frame shown -- flipped, or a movie frame
+ * between flips -- as gl_shot_<count>.ppm in the working directory. */
 static void shot(const uint8_t *px, uint32_t w, uint32_t h)
 {
     static int every = -1;
+    static uint32_t shown;
     char path[64];
     FILE *f;
     size_t k, n = (size_t)w * h;
@@ -1342,9 +1343,9 @@ static void shot(const uint8_t *px, uint32_t w, uint32_t h)
         const char *v = getenv("RECOMP_GL_SHOT");
         every = v ? atoi(v) : 0;
     }
-    if (every <= 0 || s_frame % (uint32_t)every != 0)
+    if (every <= 0 || ++shown % (uint32_t)every != 0)
         return;
-    snprintf(path, sizeof path, "gl_shot_%05u.ppm", s_frame);
+    snprintf(path, sizeof path, "gl_shot_%05u.ppm", shown);
     if ((f = fopen(path, "wb")) == NULL)
         return;
     fprintf(f, "P6 %u %u 255\n", w, h);
@@ -1355,6 +1356,155 @@ static void shot(const uint8_t *px, uint32_t w, uint32_t h)
         fputc(p[0], f);
     }
     fclose(f);
+}
+
+/* ── The video overlay (PVIDEO) ──────────────────────────────────────────
+ *
+ * XMV movies are not drawn: D3D's UpdateOverlay programs the NV2A's video
+ * scaler, which puts a YUY2 surface over the picture (registers at
+ * 0xFD008000; nv2a_d3d11.c describes them). The D3D11 path composes it on
+ * the GPU; here the frame is in memory after the readback anyway, so it is
+ * composed there, on the CPU: a 640x480 movie is a few milliseconds. While
+ * the overlay is on and nothing flips -- a movie player updates the overlay
+ * and waits for vblank without presenting -- the render thread shows the
+ * last frame with the overlay over it about 60 times a second. */
+typedef struct {
+    uint32_t va, w, h, pitch, x, y, ow, oh, key;
+    int      keyed;
+    float    s0;
+} GlOverlay;
+
+static uint32_t *s_base, *s_out;          /* the last frame; it with the overlay */
+static uint32_t  s_base_w = 640, s_base_h = 480;
+static size_t    s_base_cap, s_out_cap;
+static uint64_t  s_last_present_ns;
+
+static uint32_t pvideo(uint32_t off)
+{
+    return *(const volatile uint32_t *)(guest() + 0xFD008000u + off);
+}
+
+static int overlay_read(GlOverlay *o)
+{
+    uint32_t phys, sin, fmt;
+
+    if (!(pvideo(0x700) & 1u) || (pvideo(0x704) & 1u))
+        return 0;
+    fmt = pvideo(0x958);
+    if (((fmt >> 16) & 0xFu) != 1u)            /* YUY2 is all D3D asks for */
+        return 0;
+    phys = (pvideo(0x900) + pvideo(0x920)) & 0x0FFFFFFFu;
+    o->va = (phys >= g_xbox_contig_size && phys - g_xbox_contig_size < g_xbox_ram_top)
+          ? phys - g_xbox_contig_size : 0x80000000u + phys;
+    sin = pvideo(0x928);
+    o->w = sin & 0xFFFFu;
+    o->h = sin >> 16;
+    o->s0 = (float)(pvideo(0x930) & 0xFFFFu) / 16.0f;
+    o->pitch = fmt & 0x1FFFu;
+    o->x = pvideo(0x948) & 0xFFFFu;
+    o->y = pvideo(0x948) >> 16;
+    o->ow = pvideo(0x950) & 0xFFFFu;
+    o->oh = pvideo(0x950) >> 16;
+    o->keyed = (fmt & 0x00100000u) != 0;
+    o->key = pvideo(0xB00) & 0xFFFFFFu;
+    if (!o->w || !o->h || o->w > 2048 || o->h > 2048 || !o->ow || !o->oh
+            || o->pitch < o->w * 2u || !guest_ok(o->va, o->pitch * o->h))
+        return 0;
+    return 1;
+}
+
+static uint32_t yuv_argb(int y, int u, int v)
+{
+    float fy = 1.164f * (float)(y - 16), fu = (float)(u - 128), fv = (float)(v - 128);
+    float r = fy + 1.596f * fv, g = fy - 0.391f * fu - 0.813f * fv, b = fy + 2.018f * fu;
+    uint32_t R = r < 0 ? 0 : r > 255 ? 255 : (uint32_t)(r + 0.5f);
+    uint32_t G = g < 0 ? 0 : g > 255 ? 255 : (uint32_t)(g + 0.5f);
+    uint32_t B = b < 0 ? 0 : b > 255 ? 255 : (uint32_t)(b + 0.5f);
+    return 0xFF000000u | (R << 16) | (G << 8) | B;
+}
+
+/* The overlay into px (w x h), nearest sample, as the shader in
+ * nv2a_d3d11.c maps it: destination in frame pixels, source from s0. */
+static void overlay_compose(const GlOverlay *o, uint32_t *px, uint32_t w, uint32_t h)
+{
+    const uint8_t *src = guest() + o->va;
+    uint32_t dy, dx;
+    float sx_step = ((float)o->w - o->s0) / (float)o->ow;
+    float sy_step = (float)o->h / (float)o->oh;
+
+    for (dy = 0; dy < o->oh && o->y + dy < h; dy++) {
+        uint32_t sy = (uint32_t)(((float)dy + 0.5f) * sy_step);
+        const uint8_t *row = src + (size_t)(sy < o->h ? sy : o->h - 1) * o->pitch;
+        uint32_t *out = px + (size_t)(o->y + dy) * w;
+        for (dx = 0; dx < o->ow && o->x + dx < w; dx++) {
+            float fx = o->s0 + ((float)dx + 0.5f) * sx_step;
+            uint32_t sxp = (uint32_t)fx, pair = sxp / 2;
+            const uint8_t *q;
+            if (sxp >= o->w)
+                sxp = o->w - 1, pair = sxp / 2;
+            if (o->keyed && (out[o->x + dx] & 0xFFFFFFu) != o->key)
+                continue;
+            q = row + (size_t)pair * 4;           /* Y0 U Y1 V */
+            out[o->x + dx] = yuv_argb((sxp & 1) ? q[2] : q[0], q[1], q[3]);
+        }
+    }
+}
+
+static int keep(uint32_t **buf, size_t *cap, size_t n)
+{
+    if (*cap >= n)
+        return 1;
+    {
+        uint32_t *b = (uint32_t *)realloc(*buf, n * 4);
+        if (!b)
+            return 0;
+        *buf = b;
+        *cap = n;
+    }
+    return 1;
+}
+
+/* Present a frame, with the overlay over it if it is on. */
+static void present(const uint8_t *px, uint32_t w, uint32_t h)
+{
+    GlOverlay o;
+
+    s_last_present_ns = now_ns();
+    if (!overlay_read(&o)) {
+        xbox_FramebufferWindowPresentArgb(px, w, h, w * 4);
+        shot(px, w, h);
+        return;
+    }
+    /* Keep the frame as it was, for the ticks between flips. */
+    if (!keep(&s_base, &s_base_cap, (size_t)w * h) || !keep(&s_out, &s_out_cap, (size_t)w * h))
+        return;
+    if ((const uint8_t *)s_base != px)
+        memcpy(s_base, px, (size_t)w * h * 4);
+    s_base_w = w;
+    s_base_h = h;
+    memcpy(s_out, s_base, (size_t)w * h * 4);
+    overlay_compose(&o, s_out, w, h);
+    xbox_FramebufferWindowPresentArgb(s_out, w, h, w * 4);
+    shot((const uint8_t *)s_out, w, h);
+}
+
+/* From the render thread's idle loop: a movie playing over no flips. */
+static void overlay_tick(void)
+{
+    GlOverlay o;
+
+    if (now_ns() - s_last_present_ns < 16000000ull || !overlay_read(&o))
+        return;
+    if (!s_base) {                    /* nothing flipped yet: black, big enough */
+        if (o.x + o.ow > s_base_w)
+            s_base_w = o.x + o.ow;
+        if (o.y + o.oh > s_base_h)
+            s_base_h = o.y + o.oh;
+        if (!keep(&s_base, &s_base_cap, (size_t)s_base_w * s_base_h))
+            return;
+        memset(s_base, 0, (size_t)s_base_w * s_base_h * 4);
+    }
+    present((const uint8_t *)s_base, s_base_w, s_base_h);
 }
 
 static void flip_impl(uint32_t color_va)
@@ -1407,8 +1557,7 @@ static void flip_impl(uint32_t color_va)
                                                (GLsizeiptr)s_pbo_w[j] * s_pbo_h[j] * 4,
                                                GL_MAP_READ_BIT);
         if (px) {
-            xbox_FramebufferWindowPresentArgb(px, s_pbo_w[j], s_pbo_h[j], s_pbo_w[j] * 4);
-            shot(px, s_pbo_w[j], s_pbo_h[j]);
+            present(px, s_pbo_w[j], s_pbo_h[j]);
             glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
         }
     }
@@ -1680,6 +1829,7 @@ static void *render_thread(void *unused)
 
         if (tail == __atomic_load_n(&s_cmd_head, __ATOMIC_ACQUIRE)) {
             struct timespec ts;
+            overlay_tick();          /* a movie playing over no flips */
             pthread_mutex_lock(&s_cmd_lock);
             __atomic_store_n(&s_consumer_idle, 1, __ATOMIC_RELEASE);
             if (tail == __atomic_load_n(&s_cmd_head, __ATOMIC_ACQUIRE)) {
