@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 extern void xbox_FramebufferWindowPresentArgb(const void *px, uint32_t w,
@@ -681,6 +682,7 @@ typedef struct {
     uint32_t checked_frame;
     GLuint   obj;
     int      cube;
+    struct PackEntry *pack;               /* texture pack entry, or NULL */
 } GlTexture;
 
 static GlTexture s_tex[TEX_SLOTS];
@@ -693,6 +695,419 @@ static uint32_t level_bytes(uint32_t color, uint32_t w, uint32_t h, uint32_t pit
     if (linear)
         return pitch * h;
     return w * h * nv2a_pb_texel_bytes(color);
+}
+
+/* ── Texture packs ─────────────────────────────────────────────────────────
+ *
+ * As nv2a_d3d11.c (its notes there): RECOMP_TEXTURE_PACK names directories,
+ * ';'-separated, highest priority first, of <crc32>_<w>x<h>_<fmt>.dds files
+ * keyed by the top mip's bytes in guest memory; tails.txt names textures
+ * whose first block the pool overwrote when it freed them. The keys are the
+ * D3D11 back end's, so one pack serves both. A loader thread reads and
+ * parses the files (a GL context belongs to one thread); the render thread
+ * uploads one the first time its texture is drawn after it arrived, and
+ * the original is drawn until then. RECOMP_TEXTURE_PACK_SYNC=1 loads in
+ * place. BC1-3 need S3TC and BC7 needs GL 4.2 (or ARB_texture_compression
+ * _bptc); a pack file the driver cannot take counts as a miss. */
+static uint32_t s_crc_table[256];
+
+static uint32_t crc32_bytes(const uint8_t *p, size_t n)
+{
+    uint32_t c = 0xFFFFFFFFu;
+    size_t i;
+    if (!s_crc_table[1]) {
+        uint32_t k, j, v;
+        for (k = 0; k < 256; k++) {
+            for (v = k, j = 0; j < 8; j++)
+                v = (v & 1) ? 0xEDB88320u ^ (v >> 1) : v >> 1;
+            s_crc_table[k] = v;
+        }
+    }
+    for (i = 0; i < n; i++)
+        c = s_crc_table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+/* A parsed DDS, ready to upload. */
+typedef struct {
+    GLenum   ifmt, fmt, type;               /* fmt 0: compressed */
+    uint32_t w, h, levels;
+    uint32_t off[16], size[16];
+    uint8_t *buf;
+} PackImage;
+
+static int s_have_s3tc = -1, s_have_bptc;
+
+static PackImage *dds_parse(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *buf = NULL;
+    long n;
+    uint32_t w, h, mips, flags, fourcc, bits, off = 128, block = 0, dxgi = 0, i;
+    GLenum ifmt = 0, fmt = 0, type = 0;
+    PackImage *im = NULL;
+
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n > 128 && (buf = (uint8_t *)malloc((size_t)n)) != NULL
+            && fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf);
+        buf = NULL;
+    }
+    fclose(f);
+    if (!buf || memcmp(buf, "DDS ", 4) != 0)
+        goto fail;
+    memcpy(&h, buf + 12, 4);
+    memcpy(&w, buf + 16, 4);
+    memcpy(&mips, buf + 28, 4);
+    memcpy(&flags, buf + 80, 4);
+    memcpy(&fourcc, buf + 84, 4);
+    memcpy(&bits, buf + 88, 4);
+    if (!mips) mips = 1;
+    if (mips > 16) mips = 16;
+    if (fourcc == 0x30315844u) {                    /* "DX10" */
+        if (n < 148) goto fail;
+        memcpy(&dxgi, buf + 128, 4);
+        off = 148;
+    } else if (fourcc == 0x31545844u) {             /* "DXT1" */
+        dxgi = 71;
+    } else if (fourcc == 0x33545844u) {             /* "DXT3" */
+        dxgi = 74;
+    } else if (fourcc == 0x35545844u) {             /* "DXT5" */
+        dxgi = 77;
+    } else if ((flags & 0x40u) && bits == 32) {     /* RGB, 32 bits */
+        uint32_t rmask;
+        memcpy(&rmask, buf + 92, 4);
+        dxgi = rmask == 0x00FF0000u ? 87 : 28;
+    }
+    switch (dxgi) {                                 /* DXGI_FORMAT values */
+    case 71: if (s_have_s3tc) { ifmt = GL_COMPRESSED_RGBA_S3TC_DXT1_EXT; block = 8; } break;
+    case 72: if (s_have_s3tc) { ifmt = GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT; block = 8; } break;
+    case 74: if (s_have_s3tc) { ifmt = GL_COMPRESSED_RGBA_S3TC_DXT3_EXT; block = 16; } break;
+    case 75: if (s_have_s3tc) { ifmt = GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT; block = 16; } break;
+    case 77: if (s_have_s3tc) { ifmt = GL_COMPRESSED_RGBA_S3TC_DXT5_EXT; block = 16; } break;
+    case 78: if (s_have_s3tc) { ifmt = GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT; block = 16; } break;
+    case 80: ifmt = GL_COMPRESSED_RED_RGTC1; block = 8; break;
+    case 83: ifmt = GL_COMPRESSED_RG_RGTC2; block = 16; break;
+    case 98: if (s_have_bptc) { ifmt = GL_COMPRESSED_RGBA_BPTC_UNORM; block = 16; } break;
+    case 99: if (s_have_bptc) { ifmt = GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM; block = 16; } break;
+    case 87: ifmt = GL_RGBA8; fmt = GL_BGRA; type = GL_UNSIGNED_INT_8_8_8_8_REV; break;
+    case 28: ifmt = GL_RGBA8; fmt = GL_RGBA; type = GL_UNSIGNED_BYTE; break;
+    default: break;
+    }
+    if (!ifmt || !w || !h || w > 16384 || h > 16384)
+        goto fail;
+    if (!(im = (PackImage *)calloc(1, sizeof *im)))
+        goto fail;
+    for (i = 0; i < mips; i++) {
+        uint32_t lw = w >> i ? w >> i : 1, lh = h >> i ? h >> i : 1;
+        uint32_t size = block ? ((lw + 3) / 4) * block * ((lh + 3) / 4) : lw * lh * 4;
+        if ((long)off + (long)size > n)
+            break;
+        im->off[i] = off;
+        im->size[i] = size;
+        off += size;
+    }
+    if (!i)
+        goto fail;
+    im->ifmt = ifmt; im->fmt = fmt; im->type = type;
+    im->w = w; im->h = h; im->levels = i;
+    im->buf = buf;
+    return im;
+fail:
+    free(im);
+    free(buf);
+    return NULL;
+}
+
+typedef struct PackEntry {
+    uint32_t crc, wh, color, used;          /* used = 0: empty */
+    uint32_t va, bytes;                     /* the top mip, for RECOMP_TEXTURE_PACK_DUMP */
+    uint32_t tail;                          /* crc32 of the top mip past its first block */
+    PackImage *volatile img;                /* parsed by the loader, until uploaded */
+    volatile int state;                     /* 0 queued, 1 parsed, 2 missing */
+    GLuint obj;                             /* the uploaded replacement, render thread */
+} PackEntry;
+#define PACK_SLOTS 16384
+static PackEntry *s_pack;
+static const char *s_pack_dir;
+static int s_pack_on = -1;
+static unsigned s_pack_misses, s_pack_loaded, s_pack_freed;
+#define PACK_TAIL_SLOTS 16384
+static PackEntry **s_pack_tail;
+
+/* RECOMP_TEXTURE_PACK_DUMP=<dir>: each missed texture's top mip as
+ * <key>.raw, as nv2a_d3d11.c writes it. */
+static void pack_dump(const PackEntry *pe)
+{
+    static const char *dir = (const char *)1;
+    char path[1024];
+    const uint8_t *src;
+    FILE *f;
+
+    if (dir == (const char *)1) {
+        dir = getenv("RECOMP_TEXTURE_PACK_DUMP");
+        if (dir && *dir)
+            mkdir(dir, 0755);
+    }
+    if (!dir || !*dir || !pe->bytes || !guest_ok(pe->va, pe->bytes))
+        return;
+    src = guest() + pe->va;
+    if (crc32_bytes(src, pe->bytes) != pe->crc)
+        return;
+    snprintf(path, sizeof path, "%s/%08x_%ux%u_%02x.raw", dir, pe->crc,
+             pe->wh >> 16, pe->wh & 0xFFFFu, pe->color);
+    if ((f = fopen(path, "wb")) != NULL) {
+        fwrite(src, 1, pe->bytes, f);
+        fclose(f);
+    }
+}
+
+typedef struct { uint32_t tail, wh, color, crc; } PackTail;
+#define PACK_TAILMAP_SLOTS 16384
+static PackTail *s_tailmap;
+
+static uint32_t tailmap_at(uint32_t tail, uint32_t wh, uint32_t color)
+{
+    return (tail ^ (wh * 2654435761u) ^ color) & (PACK_TAILMAP_SLOTS - 1);
+}
+
+static void tailmap_load(void)
+{
+    char path[1024], line[128];
+    const char *d = s_pack_dir;
+    unsigned n = 0;
+    s_tailmap = (PackTail *)calloc(PACK_TAILMAP_SLOTS, sizeof *s_tailmap);
+    while (s_tailmap && d && *d) {
+        const char *end = strchr(d, ';');
+        int len = end ? (int)(end - d) : (int)strlen(d);
+        FILE *f;
+        snprintf(path, sizeof path, "%.*s/tails.txt", len, d);
+        if ((f = fopen(path, "r")) != NULL) {
+            while (fgets(line, sizeof line, f)) {
+                unsigned tail, w, h, fmt, crc, i;
+                if (sscanf(line, "%8x_%ux%u_%2x %8x", &tail, &w, &h, &fmt, &crc) != 5 || !tail)
+                    continue;
+                for (i = 0; i < 64; i++) {
+                    PackTail *s = &s_tailmap[(tailmap_at(tail, (w << 16) | h, fmt) + i)
+                                             & (PACK_TAILMAP_SLOTS - 1)];
+                    if (!s->tail) {
+                        s->tail = tail; s->wh = (w << 16) | h; s->color = fmt; s->crc = crc;
+                        n++;
+                        break;
+                    }
+                }
+            }
+            fclose(f);
+        }
+        d = end ? end + 1 : NULL;
+    }
+    if (n)
+        fprintf(stderr, "  [GL] texture pack: %u tails (freed textures)\n", n);
+}
+
+static uint32_t tailmap_find(const PackEntry *pe)
+{
+    uint32_t i, at;
+    if (!s_tailmap || !pe->tail)
+        return 0;
+    at = tailmap_at(pe->tail, pe->wh, pe->color);
+    for (i = 0; i < 64; i++) {
+        const PackTail *s = &s_tailmap[(at + i) & (PACK_TAILMAP_SLOTS - 1)];
+        if (!s->tail)
+            return 0;
+        if (s->tail == pe->tail && s->wh == pe->wh && s->color == pe->color)
+            return s->crc;
+    }
+    return 0;
+}
+
+/* The first pack directory with this key wins. */
+static PackImage *pack_find(uint32_t crc, uint32_t w, uint32_t h, uint32_t color)
+{
+    char path[1024];
+    const char *d = s_pack_dir;
+    PackImage *im = NULL;
+    while (d && *d && !im) {
+        const char *end = strchr(d, ';');
+        int len = end ? (int)(end - d) : (int)strlen(d);
+        snprintf(path, sizeof path, "%.*s/%08x_%ux%u_%02x.dds", len, d, crc, w, h, color);
+        im = dds_parse(path);
+        d = end ? end + 1 : NULL;
+    }
+    return im;
+}
+
+/* Probe the pack directories for one key and parse what is found. */
+static void pack_load(PackEntry *pe)
+{
+    uint32_t w = pe->wh >> 16, h = pe->wh & 0xFFFFu, alt;
+    PackImage *im = pack_find(pe->crc, w, h, pe->color);
+    if (!im && (alt = tailmap_find(pe)) != 0 && (im = pack_find(alt, w, h, pe->color)) != NULL)
+        __atomic_add_fetch(&s_pack_freed, 1, __ATOMIC_RELAXED);
+    if (im) {
+        if (__atomic_add_fetch(&s_pack_loaded, 1, __ATOMIC_RELAXED) <= 8)
+            fprintf(stderr, "  [GL] texture pack: %08x_%ux%u_%02x\n", pe->crc, w, h, pe->color);
+        pe->img = im;
+        __atomic_store_n(&pe->state, 1, __ATOMIC_RELEASE);
+    } else {
+        const char *mf = getenv("RECOMP_TEXTURE_PACK_MISSES");
+        FILE *f = mf && *mf ? fopen(mf, "a") : NULL;
+        __atomic_add_fetch(&s_pack_misses, 1, __ATOMIC_RELAXED);
+        if (f) {
+            fprintf(f, "%08x_%ux%u_%02x\n", pe->crc, w, h, pe->color);
+            fclose(f);
+        }
+        pack_dump(pe);
+        __atomic_store_n(&pe->state, 2, __ATOMIC_RELEASE);
+    }
+}
+
+#define PACK_QUEUE 4096
+static PackEntry *s_pack_q[PACK_QUEUE];
+static uint32_t s_pack_qhead, s_pack_qtail;
+static pthread_mutex_t s_pack_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_pack_wake = PTHREAD_COND_INITIALIZER;
+static int s_pack_sync;
+
+static void *pack_loader(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        while (__atomic_load_n(&s_pack_qtail, __ATOMIC_RELAXED)
+               != __atomic_load_n(&s_pack_qhead, __ATOMIC_ACQUIRE)) {
+            pack_load(s_pack_q[s_pack_qtail % PACK_QUEUE]);
+            __atomic_add_fetch(&s_pack_qtail, 1, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_lock(&s_pack_lock);
+        if (__atomic_load_n(&s_pack_qtail, __ATOMIC_RELAXED)
+                == __atomic_load_n(&s_pack_qhead, __ATOMIC_ACQUIRE))
+            pthread_cond_wait(&s_pack_wake, &s_pack_lock);
+        pthread_mutex_unlock(&s_pack_lock);
+    }
+    return NULL;
+}
+
+/* The pack entry for a texture whose guest bytes are new, or NULL. Render
+ * thread (or the executor's, without one). */
+static PackEntry *tex_pack_lookup(const Nv2aHwTexture *t, const GlTexture *e)
+{
+    uint32_t bb, crc, at, i, lb, wh = (e->w << 16) | e->h;
+    int linear;
+    PackEntry *pe = NULL;
+
+    if (s_pack_on < 0) {
+        s_pack_dir = getenv("RECOMP_TEXTURE_PACK");
+        s_pack_on = s_pack_dir && *s_pack_dir
+                 && (s_pack = (PackEntry *)calloc(PACK_SLOTS, sizeof *s_pack)) != NULL;
+        if (s_pack_on) {
+            const char *sy = getenv("RECOMP_TEXTURE_PACK_SYNC");
+            pthread_t th;
+            s_have_s3tc = epoxy_has_gl_extension("GL_EXT_texture_compression_s3tc");
+            s_have_bptc = epoxy_gl_version() >= 42
+                       || epoxy_has_gl_extension("GL_ARB_texture_compression_bptc");
+            s_pack_sync = sy && *sy && *sy != '0';
+            tailmap_load();
+            if (!s_pack_sync) {
+                if (pthread_create(&th, NULL, pack_loader, NULL) == 0)
+                    pthread_detach(th);
+                else
+                    s_pack_sync = 1;
+            }
+            fprintf(stderr, "  [GL] texture pack: %s (%s; S3TC %s, BC7 %s)\n", s_pack_dir,
+                    s_pack_sync ? "loaded in place" : "loaded in the background",
+                    s_have_s3tc ? "yes" : "no", s_have_bptc ? "yes" : "no");
+        }
+    }
+    if (!s_pack_on || e->cube)
+        return NULL;
+    bb = d3d8_format_dxt_block_bytes(t->color);
+    linear = !d3d8_format_is_swizzled(t->color) && !bb;
+    lb = level_bytes(t->color, e->w, e->h, t->pitch, linear);
+    crc = crc32_bytes(guest() + t->va, lb);
+    at = (crc ^ (e->w * 73856093u) ^ (e->h * 19349663u) ^ t->color) & (PACK_SLOTS - 1);
+    for (i = 0; i < 64; i++) {
+        PackEntry *c = &s_pack[(at + i) & (PACK_SLOTS - 1)];
+        if (!c->used) { pe = c; break; }
+        if (c->crc == crc && c->wh == wh && c->color == t->color)
+            return c;
+    }
+    if (!pe)
+        return NULL;                          /* table full here: no probe */
+    /* A DXT texture whose first block alone changed is one already seen
+     * (the pool's free-list header): keep its replacement. */
+    if (bb && lb > 64) {
+        uint32_t tail = crc32_bytes(guest() + t->va + 16, lb - 16);
+        uint32_t ta = (tail ^ (wh * 2654435761u) ^ t->color) & (PACK_TAIL_SLOTS - 1);
+        if (!s_pack_tail)
+            s_pack_tail = (PackEntry **)calloc(PACK_TAIL_SLOTS, sizeof *s_pack_tail);
+        for (i = 0; s_pack_tail && i < 64; i++) {
+            PackEntry **slot = &s_pack_tail[(ta + i) & (PACK_TAIL_SLOTS - 1)];
+            PackEntry *c = *slot;
+            if (!c) {
+                *slot = pe;                   /* first sight: remember it */
+                break;
+            }
+            if (c->tail == tail && c->wh == wh && c->color == t->color) {
+                s_pack_freed++;
+                return c;
+            }
+        }
+        pe->tail = tail;
+    }
+    pe->used = 1;
+    pe->crc = crc;
+    pe->wh = wh;
+    pe->color = t->color;
+    pe->va = t->va;
+    pe->bytes = lb;
+    pe->state = 0;
+    if (s_pack_sync || s_pack_qhead - __atomic_load_n(&s_pack_qtail, __ATOMIC_ACQUIRE) >= PACK_QUEUE) {
+        pack_load(pe);
+    } else {
+        s_pack_q[s_pack_qhead % PACK_QUEUE] = pe;
+        pthread_mutex_lock(&s_pack_lock);
+        __atomic_add_fetch(&s_pack_qhead, 1, __ATOMIC_RELEASE);   /* publishes the slot */
+        pthread_cond_signal(&s_pack_wake);
+        pthread_mutex_unlock(&s_pack_lock);
+    }
+    return pe;
+}
+
+/* The replacement's texture, uploaded here the first time it is asked for
+ * once parsed; 0 while it is still loading or when the pack has none. */
+static GLuint pack_texture(PackEntry *pe)
+{
+    PackImage *im;
+    uint32_t i;
+
+    if (pe->obj || __atomic_load_n(&pe->state, __ATOMIC_ACQUIRE) != 1)
+        return pe->obj;
+    im = pe->img;
+    pe->img = NULL;
+    pe->state = 2;                            /* uploaded (or failed): done */
+    if (!im)
+        return 0;
+    glGenTextures(1, &pe->obj);
+    glBindTexture(GL_TEXTURE_2D, pe->obj);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, (GLint)im->levels - 1);
+    for (i = 0; i < im->levels; i++) {
+        GLsizei lw = (GLsizei)(im->w >> i ? im->w >> i : 1);
+        GLsizei lh = (GLsizei)(im->h >> i ? im->h >> i : 1);
+        if (im->fmt)
+            glTexImage2D(GL_TEXTURE_2D, (GLint)i, (GLint)im->ifmt, lw, lh, 0,
+                         im->fmt, im->type, im->buf + im->off[i]);
+        else
+            glCompressedTexImage2D(GL_TEXTURE_2D, (GLint)i, im->ifmt, lw, lh, 0,
+                                   (GLsizei)im->size[i], im->buf + im->off[i]);
+    }
+    free(im->buf);
+    free(im);
+    s_tex_uploads++;
+    return pe->obj;
 }
 
 /* Every level (and face) decoded to A8R8G8B8 and uploaded. */
@@ -810,16 +1225,25 @@ static GLuint tex_for_impl(const Nv2aHwTexture *t, int *cube, uint32_t *tw, uint
         e->checked_frame = s_frame;
         if (!tex_upload(e, t))
             return 0;
+        e->pack = tex_pack_lookup(t, e);
     } else if (e->checked_frame != s_frame) {
         uint64_t sh = hash_sparse(guest() + t->va, bytes);
         e->checked_frame = s_frame;
         if (sh != e->shash) {
             e->shash = sh;
             tex_upload(e, t);
+            e->pack = tex_pack_lookup(t, e);
         }
     }
+    /* The size stays the original's: rectangle coordinates are scaled by
+     * it, and a replacement is sampled with normalised ones. */
     *tw = w;
     *th = h;
+    if (e->pack) {
+        GLuint r = pack_texture(e->pack);
+        if (r)
+            return r;
+    }
     return e->obj;
 }
 
@@ -2240,6 +2664,9 @@ void nv2a_gl_report(void)
             (unsigned long long)s_draws, (unsigned long long)s_skipped,
             (unsigned long long)s_tex_uploads, (unsigned long long)s_compile_fail,
             (unsigned long long)s_other_thread);
+    if (s_pack_on > 0)
+        fprintf(stderr, "  [GL] texture pack: %u loaded, %u missed, %u by freed-texture tail\n",
+                s_pack_loaded, s_pack_misses, s_pack_freed);
     if (s_flips > s_rep_flips) {
         double n = (double)(s_flips - s_rep_flips);
         fprintf(stderr, "  [GL] per frame: %.2f ms in draws (%.2f of it textures),"
