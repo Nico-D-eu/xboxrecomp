@@ -795,6 +795,68 @@ translate:
 #include <sys/types.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <strings.h>
+
+/* FATX ignores case, as NTFS does, and a POSIX file system does not. A title
+ * that writes z:\guipackages\x and later opens z:\GuiPackages\X (Amped 2's
+ * GUI package cache) expects the same file, and so does every asset path
+ * whose case differs from the extracted disc. So a path that does not exist
+ * as spelled has each component of its guest part, from base_len on, looked
+ * up in its directory ignoring case. The first component with no match ends
+ * the walk, so a file about to be created keeps the title's spelling. The
+ * base directory is the host's and is left as it is. An existing path costs
+ * one stat. */
+static void fold_case(char *path, size_t base_len)
+{
+    struct stat st;
+    char *p = path + base_len;
+
+    if (stat(path, &st) == 0)
+        return;
+    while (*p) {
+        char *end, saved = 0;
+
+        while (*p == '/')
+            p++;
+        if (!*p || p == path)
+            return;
+        end = strchr(p, '/');
+        if (end) {
+            saved = *end;
+            *end = '\0';
+        }
+        if (stat(path, &st) != 0) {
+            size_t len = strlen(p);
+            int found = 0;
+            DIR *d;
+
+            p[-1] = '\0';                       /* the parent directory */
+            d = opendir(path[0] ? path : "/");
+            p[-1] = '/';
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d)) != NULL) {
+                    if (strlen(e->d_name) == len && strcasecmp(e->d_name, p) == 0) {
+                        memcpy(p, e->d_name, len);
+                        found = 1;
+                        break;
+                    }
+                }
+                closedir(d);
+            }
+            if (!found) {
+                if (end)
+                    *end = saved;
+                return;
+            }
+        }
+        if (!end)
+            return;
+        *end = saved;
+        p = end + 1;
+    }
+}
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
@@ -1031,6 +1093,7 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+        fold_case(host_path_buf, strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         /* As the Win32 backend does: the bridge reads back the host path
