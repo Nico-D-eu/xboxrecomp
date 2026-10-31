@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 extern void xbox_FramebufferWindowPresentArgb(const void *px, uint32_t w,
                                               uint32_t h, uint32_t row_pitch);
@@ -60,9 +61,29 @@ static SDL_Window *s_win;
 static SDL_GLContext s_ctx;
 static GLuint     s_fbo;
 static GlSurface  s_color[GL_SURFACES], s_depth[GL_SURFACES];
+/* What s_fbo has attached (bind_targets). Invalid after anything that may
+ * have changed it: a surface made or deleted (GL reuses names), the flip. */
+static int        s_att_valid, s_att_complete;
+static GLuint     s_att_color, s_att_depth;
+static uint32_t   s_vp_w, s_vp_h;
 static uint32_t   s_tick;
 static uint64_t   s_draws, s_clears, s_flips, s_other_thread;
 static uint32_t   s_frame;   /* flips so far */
+/* Where the time goes, for the [GL] report: nanoseconds in draws (all of
+ * it), in texture checks and uploads (part of the draws), in flips. */
+static uint64_t   s_ns_draw, s_ns_tex, s_ns_flip, s_rep_flips;
+static uint64_t   s_rep_draw, s_rep_tex, s_rep_flip;
+/* RECOMP_GL_PROFILE=1: the draw split into sections (prepare and program,
+ * targets, vertices, indices, uniforms, textures, state, the draw call). */
+static uint64_t   s_ns_part[8], s_rep_part[8];
+static int        s_profile = -1;
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 static uint8_t   *s_readback;
 static size_t     s_readback_cap;
 
@@ -174,6 +195,7 @@ static GlSurface *surface(GlSurface *tab, uint32_t va, uint32_t w, uint32_t h, i
         if (!e)
             e = lru;
     }
+    s_att_valid = 0;
     if (e->obj) {
         if (color)
             glDeleteTextures(1, &e->obj);
@@ -236,15 +258,27 @@ static int bind_targets(const Nv2aHwDraw *d, int want_color, int want_depth,
         ds = surface(s_depth, d->zeta_va, *w, *h, 0);
     if (!rt && !ds)
         return 0;
-    glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                           rt ? rt->obj : 0, 0);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
-                              GL_RENDERBUFFER, ds ? ds->obj : 0);
-    glDrawBuffer(rt ? GL_COLOR_ATTACHMENT0 : GL_NONE);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+    /* Attach only when the targets change: re-attaching for every draw
+     * revalidates the framebuffer each time. */
+    if (!s_att_valid || s_att_color != (rt ? rt->obj : 0) || s_att_depth != (ds ? ds->obj : 0)) {
+        glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                               rt ? rt->obj : 0, 0);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                                  GL_RENDERBUFFER, ds ? ds->obj : 0);
+        glDrawBuffer(rt ? GL_COLOR_ATTACHMENT0 : GL_NONE);
+        s_att_color = rt ? rt->obj : 0;
+        s_att_depth = ds ? ds->obj : 0;
+        s_att_complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        s_att_valid = 1;
+    }
+    if (!s_att_complete)
         return 0;
-    glViewport(0, 0, (GLsizei)*w, (GLsizei)*h);
+    if (s_vp_w != *w || s_vp_h != *h) {
+        glViewport(0, 0, (GLsizei)*w, (GLsizei)*h);
+        s_vp_w = *w;
+        s_vp_h = *h;
+    }
     return 1;
 }
 
@@ -369,8 +403,136 @@ typedef struct { uint64_t vs, ps; GLuint prog; } GlProgram;
 
 static GlShader  s_vs_cache[SHADER_SLOTS], s_ps_cache[SHADER_SLOTS];
 static GlProgram s_prog[PROG_SLOTS];
-static GLuint    s_ubo_vsc, s_ubo_vsd, s_ubo_psc, s_vao, s_vbo, s_ibo;
+static GLuint    s_vao;
 static const Nv2aVpState *s_vsc_owner;
+
+/* Streaming rings for vertices, indices and uniform blocks: each draw's data
+ * goes at the next free offset of one large buffer.
+ *
+ * With GL 4.4 (buffer storage) the buffer is mapped once, persistently and
+ * coherently, and written directly. The ring is in RING_PARTS parts; leaving
+ * a part fences it, and entering one waits for its fence, so nothing the GPU
+ * may still read is overwritten. Elsewhere (macOS's 4.1) each write maps its
+ * range unsynchronised and a full ring is orphaned.
+ *
+ * Measured in Amped 2's ML1 under Mesa's d3d12 driver: a whole buffer
+ * re-specified per draw, or a map and unmap per draw, both cost 60-120 us a
+ * draw -- 150 ms a frame at about 830 draws. */
+#define RING_PARTS 4
+
+typedef struct {
+    GLuint   buf;
+    GLenum   target;
+    uint32_t size, pos;
+    uint32_t epoch;          /* wraps so far: earlier ranges are gone */
+    uint8_t *map;            /* persistent mapping, or NULL */
+    GLsync   fence[RING_PARTS];
+} GlRing;
+
+static GlRing   s_vring, s_iring, s_uring;
+static GLint    s_ubo_align = 256;
+static uint32_t s_vsc_epoch;
+static int      s_persistent;
+
+static void ring_init(GlRing *r, GLenum target, uint32_t size)
+{
+    glGenBuffers(1, &r->buf);
+    r->target = target;
+    r->size = size;
+    r->pos = 0;
+    glBindBuffer(target, r->buf);
+    if (s_persistent) {
+        GLbitfield f = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+        glBufferStorage(target, size, NULL, f);
+        r->map = (uint8_t *)glMapBufferRange(target, 0, size, f);
+        if (r->map)
+            return;
+        /* No mapping after all: plain storage can't be re-specified, so
+         * start over with an ordinary buffer. */
+        glDeleteBuffers(1, &r->buf);
+        glGenBuffers(1, &r->buf);
+        glBindBuffer(target, r->buf);
+    }
+    glBufferData(target, size, NULL, GL_STREAM_DRAW);
+}
+
+/* Persistent rings: the GPU is done with part k before it is written. */
+static void ring_enter(GlRing *r, uint32_t k)
+{
+    if (r->fence[k]) {
+        glClientWaitSync(r->fence[k], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+        glDeleteSync(r->fence[k]);
+        r->fence[k] = 0;
+    }
+}
+
+static void ring_leave(GlRing *r, uint32_t k)
+{
+    if (r->fence[k])
+        glDeleteSync(r->fence[k]);
+    r->fence[k] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+}
+
+/* Move the write position to p, fencing and waiting at part boundaries. */
+static void ring_move(GlRing *r, uint32_t from, uint32_t to)
+{
+    uint32_t part = r->size / RING_PARTS, a = from / part, b;
+
+    if (!r->map)
+        return;
+    if (to < from) {                       /* wrapped */
+        for (b = a; b < RING_PARTS; b++)
+            ring_leave(r, b);
+        a = 0;
+        ring_enter(r, 0);
+    }
+    for (b = a + 1; b <= to / part && b < RING_PARTS; b++) {
+        ring_leave(r, b - 1);
+        ring_enter(r, b);
+    }
+}
+
+/* Room for n more bytes from here, wrapping (or orphaning) if not. */
+static void ring_reserve(GlRing *r, uint32_t n)
+{
+    if (r->pos + n <= r->size)
+        return;
+    if (r->map) {
+        ring_move(r, r->pos, 0);
+    } else {
+        glBindBuffer(r->target, r->buf);
+        glBufferData(r->target, r->size, NULL, GL_STREAM_DRAW);
+    }
+    r->pos = 0;
+    r->epoch++;
+}
+
+/* n bytes from src at the next offset aligned to align (*at). */
+static int ring_put(GlRing *r, const void *src, uint32_t n, uint32_t align, uint32_t *at)
+{
+    uint32_t p;
+
+    if (n + align > r->size)
+        return 0;
+    ring_reserve(r, n + align);
+    p = (r->pos + align - 1) / align * align;
+    if (r->map) {
+        ring_move(r, r->pos, p + n);
+        memcpy(r->map + p, src, n);
+    } else {
+        void *m;
+        glBindBuffer(r->target, r->buf);
+        m = glMapBufferRange(r->target, p, n, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT
+                                              | GL_MAP_INVALIDATE_RANGE_BIT);
+        if (!m)
+            return 0;
+        memcpy(m, src, n);
+        glUnmapBuffer(r->target);
+    }
+    r->pos = p + n;
+    *at = p;
+    return 1;
+}
 static uint32_t  s_vsc_gen;
 static uint64_t  s_skipped, s_compile_fail, s_tex_uploads;
 
@@ -563,7 +725,7 @@ static int tex_upload(GlTexture *e, const Nv2aHwTexture *t)
 
 /* The texture a stage samples, current with guest memory (checked once a
  * frame, sparsely). 0: none. */
-static GLuint tex_for(const Nv2aHwTexture *t, int *cube, uint32_t *tw, uint32_t *th)
+static GLuint tex_for_impl(const Nv2aHwTexture *t, int *cube, uint32_t *tw, uint32_t *th)
 {
     uint32_t bb = d3d8_format_dxt_block_bytes(t->color);
     int swz = d3d8_format_is_swizzled(t->color) || bb;
@@ -644,6 +806,14 @@ static GLuint tex_for(const Nv2aHwTexture *t, int *cube, uint32_t *tw, uint32_t 
     *tw = w;
     *th = h;
     return e->obj;
+}
+
+static GLuint tex_for(const Nv2aHwTexture *t, int *cube, uint32_t *tw, uint32_t *th)
+{
+    uint64_t t0 = now_ns();
+    GLuint r = tex_for_impl(t, cube, tw, th);
+    s_ns_tex += now_ns() - t0;
+    return r;
 }
 
 /* Sampler objects by filter, address and border. */
@@ -792,27 +962,20 @@ static void emit_tris(uint32_t prim, const uint32_t *idx, uint32_t n, uint32_t b
 static int draw_init(void)
 {
     glGenVertexArrays(1, &s_vao);
-    glGenBuffers(1, &s_vbo);
-    glGenBuffers(1, &s_ibo);
-    glGenBuffers(1, &s_ubo_vsc);
-    glGenBuffers(1, &s_ubo_vsd);
-    glGenBuffers(1, &s_ubo_psc);
-    glBindBuffer(GL_UNIFORM_BUFFER, s_ubo_vsc);
-    glBufferData(GL_UNIFORM_BUFFER, sizeof(float) * 4 * NV2A_VP_CONSTANTS, NULL, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_UNIFORM_BUFFER, s_ubo_vsd);
-    glBufferData(GL_UNIFORM_BUFFER, sizeof(Nv2aHlslVsParams), NULL, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_UNIFORM_BUFFER, s_ubo_psc);
-    glBufferData(GL_UNIFORM_BUFFER, sizeof(Nv2aHlslPsParams), NULL, GL_DYNAMIC_DRAW);
-    glBindBufferBase(GL_UNIFORM_BUFFER, 0, s_ubo_vsc);
-    glBindBufferBase(GL_UNIFORM_BUFFER, 1, s_ubo_vsd);
-    glBindBufferBase(GL_UNIFORM_BUFFER, 2, s_ubo_psc);
-    glBindVertexArray(s_vao);
+    glBindVertexArray(s_vao);           /* first: the index ring binds into it */
+    glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &s_ubo_align);
+    s_persistent = epoxy_gl_version() >= 44 || epoxy_has_gl_extension("GL_ARB_buffer_storage");
+    if (s_ubo_align < 16)
+        s_ubo_align = 16;
+    ring_init(&s_vring, GL_ARRAY_BUFFER, 32u << 20);
+    ring_init(&s_iring, GL_ELEMENT_ARRAY_BUFFER, 8u << 20);
+    ring_init(&s_uring, GL_UNIFORM_BUFFER, 16u << 20);
     /* No depth clip, as the D3D11 path (and the software one) draw. */
     glEnable(GL_DEPTH_CLAMP);
     return 1;
 }
 
-void nv2a_gl_draw(const Nv2aHwDraw *d)
+static void draw_impl(const Nv2aHwDraw *d)
 {
     static uint8_t *vbuf;
     static size_t vbuf_cap;
@@ -823,6 +986,14 @@ void nv2a_gl_draw(const Nv2aHwDraw *d)
     Nv2aHlslVsParams vsd;
     Nv2aHlslPsParams psd;
     uint32_t nstreams = 0, i, a, lo = 0xFFFFFFFFu, hi = 0, nidx, count, w, h, total;
+    uint32_t vb_at = 0, ib_at = 0, at = 0;
+    uint64_t mark = 0, tnow;
+#define MARK(k) do { if (s_profile) { tnow = now_ns(); s_ns_part[k] += tnow - mark; mark = tnow; } } while (0)
+
+    if (s_profile < 0)
+        s_profile = getenv("RECOMP_GL_PROFILE") != NULL;
+    if (s_profile)
+        mark = now_ns();
     GLuint prog;
 
     if (!on_thread())
@@ -842,12 +1013,14 @@ void nv2a_gl_draw(const Nv2aHwDraw *d)
         s_skipped++;
         return;
     }
+    MARK(0);
     if (!bind_targets(d, d->color_va && (d->color_mask & 0x01010101u), d->zeta_va != 0, &w, &h)) {
         s_skipped++;
         return;
     }
     mem = d->inline_base ? d->inline_base : guest();
 
+    MARK(1);
     /* Streams: one per interleaved buffer, copied over the index range. */
     memset(&vsd, 0, sizeof vsd);
     for (a = 0; a < 16; a++) {
@@ -905,8 +1078,10 @@ void nv2a_gl_draw(const Nv2aHwDraw *d)
         memcpy(vbuf + st[i].at, mem + src, avail);
         memset(vbuf + st[i].at + avail, 0, span - avail + 16);
     }
-    glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
-    glBufferData(GL_ARRAY_BUFFER, total ? total : 16, total ? vbuf : NULL, GL_STREAM_DRAW);
+    if (!ring_put(&s_vring, vbuf, total ? total : 16, 16, &vb_at)) {
+        s_skipped++;
+        return;
+    }
     for (a = 0; a < 16; a++) {
         const Nv2aHwAttr *at = &d->attr[a];
         uint32_t bytes, mode, s;
@@ -921,9 +1096,10 @@ void nv2a_gl_draw(const Nv2aHwDraw *d)
                 break;
         glEnableVertexAttribArray(a);
         glVertexAttribIPointer(a, comps, type, (GLsizei)at->stride,
-                               (const void *)(uintptr_t)(st[s].at + at->offset - st[s].base));
+                               (const void *)(uintptr_t)(vb_at + st[s].at + at->offset - st[s].base));
     }
 
+    MARK(2);
     if (ibuf_cap < nidx) {
         uint32_t *n = (uint32_t *)realloc(ibuf, (size_t)nidx * 4);
         if (!n)
@@ -932,9 +1108,12 @@ void nv2a_gl_draw(const Nv2aHwDraw *d)
         ibuf_cap = nidx;
     }
     emit_tris(d->prim, d->idx, d->idx_count, lo, ibuf);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_ibo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)nidx * 4, ibuf, GL_STREAM_DRAW);
+    if (!ring_put(&s_iring, ibuf, nidx * 4, 4, &ib_at)) {
+        s_skipped++;
+        return;
+    }
 
+    MARK(3);
     /* Vertex parameters, as nv2a_d3d11.c sets them. */
     vsd.vp[0] = 2.0f / (float)w;
     vsd.vp[1] = 2.0f / (float)h;
@@ -958,15 +1137,31 @@ void nv2a_gl_draw(const Nv2aHwDraw *d)
             && !(d->cur_attr_set & (1u << (d->diffuse_attr & 15))))
         vsd.adef[d->diffuse_attr & 15][0] = vsd.adef[d->diffuse_attr & 15][1] =
             vsd.adef[d->diffuse_attr & 15][2] = 1.0f;
-    glBindBuffer(GL_UNIFORM_BUFFER, s_ubo_vsd);
-    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof vsd, &vsd);
-    if (d->use_vp && (d->vp != s_vsc_owner || d->vp->constants_gen != s_vsc_gen)) {
-        glBindBuffer(GL_UNIFORM_BUFFER, s_ubo_vsc);
-        glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof d->vp->constants, d->vp->constants);
+    /* Room for all three blocks first: a wrap between them would leave the
+     * ranges already bound pointing into the storage it replaced. */
+    ring_reserve(&s_uring, sizeof vsd + sizeof psd + sizeof d->vp->constants
+                           + 3u * (uint32_t)s_ubo_align);
+    if (!ring_put(&s_uring, &vsd, sizeof vsd, (uint32_t)s_ubo_align, &at)) {
+        s_skipped++;
+        return;
+    }
+    glBindBufferRange(GL_UNIFORM_BUFFER, 1, s_uring.buf, at, sizeof vsd);
+    /* The constants only when they changed -- or the ring was replaced
+     * under the range still bound. */
+    if (d->use_vp && (d->vp != s_vsc_owner || d->vp->constants_gen != s_vsc_gen
+                      || s_vsc_epoch != s_uring.epoch)) {
+        if (!ring_put(&s_uring, d->vp->constants, sizeof d->vp->constants,
+                      (uint32_t)s_ubo_align, &at)) {
+            s_skipped++;
+            return;
+        }
+        glBindBufferRange(GL_UNIFORM_BUFFER, 0, s_uring.buf, at, sizeof d->vp->constants);
         s_vsc_owner = d->vp;
         s_vsc_gen = d->vp->constants_gen;
+        s_vsc_epoch = s_uring.epoch;
     }
 
+    MARK(4);
     /* Pixel parameters and textures. */
     memset(&psd, 0, sizeof psd);
     for (i = 0; i < 8; i++) {
@@ -1022,9 +1217,13 @@ void nv2a_gl_draw(const Nv2aHwDraw *d)
         smp = sampler_for(t, 16);
         glBindSampler(cube ? 4 + i : i, smp);
     }
-    glBindBuffer(GL_UNIFORM_BUFFER, s_ubo_psc);
-    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof psd, &psd);
+    if (!ring_put(&s_uring, &psd, sizeof psd, (uint32_t)s_ubo_align, &at)) {
+        s_skipped++;
+        return;
+    }
+    glBindBufferRange(GL_UNIFORM_BUFFER, 2, s_uring.buf, at, sizeof psd);
 
+    MARK(5);
     /* Fixed function: NV2A's values are GL's enums. */
     glUseProgram(prog);
     glEnable(GL_SCISSOR_TEST);
@@ -1061,7 +1260,11 @@ void nv2a_gl_draw(const Nv2aHwDraw *d)
     }
     glDisable(GL_CULL_FACE);        /* as nv2a_d3d11.c: culling not yet checked */
 
-    glDrawElements(GL_TRIANGLES, (GLsizei)nidx, GL_UNSIGNED_INT, NULL);
+    MARK(6);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_iring.buf);
+    glDrawElements(GL_TRIANGLES, (GLsizei)nidx, GL_UNSIGNED_INT, (const void *)(uintptr_t)ib_at);
+    MARK(7);
+#undef MARK
     {
         GlSurface *rt = d->color_va ? surface_find(s_color, d->color_va) : NULL;
         if (rt)
@@ -1072,7 +1275,7 @@ void nv2a_gl_draw(const Nv2aHwDraw *d)
 /* The finished frame, read back and handed to the window. Synchronous: a
  * pixel-buffer ring comes with the draws, when there is something to wait
  * for. */
-void nv2a_gl_flip(uint32_t color_va)
+static void flip_impl(uint32_t color_va)
 {
     GlSurface *e;
     size_t need;
@@ -1094,6 +1297,7 @@ void nv2a_gl_flip(uint32_t color_va)
     glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->obj, 0);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
+    s_att_valid = 0;
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glReadPixels(0, 0, (GLsizei)e->w, (GLsizei)e->h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
@@ -1125,6 +1329,20 @@ void nv2a_gl_flip(uint32_t color_va)
     }
 }
 
+void nv2a_gl_draw(const Nv2aHwDraw *d)
+{
+    uint64_t t0 = now_ns();
+    draw_impl(d);
+    s_ns_draw += now_ns() - t0;
+}
+
+void nv2a_gl_flip(uint32_t color_va)
+{
+    uint64_t t0 = now_ns();
+    flip_impl(color_va);
+    s_ns_flip += now_ns() - t0;
+}
+
 /* Visibility tests are not counted yet: reports stay as the guest left
  * them, which reads as "hidden" (no lens flares). */
 void nv2a_gl_zpass(int enable) { (void)enable; }
@@ -1143,6 +1361,27 @@ void nv2a_gl_report(void)
             (unsigned long long)s_draws, (unsigned long long)s_skipped,
             (unsigned long long)s_tex_uploads, (unsigned long long)s_compile_fail,
             (unsigned long long)s_other_thread);
+    if (s_flips > s_rep_flips) {
+        double n = (double)(s_flips - s_rep_flips);
+        fprintf(stderr, "  [GL] per frame: %.2f ms in draws (%.2f of it textures),"
+                        " %.2f ms in the flip\n",
+                (double)(s_ns_draw - s_rep_draw) / n / 1e6,
+                (double)(s_ns_tex - s_rep_tex) / n / 1e6,
+                (double)(s_ns_flip - s_rep_flip) / n / 1e6);
+        s_rep_flips = s_flips;
+        s_rep_draw = s_ns_draw;
+        s_rep_tex = s_ns_tex;
+        s_rep_flip = s_ns_flip;
+        if (s_profile > 0) {
+            int k;
+            fprintf(stderr, "  [GL] draw sections per frame (ms):");
+            for (k = 0; k < 8; k++) {
+                fprintf(stderr, " %.2f", (double)(s_ns_part[k] - s_rep_part[k]) / n / 1e6);
+                s_rep_part[k] = s_ns_part[k];
+            }
+            fprintf(stderr, "\n");
+        }
+    }
 }
 
 #endif /* !_WIN32 */
