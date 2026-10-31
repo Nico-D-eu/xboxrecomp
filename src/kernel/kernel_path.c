@@ -1095,6 +1095,54 @@ translate:
         }
         fold_case(host_path_buf, strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
 
+        /* RECOMP_OVERLAY_DIR, as the Win32 backend reads it: ';'-separated
+         * directories searched in order for a file at the same relative
+         * path as one in the game dir; the first that has it wins. Game
+         * media only, not saves or caches; listings are not merged. Case is
+         * folded inside each overlay as in the game dir. */
+        if (base_dir == s_game_dir && !sub_dir && remainder_posix[0]) {
+#define OVERLAY_MAX 16
+            static char overlay[OVERLAY_MAX][MAX_PATH];
+            static int n_overlay = -1;              /* -1 unread */
+            int k;
+            if (n_overlay < 0) {
+                const char *e = getenv("RECOMP_OVERLAY_DIR");
+                n_overlay = 0;
+                while (e && *e && n_overlay < OVERLAY_MAX) {
+                    const char *end = strchr(e, ';');
+                    size_t len = end ? (size_t)(end - e) : strlen(e);
+                    struct stat st;
+                    if (len && len < MAX_PATH) {
+                        int dir;
+                        memcpy(overlay[n_overlay], e, len);
+                        overlay[n_overlay][len] = 0;
+                        strip_trailing_slash(overlay[n_overlay]);
+                        dir = stat(overlay[n_overlay], &st) == 0 && S_ISDIR(st.st_mode);
+                        fprintf(stderr, "  [PATH] overlay %s %s\n", overlay[n_overlay],
+                                dir ? "on" : "(not a directory, off)");
+                        if (dir)
+                            n_overlay++;
+                    }
+                    e = end ? end + 1 : NULL;
+                }
+                fflush(stderr);
+            }
+            for (k = 0; k < n_overlay; k++) {
+                char cand[MAX_PATH];
+                struct stat st;
+                if (snprintf(cand, sizeof cand, "%s/%s", overlay[k], remainder_posix)
+                        >= (int)sizeof cand)
+                    continue;
+                fold_case(cand, strlen(overlay[k]));
+                if (stat(cand, &st) == 0 && S_ISREG(st.st_mode)) {
+                    snprintf(host_path_buf, buf_size, "%s", cand);
+                    fprintf(stderr, "  [PATH] %s -> overlay %d\n", xbox_path, k);
+                    fflush(stderr);
+                    break;
+                }
+            }
+        }
+
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         /* As the Win32 backend does: the bridge reads back the host path
          * the call it just made translated (the missing-file report, the
