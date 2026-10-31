@@ -84,8 +84,6 @@ static uint64_t now_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
-static uint8_t   *s_readback;
-static size_t     s_readback_cap;
 
 /* A surface's size, as nv2a_d3d11.c works it out (there inside its _WIN32
  * block): swizzled surfaces carry their size in the format, linear ones
@@ -1272,13 +1270,50 @@ static void draw_impl(const Nv2aHwDraw *d)
     }
 }
 
-/* The finished frame, read back and handed to the window. Synchronous: a
- * pixel-buffer ring comes with the draws, when there is something to wait
- * for. */
+/* The frame read back without waiting for it: each flip starts reading its
+ * frame into one of two pixel-pack buffers and shows the frame read at the
+ * flip before, which the GPU has long finished. The window runs a frame
+ * behind; in return the CPU never waits for the GPU here, which with a
+ * synchronous glReadPixels it did every frame (about 9 ms in ML1). */
+static GLuint   s_rfbo, s_pbo[2];
+static uint32_t s_pbo_w[2], s_pbo_h[2];
+static size_t   s_pbo_cap[2];
+static GLsync   s_pbo_fence[2];
+static int      s_pbo_next;
+
+/* RECOMP_GL_SHOT=<n>: every n-th frame as gl_shot_<frame>.ppm in the
+ * working directory. */
+static void shot(const uint8_t *px, uint32_t w, uint32_t h)
+{
+    static int every = -1;
+    char path[64];
+    FILE *f;
+    size_t k, n = (size_t)w * h;
+
+    if (every < 0) {
+        const char *v = getenv("RECOMP_GL_SHOT");
+        every = v ? atoi(v) : 0;
+    }
+    if (every <= 0 || s_frame % (uint32_t)every != 0)
+        return;
+    snprintf(path, sizeof path, "gl_shot_%05u.ppm", s_frame);
+    if ((f = fopen(path, "wb")) == NULL)
+        return;
+    fprintf(f, "P6 %u %u 255\n", w, h);
+    for (k = 0; k < n; k++) {
+        const uint8_t *p = px + k * 4;              /* B, G, R, A */
+        fputc(p[2], f);
+        fputc(p[1], f);
+        fputc(p[0], f);
+    }
+    fclose(f);
+}
+
 static void flip_impl(uint32_t color_va)
 {
     GlSurface *e;
     size_t need;
+    int k, j;
 
     if (!on_thread())
         return;
@@ -1286,47 +1321,50 @@ static void flip_impl(uint32_t color_va)
     s_frame++;
     if (!(e = surface_find(s_color, color_va)))
         return;
-    need = (size_t)e->w * e->h * 4;
-    if (s_readback_cap < need) {
-        uint8_t *n = (uint8_t *)realloc(s_readback, need);
-        if (!n)
-            return;
-        s_readback = n;
-        s_readback_cap = need;
+    if (!s_rfbo) {
+        glGenFramebuffers(1, &s_rfbo);
+        glGenBuffers(2, s_pbo);
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->obj, 0);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
-    s_att_valid = 0;
+
+    /* Start this frame's read. */
+    k = s_pbo_next;
+    s_pbo_next ^= 1;
+    need = (size_t)e->w * e->h * 4;
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, s_pbo[k]);
+    if (s_pbo_cap[k] < need) {
+        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)need, NULL, GL_STREAM_READ);
+        s_pbo_cap[k] = need;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, s_rfbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->obj, 0);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, (GLsizei)e->w, (GLsizei)e->h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
-                 s_readback);
-    xbox_FramebufferWindowPresentArgb(s_readback, e->w, e->h, e->w * 4);
-    {   /* RECOMP_GL_SHOT=<n>: every n-th frame as gl_shot_<frame>.ppm in the
-         * working directory. */
-        static int every = -1;
-        if (every < 0) {
-            const char *v = getenv("RECOMP_GL_SHOT");
-            every = v ? atoi(v) : 0;
-        }
-        if (every > 0 && s_frame % (uint32_t)every == 0) {
-            char path[64];
-            FILE *f;
-            snprintf(path, sizeof path, "gl_shot_%05u.ppm", s_frame);
-            if ((f = fopen(path, "wb")) != NULL) {
-                size_t k, n = (size_t)e->w * e->h;
-                fprintf(f, "P6 %u %u 255\n", e->w, e->h);
-                for (k = 0; k < n; k++) {
-                    const uint8_t *p = s_readback + k * 4;   /* B, G, R, A */
-                    fputc(p[2], f);
-                    fputc(p[1], f);
-                    fputc(p[0], f);
-                }
-                fclose(f);
-            }
+    glReadPixels(0, 0, (GLsizei)e->w, (GLsizei)e->h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
+    if (s_pbo_fence[k])
+        glDeleteSync(s_pbo_fence[k]);
+    s_pbo_fence[k] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    s_pbo_w[k] = e->w;
+    s_pbo_h[k] = e->h;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, s_fbo);
+
+    /* Show the one started at the last flip. */
+    j = k ^ 1;
+    if (s_pbo_fence[j]) {
+        const uint8_t *px;
+        glClientWaitSync(s_pbo_fence[j], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+        glDeleteSync(s_pbo_fence[j]);
+        s_pbo_fence[j] = 0;
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, s_pbo[j]);
+        px = (const uint8_t *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
+                                               (GLsizeiptr)s_pbo_w[j] * s_pbo_h[j] * 4,
+                                               GL_MAP_READ_BIT);
+        if (px) {
+            xbox_FramebufferWindowPresentArgb(px, s_pbo_w[j], s_pbo_h[j], s_pbo_w[j] * 4);
+            shot(px, s_pbo_w[j], s_pbo_h[j]);
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
         }
     }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 }
 
 void nv2a_gl_draw(const Nv2aHwDraw *d)
