@@ -15,11 +15,15 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
-/* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
- * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
- * now the whole body is Windows-only so apu_emu links on Debian. */
+/* The MMIO hook is an x86-64 instruction decoder. On Windows the title's VEH
+ * hands it the CONTEXT; on POSIX x86-64 xbox_PosixMmioFault hands it the
+ * registers copied out of the signal's ucontext_t (mmio_ctx_t). An arm64
+ * host uses apu_hook_handle_mmio_posix and the A64 decoder instead. */
+#if defined(_WIN32) || defined(__x86_64__)
 #if defined(_WIN32)
 #include <windows.h>
+#endif
+#include "mmio_decode.h"   /* mmio_ctx_t */
 
 /* APU MMIO base in Xbox VA space */
 #define APU_MMIO_BASE  0xFE800000u
@@ -36,7 +40,7 @@ static int g_apu_mmio_decode_fail = 0;
  * x86-64 register access helpers (same as NV2A hook)
  * ============================================================ */
 
-static uint64_t *ctx_reg64(PCONTEXT ctx, int reg)
+static uint64_t *ctx_reg64(mmio_ctx_t ctx, int reg)
 {
     switch (reg & 0xF) {
     case 0:  return (uint64_t*)&ctx->Rax;
@@ -78,7 +82,7 @@ static int decode_modrm_len(const uint8_t *ip, int has_rex_b)
  * Instruction decoder for APU MMIO access
  * ============================================================ */
 
-static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
+static bool apu_decode_and_handle(mmio_ctx_t ctx, uint32_t mmio_offset, int is_write)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
     if (!g_apu_state) return false;
@@ -254,7 +258,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
  * Public API (called from VEH in main.c)
  * ============================================================ */
 
-bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+bool apu_hook_handle_mmio(mmio_ctx_t ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
@@ -280,4 +284,4 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     return ok;
 }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || __x86_64__ */

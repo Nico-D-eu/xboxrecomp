@@ -43,6 +43,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "video_player.h"
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
@@ -213,6 +214,49 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
 static int (*s_guest_main)(void);
 static volatile int s_guest_rc;
 static Uint32 s_guest_done_event;
+static Uint32 s_fullscreen_event;            /* xbox_SetFullscreen, user.code */
+static volatile int s_fullscreen;
+
+/* Set by the project: flush its log on quit, quickly and without stdio, as
+ * fb_present.c's close handler does. NULL: the usual exit(). */
+void (*g_xbox_quit_logs)(void);
+
+/* Quit as the window's close button does, for a project that offers it from
+ * inside the title. Callable from any thread; no window, no-op. */
+void xbox_RequestQuit(void)
+{
+    SDL_Event ev;
+    if (!__atomic_load_n(&s_running, __ATOMIC_ACQUIRE))
+        return;
+    memset(&ev, 0, sizeof ev);
+    ev.type = SDL_QUIT;
+    SDL_PushEvent(&ev);
+}
+
+/* Fullscreen on or off, as F11 does. Callable from any thread: the change is
+ * made on the window's thread. */
+void xbox_SetFullscreen(int on)
+{
+    SDL_Event ev;
+    if (!__atomic_load_n(&s_running, __ATOMIC_ACQUIRE))
+        return;
+    memset(&ev, 0, sizeof ev);
+    ev.type = s_fullscreen_event;
+    ev.user.code = on != 0;
+    SDL_PushEvent(&ev);
+}
+
+int xbox_IsFullscreen(void)
+{
+    return s_fullscreen;
+}
+
+/* Borderless fullscreen at the desktop's resolution, like the Win32 window's. */
+static void set_fullscreen(SDL_Window *win, int on)
+{
+    if (SDL_SetWindowFullscreen(win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) == 0)
+        s_fullscreen = on;
+}
 
 static void *guest_thread(void *arg)
 {
@@ -322,7 +366,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     FB_W, FB_H, ri.name, vsync ? "on" : "off");
     }
 
-    s_guest_done_event = SDL_RegisterEvents(2);
+    s_guest_done_event = SDL_RegisterEvents(3);
     if (s_guest_done_event == (Uint32)-1) {
         fprintf(stderr, "  [FBWIN] SDL_RegisterEvents failed; running headless\n");
         SDL_DestroyRenderer(ren);
@@ -331,6 +375,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         return guest_main();
     }
     s_frame_event = s_guest_done_event + 1;
+    s_fullscreen_event = s_guest_done_event + 2;
+    e = getenv("RECOMP_WINDOW_MODE");
+    if (e && (!strcmp(e, "borderless") || !strcmp(e, "fullscreen")))
+        set_fullscreen(win, 1);
     s_guest_main = guest_main;
     /* This thread pumps SDL events from here on, which also updates the
      * game controllers; the input layer then only reads them. */
@@ -367,6 +415,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     guest_done = 1;
                 else if (ev.type == s_frame_event)
                     __atomic_store_n(&s_wake_pending, 0, __ATOMIC_RELEASE);
+                else if (ev.type == s_fullscreen_event)
+                    set_fullscreen(win, ev.user.code);
+                else if (ev.type == SDL_KEYDOWN && !ev.key.repeat
+                         && (ev.key.keysym.sym == SDLK_F11
+                             || (ev.key.keysym.sym == SDLK_RETURN
+                                 && (ev.key.keysym.mod & KMOD_ALT))))
+                    set_fullscreen(win, !s_fullscreen);
                 else if (ev.type == SDL_WINDOWEVENT
                          && (ev.window.event == SDL_WINDOWEVENT_EXPOSED
                              || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED))
@@ -436,6 +491,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     __atomic_store_n(&s_running, 0, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&s_in_present, __ATOMIC_SEQ_CST))
         sched_yield();
+    /* A project with an asynchronous log flushes it its own bounded way and
+     * the process ends here: exit()'s handlers can wait on a lock that a
+     * guest thread holds (see fb_present.c, WM_CLOSE). */
+    if (quit && g_xbox_quit_logs) {
+        SDL_HideWindow(win);
+        g_xbox_quit_logs();
+        _exit(0);
+    }
     fprintf(stderr, "  [FBWIN] %s\n", quit ? "window closed" : "guest returned");
     fflush(stdout);
     fflush(stderr);
