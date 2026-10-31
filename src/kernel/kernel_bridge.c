@@ -5313,7 +5313,9 @@ static int bridge_async_io_enabled(void)
 /* RECOMP_READ_VERIFY=1: read the same bytes again through a handle of our
  * own and compare -- whether what a title's decoder chokes on is what is on
  * disk. Logs a mismatch with the file's path, the offset and the first
- * differing byte (the first 32 mismatches), and a tally every 2000 reads. */
+ * differing byte (the first 32 mismatches), and a tally every 2000 reads.
+ * Windows only; elsewhere it does nothing. */
+#if defined(_WIN32)
 static void bridge_verify_read(HANDLE h, long long at, const uint8_t *got, uint32_t n)
 {
     static int on = -1;
@@ -5357,6 +5359,12 @@ static void bridge_verify_read(HANDLE h, long long at, const uint8_t *got, uint3
     free(mine);
     CloseHandle(h2);
 }
+#else
+static void bridge_verify_read(HANDLE h, long long at, const uint8_t *got, uint32_t n)
+{
+    (void)h; (void)at; (void)got; (void)n;
+}
+#endif
 
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
@@ -5385,10 +5393,12 @@ static void bridge_NtReadFile(void)
         static int verify = -1;
         if (verify < 0)
             verify = getenv("RECOMP_READ_VERIFY") != NULL;
+#if defined(_WIN32)
         if (verify && !poff) {
             LARGE_INTEGER z = {0};
             SetFilePointerEx(handle, z, &off, FILE_CURRENT);
         }
+#endif
     }
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
