@@ -30,6 +30,7 @@
 #include <SDL.h>
 #include <epoxy/gl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -122,10 +123,6 @@ static int draw_init(void);
 
 static int init(void)
 {
-    const char *e = getenv("RECOMP_GPU");
-
-    if (!e || strcmp(e, "gl") != 0)
-        return 0;
     if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "  [GL] no SDL video (%s); software rasteriser\n", SDL_GetError());
         return 0;
@@ -151,13 +148,6 @@ static int init(void)
     fprintf(stderr, "  [GL] back end up: %s, OpenGL %s\n",
             (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
     return 1;
-}
-
-int nv2a_gl_active(void)
-{
-    if (!s_state)
-        s_state = init() ? 1 : -1;
-    return s_state == 1;
 }
 
 /* The context belongs to the thread that made it. The executor makes every
@@ -282,7 +272,7 @@ static int bind_targets(const Nv2aHwDraw *d, int want_color, int want_depth,
     return 1;
 }
 
-void nv2a_gl_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color, uint32_t zclear)
+static void do_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color, uint32_t zclear)
 {
     GLbitfield bits = 0;
     uint32_t w, h;
@@ -1425,18 +1415,412 @@ static void flip_impl(uint32_t color_va)
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 }
 
-void nv2a_gl_draw(const Nv2aHwDraw *d)
+static void do_draw(const Nv2aHwDraw *d)
 {
     uint64_t t0 = now_ns();
     draw_impl(d);
     s_ns_draw += now_ns() - t0;
 }
 
-void nv2a_gl_flip(uint32_t color_va)
+static void do_flip(uint32_t color_va)
 {
     uint64_t t0 = now_ns();
     flip_impl(color_va);
     s_ns_flip += now_ns() - t0;
+}
+
+/* ── The render thread ───────────────────────────────────────────────────
+ *
+ * nv2a_d3d11.c's design, for the same reason: with GL on the executor's
+ * thread, every millisecond of driver work was the title's too (ML1: about
+ * 11 ms of executor work and 13 of GL a frame, one after the other). So the
+ * executor only snapshots a draw -- its description, the indices rebased to
+ * zero and the vertex bytes it reads out of guest memory -- into a packet
+ * on a ring, and this thread, which owns the context, does the GL work from
+ * the packets. Vertex-program and combiner state travel as packets of their
+ * own, sent when their change counters move. Textures are read from guest
+ * memory when the draw is replayed, as on D3D11.
+ *
+ * RECOMP_GPU_THREAD=0 does the GL work on the executor's thread. */
+
+enum { PKT_WRAP = 1, PKT_DRAW, PKT_CLEAR, PKT_FLIP, PKT_VP_PROG, PKT_VP_CONST, PKT_COMB };
+
+typedef struct { uint32_t type, bytes; } PktHdr;        /* bytes includes this */
+
+typedef struct {
+    PktHdr     h;
+    Nv2aHwDraw d;
+    float      cur[16][4];
+    uint32_t   nidx, blob_bytes;
+    /* uint32_t idx[nidx]; then the vertex blob, 16-aligned */
+} PktDraw;
+
+typedef struct { PktHdr h; Nv2aHwDraw d; uint32_t flags, color, zclear; } PktClear;
+typedef struct { PktHdr h; uint32_t color_va; } PktFlip;
+typedef struct {
+    PktHdr   h;
+    uint32_t program_start, program_gen, execution_mode;
+    uint32_t program[NV2A_VP_SLOTS][4];
+} PktVpProg;
+typedef struct {
+    PktHdr   h;
+    uint32_t constants_gen;
+    float    constants[NV2A_VP_CONSTANTS][4];
+} PktVpConst;
+typedef struct { PktHdr h; Nv2aCombiner comb; } PktComb;
+
+#define CMD_RING_BYTES (64u << 20)
+static uint8_t        *s_cmd;
+static uint64_t        s_cmd_head, s_cmd_tail;    /* bytes ever written / read */
+static int             s_consumer_idle, s_threaded;
+static pthread_mutex_t s_cmd_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_cmd_wake = PTHREAD_COND_INITIALIZER;
+static uint32_t        s_flips_queued, s_flips_done;
+static Nv2aVpState     s_rvp;                     /* render-side copies */
+static Nv2aCombiner    s_rcomb;
+
+static uint32_t align16(uint32_t n)
+{
+    return (n + 15u) & ~15u;
+}
+
+static void cmd_wake(void)
+{
+    pthread_mutex_lock(&s_cmd_lock);
+    pthread_cond_signal(&s_cmd_wake);
+    pthread_mutex_unlock(&s_cmd_lock);
+}
+
+static uint8_t *cmd_reserve(uint32_t bytes)
+{
+    for (;;) {
+        uint64_t head = __atomic_load_n(&s_cmd_head, __ATOMIC_RELAXED);
+        uint64_t tail = __atomic_load_n(&s_cmd_tail, __ATOMIC_ACQUIRE);
+        uint32_t pos = (uint32_t)(head % CMD_RING_BYTES), need = bytes;
+
+        if (pos + bytes > CMD_RING_BYTES)
+            need += CMD_RING_BYTES - pos;        /* the wrap, then the packet */
+        if ((uint64_t)CMD_RING_BYTES - (head - tail) >= need) {
+            if (pos + bytes > CMD_RING_BYTES) {
+                if (CMD_RING_BYTES - pos >= sizeof(PktHdr)) {
+                    PktHdr *w = (PktHdr *)(s_cmd + pos);
+                    w->type = PKT_WRAP;
+                    w->bytes = CMD_RING_BYTES - pos;
+                }
+                __atomic_store_n(&s_cmd_head, head + (CMD_RING_BYTES - pos), __ATOMIC_RELEASE);
+                continue;
+            }
+            return s_cmd + pos;
+        }
+        cmd_wake();                              /* full: make sure it drains */
+        sched_yield();
+    }
+}
+
+static void cmd_commit(uint32_t bytes)
+{
+    __atomic_store_n(&s_cmd_head, s_cmd_head + bytes, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&s_consumer_idle, __ATOMIC_ACQUIRE))
+        cmd_wake();
+}
+
+static void send_state(const Nv2aHwDraw *d)
+{
+    static const Nv2aVpState *vp_owner;
+    static uint32_t prog_gen = 0xFFFFFFFFu, prog_start = 0xFFFFFFFFu, const_gen = 0xFFFFFFFFu;
+    static const Nv2aCombiner *comb_owner;
+    static uint32_t comb_gen = 0xFFFFFFFFu;
+
+    if (d->vp && (d->vp != vp_owner || d->vp->program_gen != prog_gen
+                  || d->vp->program_start != prog_start)) {
+        PktVpProg *p = (PktVpProg *)cmd_reserve(align16(sizeof *p));
+        p->h.type = PKT_VP_PROG;
+        p->h.bytes = align16(sizeof *p);
+        p->program_start = d->vp->program_start;
+        p->program_gen = d->vp->program_gen;
+        p->execution_mode = d->vp->execution_mode;
+        memcpy(p->program, d->vp->program, sizeof p->program);
+        cmd_commit(p->h.bytes);
+        prog_gen = d->vp->program_gen;
+        prog_start = d->vp->program_start;
+    }
+    if (d->vp && (d->vp != vp_owner || d->vp->constants_gen != const_gen)) {
+        PktVpConst *p = (PktVpConst *)cmd_reserve(align16(sizeof *p));
+        p->h.type = PKT_VP_CONST;
+        p->h.bytes = align16(sizeof *p);
+        p->constants_gen = d->vp->constants_gen;
+        memcpy(p->constants, d->vp->constants, sizeof p->constants);
+        cmd_commit(p->h.bytes);
+        const_gen = d->vp->constants_gen;
+    }
+    vp_owner = d->vp;
+    if (d->comb && (d->comb != comb_owner || d->comb->gen != comb_gen)) {
+        PktComb *p = (PktComb *)cmd_reserve(align16(sizeof *p));
+        p->h.type = PKT_COMB;
+        p->h.bytes = align16(sizeof *p);
+        p->comb = *d->comb;
+        cmd_commit(p->h.bytes);
+        comb_owner = d->comb;
+        comb_gen = d->comb->gen;
+    }
+}
+
+/* Snapshot a draw: which bytes of which streams it reads, copied, with the
+ * indices rebased so the copy starts at index 0. */
+static void queue_draw(const Nv2aHwDraw *d)
+{
+    const uint8_t *mem = d->inline_base ? d->inline_base : guest();
+    struct { uint32_t base, stride, end; } st[16];
+    uint32_t stream_of[16], nstreams = 0, lo = 0xFFFFFFFFu, hi = 0, i, a, count;
+    uint32_t blob = 0, blob_off[16], span[16], src[16], total;
+    PktDraw *p;
+    uint32_t *idx;
+    uint8_t *vb;
+
+    if (d->idx_count < 3 || !tri_indices(d->prim, d->idx_count))
+        return;
+    for (i = 0; i < d->idx_count; i++) {
+        if (d->idx[i] < lo) lo = d->idx[i];
+        if (d->idx[i] > hi) hi = d->idx[i];
+    }
+    count = hi - lo + 1;
+    if (count > (1u << 20)) {
+        s_skipped++;
+        return;
+    }
+    for (a = 0; a < 16; a++) {
+        const Nv2aHwAttr *at = &d->attr[a];
+        uint32_t bytes = 0, mode = 0, s;
+        GLint comps = 0;
+        GLenum type;
+
+        stream_of[a] = 0xFFFFFFFFu;
+        if (!at->size || !at->stride || (!d->inline_base && !at->offset))
+            continue;
+        attr_gl(at, &comps, &type, &bytes, &mode);
+        if (!comps || (at->stride % 4) || (at->offset % 4))
+            continue;
+        for (s = 0; s < nstreams; s++)
+            if (st[s].stride == at->stride && at->offset >= st[s].base
+                    && at->offset + bytes <= st[s].base + at->stride)
+                break;
+        if (s == nstreams) {
+            st[s].base = at->offset;
+            st[s].stride = at->stride;
+            st[s].end = 0;
+            nstreams++;
+        }
+        if (at->offset - st[s].base + bytes > st[s].end)
+            st[s].end = at->offset - st[s].base + bytes;
+        stream_of[a] = s;
+    }
+    for (i = 0; i < nstreams; i++) {
+        span[i] = (count - 1) * st[i].stride + st[i].end;
+        src[i] = st[i].base + lo * st[i].stride;
+        if (d->inline_base && src[i] + span[i] > d->inline_bytes)
+            span[i] = src[i] >= d->inline_bytes ? 0 : d->inline_bytes - src[i];
+        if (!d->inline_base && !guest_ok(src[i], span[i])) {
+            s_skipped++;
+            return;
+        }
+        blob_off[i] = blob;
+        blob += align16(span[i] + 16);           /* the draw path reads a little past */
+    }
+    total = align16(sizeof(PktDraw) + d->idx_count * 4) + blob;
+    if (total > CMD_RING_BYTES / 4) {
+        s_skipped++;
+        return;
+    }
+    send_state(d);
+
+    p = (PktDraw *)cmd_reserve(total);
+    p->h.type = PKT_DRAW;
+    p->h.bytes = total;
+    p->d = *d;
+    p->nidx = d->idx_count;
+    p->blob_bytes = blob;
+    if (d->cur_attr)
+        memcpy(p->cur, d->cur_attr, sizeof p->cur);
+    idx = (uint32_t *)(p + 1);
+    for (i = 0; i < d->idx_count; i++)
+        idx[i] = d->idx[i] - lo;
+    vb = (uint8_t *)p + align16(sizeof(PktDraw) + d->idx_count * 4);
+    for (i = 0; i < nstreams; i++) {
+        memcpy(vb + blob_off[i], mem + src[i], span[i]);
+        memset(vb + blob_off[i] + span[i], 0, 16);
+    }
+    /* Every attribute now lives in the blob; the rest are absent. */
+    for (a = 0; a < 16; a++) {
+        if (stream_of[a] == 0xFFFFFFFFu) {
+            p->d.attr[a].size = 0;
+            continue;
+        }
+        p->d.attr[a].offset = blob_off[stream_of[a]] + (d->attr[a].offset - st[stream_of[a]].base);
+    }
+    p->d.inline_bytes = blob;
+    p->d.cur_attr = d->cur_attr ? p->cur : NULL;
+    cmd_commit(total);
+}
+
+static int  s_init_done, s_init_ok;
+
+static void *render_thread(void *unused)
+{
+    (void)unused;
+    s_init_ok = init();
+    pthread_mutex_lock(&s_cmd_lock);
+    s_init_done = 1;
+    pthread_cond_broadcast(&s_cmd_wake);
+    pthread_mutex_unlock(&s_cmd_lock);
+    if (!s_init_ok)
+        return NULL;
+    for (;;) {
+        uint64_t tail = __atomic_load_n(&s_cmd_tail, __ATOMIC_RELAXED);
+        PktHdr *h;
+
+        if (tail == __atomic_load_n(&s_cmd_head, __ATOMIC_ACQUIRE)) {
+            struct timespec ts;
+            pthread_mutex_lock(&s_cmd_lock);
+            __atomic_store_n(&s_consumer_idle, 1, __ATOMIC_RELEASE);
+            if (tail == __atomic_load_n(&s_cmd_head, __ATOMIC_ACQUIRE)) {
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 2000000;
+                if (ts.tv_nsec >= 1000000000) {
+                    ts.tv_sec++;
+                    ts.tv_nsec -= 1000000000;
+                }
+                pthread_cond_timedwait(&s_cmd_wake, &s_cmd_lock, &ts);
+            }
+            __atomic_store_n(&s_consumer_idle, 0, __ATOMIC_RELEASE);
+            pthread_mutex_unlock(&s_cmd_lock);
+            continue;
+        }
+        h = (PktHdr *)(s_cmd + (uint32_t)(tail % CMD_RING_BYTES));
+        switch (h->type) {
+        case PKT_VP_PROG: {
+            const PktVpProg *p = (const PktVpProg *)h;
+            s_rvp.program_start = p->program_start;
+            s_rvp.program_gen = p->program_gen;
+            s_rvp.execution_mode = p->execution_mode;
+            memcpy(s_rvp.program, p->program, sizeof s_rvp.program);
+            break;
+        }
+        case PKT_VP_CONST: {
+            const PktVpConst *p = (const PktVpConst *)h;
+            s_rvp.constants_gen = p->constants_gen;
+            memcpy(s_rvp.constants, p->constants, sizeof s_rvp.constants);
+            break;
+        }
+        case PKT_COMB:
+            s_rcomb = ((const PktComb *)h)->comb;
+            break;
+        case PKT_DRAW: {
+            PktDraw *p = (PktDraw *)h;
+            p->d.idx = (const uint32_t *)(p + 1);
+            p->d.idx_count = p->nidx;
+            p->d.inline_base = (const uint8_t *)p + align16(sizeof(PktDraw) + p->nidx * 4);
+            if (p->d.cur_attr)
+                p->d.cur_attr = (const float (*)[4])p->cur;
+            p->d.vp = p->d.vp ? &s_rvp : NULL;
+            p->d.comb = p->d.comb ? &s_rcomb : NULL;
+            do_draw(&p->d);
+            break;
+        }
+        case PKT_CLEAR: {
+            const PktClear *p = (const PktClear *)h;
+            do_clear(&p->d, p->flags, p->color, p->zclear);
+            break;
+        }
+        case PKT_FLIP:
+            do_flip(((const PktFlip *)h)->color_va);
+            __atomic_add_fetch(&s_flips_done, 1, __ATOMIC_RELEASE);
+            break;
+        default:
+            break;
+        }
+        __atomic_store_n(&s_cmd_tail, tail + h->bytes, __ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+
+/* The back end, on first use: on a render thread of its own unless
+ * RECOMP_GPU_THREAD=0, else here on the executor's thread. */
+int nv2a_gl_active(void)
+{
+    const char *e;
+    pthread_t th;
+
+    if (s_state)
+        return s_state == 1;
+    e = getenv("RECOMP_GPU");
+    if (!e || strcmp(e, "gl") != 0) {
+        s_state = -1;
+        return 0;
+    }
+    e = getenv("RECOMP_GPU_THREAD");
+    if (!(e && *e == '0')) {
+        s_cmd = (uint8_t *)malloc(CMD_RING_BYTES);
+        if (s_cmd && pthread_create(&th, NULL, render_thread, NULL) == 0) {
+            pthread_detach(th);
+            pthread_mutex_lock(&s_cmd_lock);
+            while (!s_init_done)
+                pthread_cond_wait(&s_cmd_wake, &s_cmd_lock);
+            pthread_mutex_unlock(&s_cmd_lock);
+            s_state = s_init_ok ? 1 : -1;
+            if (s_init_ok) {
+                s_threaded = 1;
+                fprintf(stderr, "  [GL] drawing on a render thread (%u MB command ring)\n",
+                        CMD_RING_BYTES >> 20);
+            }
+            return s_state == 1;
+        }
+        free(s_cmd);
+        s_cmd = NULL;
+    }
+    s_state = init() ? 1 : -1;
+    return s_state == 1;
+}
+
+void nv2a_gl_draw(const Nv2aHwDraw *d)
+{
+    if (s_threaded)
+        queue_draw(d);
+    else
+        do_draw(d);
+}
+
+void nv2a_gl_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color, uint32_t zclear)
+{
+    PktClear *p;
+
+    if (!s_threaded) {
+        do_clear(d, flags, color, zclear);
+        return;
+    }
+    p = (PktClear *)cmd_reserve(align16(sizeof *p));
+    p->h.type = PKT_CLEAR;
+    p->h.bytes = align16(sizeof *p);
+    p->d = *d;
+    p->flags = flags;
+    p->color = color;
+    p->zclear = zclear;
+    cmd_commit(p->h.bytes);
+}
+
+void nv2a_gl_flip(uint32_t color_va)
+{
+    PktFlip *p;
+
+    if (!s_threaded) {
+        do_flip(color_va);
+        return;
+    }
+    __atomic_add_fetch(&s_flips_queued, 1, __ATOMIC_RELEASE);
+    p = (PktFlip *)cmd_reserve(align16(sizeof *p));
+    p->h.type = PKT_FLIP;
+    p->h.bytes = align16(sizeof *p);
+    p->color_va = color_va;
+    cmd_commit(p->h.bytes);
 }
 
 /* Visibility tests are not counted yet: reports stay as the guest left
@@ -1444,8 +1828,15 @@ void nv2a_gl_flip(uint32_t color_va)
 void nv2a_gl_zpass(int enable) { (void)enable; }
 void nv2a_gl_get_report(uint32_t va, uint32_t va_alt) { (void)va; (void)va_alt; }
 
-/* No queue yet: every call completes before it returns. */
-int nv2a_gl_frames_in_flight(void) { return -1; }
+/* Frames queued and not yet drawn, which the executor keeps small;
+ * -1 without a render thread. */
+int nv2a_gl_frames_in_flight(void)
+{
+    if (!s_threaded)
+        return -1;
+    return (int)(__atomic_load_n(&s_flips_queued, __ATOMIC_ACQUIRE)
+                 - __atomic_load_n(&s_flips_done, __ATOMIC_ACQUIRE));
+}
 
 void nv2a_gl_report(void)
 {
