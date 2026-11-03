@@ -28,6 +28,11 @@
  * example to print who opened a file). NULL by default. */
 void (*g_xbox_path_hook)(const char *xbox_path) = NULL;
 
+/* The project's replacement for the video overlay's picture (kernel.h).
+ * Kept here beside the path hook, so it exists whichever renderer is
+ * built. NULL by default. */
+const XboxOverlaySource *volatile g_xbox_overlay_source = NULL;
+
 /*
  * Helper: check if an ANSI string starts with a prefix (case-insensitive).
  * Returns the number of chars consumed from the prefix, or 0 if no match.

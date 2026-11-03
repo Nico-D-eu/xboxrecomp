@@ -40,6 +40,7 @@
 #include <dxgi1_6.h>
 
 #include "nv2a_hlsl.h"
+#include "overlay_source.h"       /* g_xbox_overlay_source */
 #include "xbox_memory_layout.h"   /* xbox_PinHostThread */
 #include "../d3d/d3d8_swizzle.h"
 
@@ -2998,6 +2999,9 @@ typedef struct {
 static ID3D11Texture2D *s_ov_tex;
 static ID3D11ShaderResourceView *s_ov_srv;
 static uint32_t s_ov_tw, s_ov_th;
+static ID3D11Texture2D *s_rep_tex;          /* g_xbox_overlay_source's picture */
+static ID3D11ShaderResourceView *s_rep_srv;
+static uint32_t s_rep_w, s_rep_h;
 static ID3D11VertexShader *s_ov_vs;
 static ID3D11PixelShader *s_ov_ps;
 static ID3D11Buffer *s_ov_cb;
@@ -3041,9 +3045,10 @@ static int overlay_read(Overlay *o)
 
 static const char s_ov_hlsl[] =
     "cbuffer O : register(b0) { float4 src; float4 dst; float4 frm; uint4 key; };\n"
-    /* src: w, h, s0, unused (source pixels); dst: x, y, w, h (guest pixels);
+    /* src: w, h, s0, replaced (source pixels); dst: x, y, w, h (guest pixels);
      * frm: frame w, h (guest pixels) and its uv scale; key: on, r, g, b */
     "Texture2D<float4> yuy : register(t0); Texture2D frame : register(t1);\n"
+    "Texture2D rep : register(t2);\n"
     "SamplerState sm : register(s0);\n"
     "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
     "V vs(uint id : SV_VertexID) {\n"
@@ -3059,6 +3064,7 @@ static const char s_ov_hlsl[] =
     "  float3 rgb = saturate(float3(1.164 * y + 1.596 * v,\n"
     "                               1.164 * y - 0.391 * u - 0.813 * v,\n"
     "                               1.164 * y + 2.018 * u));\n"
+    "  if (src.w != 0) rgb = rep.Sample(sm, i.uv).rgb;   /* the project's picture */\n"
     "  if (key.x != 0) {\n"
     "    float2 g = dst.xy + i.uv * dst.zw;\n"
     "    float3 f = frame.Sample(sm, g / frm.xy * frm.zw).rgb;\n"
@@ -3094,6 +3100,52 @@ static int overlay_init(void)
     return s_ov_ps && s_ov_vs && s_ov_cb;
 }
 
+/* The project's picture for the overlay (g_xbox_overlay_source), uploaded
+ * into s_rep_tex: 1 if there is one this frame. */
+static int overlay_replacement(void)
+{
+    const XboxOverlaySource *src = g_xbox_overlay_source;
+    const uint8_t *px;
+    uint32_t w = 0, h = 0, pitch = 0, y;
+    D3D11_MAPPED_SUBRESOURCE m;
+    int ok = 0;
+
+    if (!src || !(px = (const uint8_t *)src->acquire(&w, &h, &pitch)))
+        return 0;
+    if (w && h && w <= 8192 && h <= 8192 && pitch >= w * 4u) {
+        if (!s_rep_tex || s_rep_w != w || s_rep_h != h) {
+            D3D11_TEXTURE2D_DESC td;
+            if (s_rep_srv) ID3D11ShaderResourceView_Release(s_rep_srv);
+            if (s_rep_tex) ID3D11Texture2D_Release(s_rep_tex);
+            s_rep_srv = NULL;
+            s_rep_tex = NULL;
+            memset(&td, 0, sizeof td);
+            td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DYNAMIC;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_rep_tex)))
+                ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_rep_tex,
+                                                      NULL, &s_rep_srv);
+            s_rep_w = w;
+            s_rep_h = h;
+            fprintf(stderr, "  [D3D11] video overlay: the project's picture, %ux%u\n", w, h);
+        }
+        if (s_rep_srv && SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_rep_tex,
+                                                            0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            for (y = 0; y < h; y++)
+                memcpy((uint8_t *)m.pData + (size_t)y * m.RowPitch,
+                       px + (size_t)y * pitch, (size_t)w * 4);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_rep_tex, 0);
+            ok = 1;
+        }
+    }
+    src->release();
+    return ok;
+}
+
 /* Draw the overlay into the bound back buffer, over the frame already blitted
  * into `pic` (the letterboxed picture's viewport, in back-buffer pixels). */
 static void overlay_compose(RtEntry *rt, uint32_t fw, uint32_t fh, const D3D11_VIEWPORT *pic)
@@ -3102,7 +3154,8 @@ static void overlay_compose(RtEntry *rt, uint32_t fw, uint32_t fh, const D3D11_V
     D3D11_VIEWPORT vp;
     D3D11_MAPPED_SUBRESOURCE m;
     uint32_t tw, y;
-    ID3D11ShaderResourceView *srvs[2];
+    int replaced;
+    ID3D11ShaderResourceView *srvs[3];
 
     if (!overlay_read(&o) || !overlay_init())
         return;
@@ -3145,12 +3198,13 @@ static void overlay_compose(RtEntry *rt, uint32_t fw, uint32_t fh, const D3D11_V
         memcpy((uint8_t *)m.pData + (size_t)y * m.RowPitch,
                guest() + o.va + (size_t)y * o.pitch, (size_t)tw * 4);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ov_tex, 0);
+    replaced = overlay_replacement();
 
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ov_cb, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         float *f = (float *)m.pData;
         uint32_t *u = (uint32_t *)m.pData;
-        f[0] = (float)o.w; f[1] = (float)o.h; f[2] = o.s0; f[3] = 0;
+        f[0] = (float)o.w; f[1] = (float)o.h; f[2] = o.s0; f[3] = replaced ? 1.0f : 0.0f;
         f[4] = (float)o.x; f[5] = (float)o.y; f[6] = (float)o.ow; f[7] = (float)o.oh;
         f[8] = (float)fw; f[9] = (float)fh;
         f[10] = rt ? (float)fw / (float)rt->w : 1.0f;
@@ -3172,11 +3226,12 @@ static void overlay_compose(RtEntry *rt, uint32_t fw, uint32_t fh, const D3D11_V
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_ov_cb);
     srvs[0] = s_ov_srv;
     srvs[1] = rt ? rt->srv : NULL;
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, srvs);
+    srvs[2] = replaced ? s_rep_srv : NULL;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 3, srvs);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
-    srvs[0] = srvs[1] = NULL;
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, srvs);
+    srvs[0] = srvs[1] = srvs[2] = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 3, srvs);
 }
 
 static int present_frame(RtEntry *rt, uint32_t w, uint32_t h);
