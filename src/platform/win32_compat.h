@@ -186,6 +186,16 @@ DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 VOID  Sleep(DWORD ms);
 DWORD SleepEx(DWORD ms, BOOL alertable);
 
+/* The spin-wait hint (PAUSE on x86, YIELD on arm64). */
+static inline void YieldProcessor(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
 /* ---- Timer queues ----------------------------------------------------- */
 HANDLE CreateTimerQueue(void);
 BOOL   DeleteTimerQueue(HANDLE timerQueue);

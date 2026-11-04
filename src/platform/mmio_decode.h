@@ -28,16 +28,32 @@
 #ifndef MMIO_DECODE_H
 #define MMIO_DECODE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
+#if defined(_WIN32) || defined(__x86_64__)
 #if defined(_WIN32)
 #include <windows.h>
+typedef PCONTEXT mmio_ctx_t;
+#else
+/* POSIX x86-64: the registers the decoder touches, under the Win32 CONTEXT
+ * names, so the same decoder serves both hosts. The SIGSEGV handler copies
+ * them in from the signal's ucontext_t and back out when an access was
+ * serviced (xbox_PosixMmioFault, xbox_memory_layout.c). */
+typedef struct {
+    uint64_t Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi;
+    uint64_t R8, R9, R10, R11, R12, R13, R14, R15;
+    uint64_t Rip;
+    uint32_t EFlags;
+} MMIO_X64_CONTEXT;
+typedef MMIO_X64_CONTEXT *mmio_ctx_t;
+#endif
 
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
 typedef void     (*mmio_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
 
-static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
+static inline uint64_t *mmio_ctx_reg(mmio_ctx_t c, int reg)
 {
     switch (reg & 0xF) {
     case 0:  return (uint64_t *)&c->Rax;   case 1:  return (uint64_t *)&c->Rcx;
@@ -80,7 +96,7 @@ static inline uint64_t mmio_size_mask(int size)
 /* a OP b at the given width, with the flags a following jcc reads: ZF, SF, CF
  * and OF. PF and AF are left alone; nothing branches on them after a register
  * read. The logical operations clear CF and OF, as the hardware does. */
-static inline uint64_t mmio_alu(PCONTEXT ctx, int op, uint64_t a, uint64_t b,
+static inline uint64_t mmio_alu(mmio_ctx_t ctx, int op, uint64_t a, uint64_t b,
                                 int size)
 {
     uint64_t m = mmio_size_mask(size), sign = 1ULL << (size * 8 - 1), r;
@@ -112,7 +128,7 @@ static inline uint64_t mmio_alu(PCONTEXT ctx, int op, uint64_t a, uint64_t b,
 
 /* A general register at an operand width. Without a REX prefix, byte
  * registers 4-7 are AH, CH, DH and BH -- bits 15:8 of registers 0-3. */
-static inline uint64_t mmio_get_reg(PCONTEXT c, int reg, int size, int has_rex)
+static inline uint64_t mmio_get_reg(mmio_ctx_t c, int reg, int size, int has_rex)
 {
     if (size == 1 && !has_rex && reg >= 4 && reg < 8)
         return (*mmio_ctx_reg(c, reg - 4) >> 8) & 0xFF;
@@ -121,7 +137,7 @@ static inline uint64_t mmio_get_reg(PCONTEXT c, int reg, int size, int has_rex)
 
 /* Write with x86-64 width rules: a 32-bit write zeroes bits 63:32, an 8- or
  * 16-bit write merges into what was there. */
-static inline void mmio_set_reg(PCONTEXT c, int reg, uint64_t v, int size,
+static inline void mmio_set_reg(mmio_ctx_t c, int reg, uint64_t v, int size,
                                 int has_rex)
 {
     uint64_t *d;
@@ -159,7 +175,7 @@ static inline uint64_t mmio_imm(const uint8_t *p, int size, int *len)
  * once; a memory-destination form reads, then writes (CMP and TEST only
  * read). ADC/SBB, the rest of F6/F7 (NOT/NEG/MUL/DIV), string moves and
  * anything else return 0. */
-static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+static inline int mmio_emulate(mmio_ctx_t ctx, uint32_t off, void *dev,
                                mmio_read_fn rd, mmio_write_fn wr)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
@@ -290,5 +306,5 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || __x86_64__ */
 #endif /* MMIO_DECODE_H */

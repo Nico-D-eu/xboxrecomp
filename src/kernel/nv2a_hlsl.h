@@ -87,4 +87,16 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *key, char *buf, size_t size);
  * paints each program with its own. */
 uint32_t nv2a_hlsl_ps_tag(const Nv2aHlslPsKey *key);
 
+/* The same three in GLSL 3.30 core, for the OpenGL back end: one translation
+ * of the vertex program and combiners, two spellings. The uniform blocks
+ * (VSC, VSD, PSC) are std140 with the layout of Nv2aHlslVsParams and
+ * Nv2aHlslPsParams; attribute n is location n (unsigned, as the HLSL input
+ * is); samplers tx0-3, cx0-3, tv0-3 and tz0-3 go on units 0-15. Clip space
+ * is GL's, with y flipped so row 0 of the target is the top: the back end
+ * reverses the front-face winding to match. */
+size_t nv2a_glsl_vs(const Nv2aVpState *vp, char *buf, size_t size,
+                    int *writes_consts);
+size_t nv2a_glsl_vs_passthrough(char *buf, size_t size);
+size_t nv2a_glsl_ps(const Nv2aHlslPsKey *key, char *buf, size_t size);
+
 #endif

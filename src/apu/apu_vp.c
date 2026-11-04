@@ -172,9 +172,9 @@ static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
     assert(v < MCPX_HW_MAX_VOICES);
     /* Announce the wait: the frame thread holds d->lock for as long as it is
      * behind real time and hands it over only when someone is queued. */
-    _InterlockedIncrement(&g_apu_lock_waiters);
+    qatomic_fetch_add(&g_apu_lock_waiters, 1);
     qemu_mutex_lock(&d->lock);
-    _InterlockedDecrement(&g_apu_lock_waiters);
+    qatomic_fetch_add(&g_apu_lock_waiters, -1);
 
     uint64_t mask = 1ULL << (v % 64);
     if (lock) {

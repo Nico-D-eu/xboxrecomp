@@ -295,13 +295,20 @@ int xa2_queued(void)
     return (int)state.BuffersQueued;
 }
 
-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+#else /* !_WIN32: apu_sdl2.c implements the same contract over SDL2 */
 
-int  xa2_init(void)                                   { return 0; }
-void xa2_shutdown(void)                               {}
-int  xa2_is_active(void)                              { return 0; }
-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
-int  xa2_get_buffer_size(void)                        { return 0; }
-int  xa2_queued(void)                                 { return -1; }
+/* The one call this fork's frame pacing adds (apu_core.c): the output queue
+ * in buffers, from SDL's count of queued samples. Stubs for the rest used to
+ * live here too and, being first in the archive, won over apu_sdl2.c, so a
+ * POSIX build had no audio and the APU never ran. */
+int xa2_queued_samples(void);
+
+int xa2_queued(void)
+{
+    int n = xa2_get_buffer_size();
+    if (!xa2_is_active() || n <= 0)
+        return -1;
+    return xa2_queued_samples() / n;
+}
 
 #endif /* _WIN32 */

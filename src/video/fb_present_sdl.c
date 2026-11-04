@@ -43,6 +43,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "video_player.h"
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
@@ -60,6 +61,7 @@ struct fb_slot {
     uint8_t *px;
     size_t   cap;
     uint32_t bpp;
+    uint32_t w, h;          /* FB_W x FB_H, or a GPU back end's frame size */
 };
 
 /* What the window takes from SDL, and gives back on every way out. */
@@ -148,7 +150,45 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
     for (y = 0; y < FB_H; y++)
         memcpy(s->px + (size_t)y * FB_W * bpp, src + (size_t)y * pitch,
                (size_t)FB_W * bpp);
+    s->w = FB_W;
+    s->h = FB_H;
     publish(bpp);
+}
+
+/* A finished frame from a GPU back end (nv2a_gl.c): A8R8G8B8 rows, top row
+ * first, at the size it was drawn. Same slots and wake-up as a flip. */
+void xbox_FramebufferWindowPresentArgb(const void *px, uint32_t w, uint32_t h,
+                                       uint32_t row_pitch)
+{
+    struct fb_slot *s;
+    size_t need;
+    uint32_t y;
+
+    if (!px || !w || !h || w > 8192 || h > 8192)
+        return;
+    if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST))
+        return;
+    __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_running, __ATOMIC_SEQ_CST)) {
+        s = &s_slot[s_back];
+        need = (size_t)w * h * 4;
+        if (s->cap < need) {
+            uint8_t *n = (uint8_t *)realloc(s->px, need);
+            if (n) {
+                s->px = n;
+                s->cap = need;
+            }
+        }
+        if (s->cap >= need) {
+            for (y = 0; y < h; y++)
+                memcpy(s->px + (size_t)y * w * 4,
+                       (const uint8_t *)px + (size_t)y * row_pitch, (size_t)w * 4);
+            s->w = w;
+            s->h = h;
+            publish(4);
+        }
+    }
+    __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
 }
 
 /* Called by the pushbuffer executor when the title flips. */
@@ -213,6 +253,49 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
 static int (*s_guest_main)(void);
 static volatile int s_guest_rc;
 static Uint32 s_guest_done_event;
+static Uint32 s_fullscreen_event;            /* xbox_SetFullscreen, user.code */
+static volatile int s_fullscreen;
+
+/* Set by the project: flush its log on quit, quickly and without stdio, as
+ * fb_present.c's close handler does. NULL: the usual exit(). */
+void (*g_xbox_quit_logs)(void);
+
+/* Quit as the window's close button does, for a project that offers it from
+ * inside the title. Callable from any thread; no window, no-op. */
+void xbox_RequestQuit(void)
+{
+    SDL_Event ev;
+    if (!__atomic_load_n(&s_running, __ATOMIC_ACQUIRE))
+        return;
+    memset(&ev, 0, sizeof ev);
+    ev.type = SDL_QUIT;
+    SDL_PushEvent(&ev);
+}
+
+/* Fullscreen on or off, as F11 does. Callable from any thread: the change is
+ * made on the window's thread. */
+void xbox_SetFullscreen(int on)
+{
+    SDL_Event ev;
+    if (!__atomic_load_n(&s_running, __ATOMIC_ACQUIRE))
+        return;
+    memset(&ev, 0, sizeof ev);
+    ev.type = s_fullscreen_event;
+    ev.user.code = on != 0;
+    SDL_PushEvent(&ev);
+}
+
+int xbox_IsFullscreen(void)
+{
+    return s_fullscreen;
+}
+
+/* Borderless fullscreen at the desktop's resolution, like the Win32 window's. */
+static void set_fullscreen(SDL_Window *win, int on)
+{
+    if (SDL_SetWindowFullscreen(win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) == 0)
+        s_fullscreen = on;
+}
 
 static void *guest_thread(void *arg)
 {
@@ -274,7 +357,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     SDL_Window *win;
     SDL_Renderer *ren;
     SDL_Texture *tex = NULL;
-    uint32_t tex_bpp = 0;
+    uint32_t tex_bpp = 0, tex_w = 0, tex_h = 0, fw = FB_W, fh = FB_H;
     uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
     const char *e;
     int vsync, scale, quit = 0, guest_done = 0, dirty = 1;
@@ -322,7 +405,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     FB_W, FB_H, ri.name, vsync ? "on" : "off");
     }
 
-    s_guest_done_event = SDL_RegisterEvents(2);
+    s_guest_done_event = SDL_RegisterEvents(3);
     if (s_guest_done_event == (Uint32)-1) {
         fprintf(stderr, "  [FBWIN] SDL_RegisterEvents failed; running headless\n");
         SDL_DestroyRenderer(ren);
@@ -331,6 +414,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         return guest_main();
     }
     s_frame_event = s_guest_done_event + 1;
+    s_fullscreen_event = s_guest_done_event + 2;
+    e = getenv("RECOMP_WINDOW_MODE");
+    if (e && (!strcmp(e, "borderless") || !strcmp(e, "fullscreen")))
+        set_fullscreen(win, 1);
     s_guest_main = guest_main;
     /* This thread pumps SDL events from here on, which also updates the
      * game controllers; the input layer then only reads them. */
@@ -367,6 +454,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     guest_done = 1;
                 else if (ev.type == s_frame_event)
                     __atomic_store_n(&s_wake_pending, 0, __ATOMIC_RELEASE);
+                else if (ev.type == s_fullscreen_event)
+                    set_fullscreen(win, ev.user.code);
+                else if (ev.type == SDL_KEYDOWN && !ev.key.repeat
+                         && (ev.key.keysym.sym == SDLK_F11
+                             || (ev.key.keysym.sym == SDLK_RETURN
+                                 && (ev.key.keysym.mod & KMOD_ALT))))
+                    set_fullscreen(win, !s_fullscreen);
                 else if (ev.type == SDL_WINDOWEVENT
                          && (ev.window.event == SDL_WINDOWEVENT_EXPOSED
                              || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED))
@@ -387,23 +481,32 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             shown_seq = seq;
             px = s_slot[s_front].px;
             bpp = s_slot[s_front].bpp;
-            pitch = FB_W * bpp;
+            fw = s_slot[s_front].w;
+            fh = s_slot[s_front].h;
+            pitch = fw * bpp;
         } else if (!shown_seq && s_fb_va && s_fb_pitch) {
             /* No flip yet: the display surface, as the GDI window reads it. */
             bpp = s_fb_pitch / FB_W;
             pitch = s_fb_pitch;
+            fw = FB_W;
+            fh = FB_H;
             if (bpp == 2 || bpp == 4)
                 px = (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
         }
         if (px) {
-            if (!tex || bpp != tex_bpp) {
+            if (!tex || bpp != tex_bpp || fw != tex_w || fh != tex_h) {
                 if (tex)
                     SDL_DestroyTexture(tex);
                 tex = SDL_CreateTexture(ren, bpp == 4 ? SDL_PIXELFORMAT_RGB888
                                                       : SDL_PIXELFORMAT_RGB565,
                                         SDL_TEXTUREACCESS_STREAMING,
-                                        (int)FB_W, (int)FB_H);
+                                        (int)fw, (int)fh);
                 tex_bpp = bpp;
+                tex_w = fw;
+                tex_h = fh;
+                /* A GPU back end's frame is the title's own size (1280x720
+                 * in HD modes): letterbox to that shape, not to 640x480. */
+                SDL_RenderSetLogicalSize(ren, (int)fw, (int)fh);
             }
             if (tex)
                 SDL_UpdateTexture(tex, NULL, px, (int)pitch);
@@ -436,6 +539,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     __atomic_store_n(&s_running, 0, __ATOMIC_SEQ_CST);
     while (__atomic_load_n(&s_in_present, __ATOMIC_SEQ_CST))
         sched_yield();
+    /* A project with an asynchronous log flushes it its own bounded way and
+     * the process ends here: exit()'s handlers can wait on a lock that a
+     * guest thread holds (see fb_present.c, WM_CLOSE). */
+    if (quit && g_xbox_quit_logs) {
+        SDL_HideWindow(win);
+        g_xbox_quit_logs();
+        _exit(0);
+    }
     fprintf(stderr, "  [FBWIN] %s\n", quit ? "window closed" : "guest returned");
     fflush(stdout);
     fflush(stderr);

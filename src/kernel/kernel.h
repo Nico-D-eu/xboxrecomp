@@ -585,6 +585,9 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
  * do not. */
 extern void (*g_xbox_path_hook)(const char *xbox_path);
 
+/* Optional: a replacement for the video overlay's picture, g_xbox_overlay_source. */
+#include "overlay_source.h"
+
 /*
  * Which tree a guest path lands in, from the same rule that translates it
  * (after the title's own drive links). Prints nothing and creates nothing,

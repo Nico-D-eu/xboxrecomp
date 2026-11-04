@@ -28,6 +28,11 @@
  * example to print who opened a file). NULL by default. */
 void (*g_xbox_path_hook)(const char *xbox_path) = NULL;
 
+/* The project's replacement for the video overlay's picture (kernel.h).
+ * Kept here beside the path hook, so it exists whichever renderer is
+ * built. NULL by default. */
+const XboxOverlaySource *volatile g_xbox_overlay_source = NULL;
+
 /*
  * Helper: check if an ANSI string starts with a prefix (case-insensitive).
  * Returns the number of chars consumed from the prefix, or 0 if no match.
@@ -795,6 +800,68 @@ translate:
 #include <sys/types.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <strings.h>
+
+/* FATX ignores case, as NTFS does, and a POSIX file system does not. A title
+ * that writes z:\guipackages\x and later opens z:\GuiPackages\X (Amped 2's
+ * GUI package cache) expects the same file, and so does every asset path
+ * whose case differs from the extracted disc. So a path that does not exist
+ * as spelled has each component of its guest part, from base_len on, looked
+ * up in its directory ignoring case. The first component with no match ends
+ * the walk, so a file about to be created keeps the title's spelling. The
+ * base directory is the host's and is left as it is. An existing path costs
+ * one stat. */
+static void fold_case(char *path, size_t base_len)
+{
+    struct stat st;
+    char *p = path + base_len;
+
+    if (stat(path, &st) == 0)
+        return;
+    while (*p) {
+        char *end, saved = 0;
+
+        while (*p == '/')
+            p++;
+        if (!*p || p == path)
+            return;
+        end = strchr(p, '/');
+        if (end) {
+            saved = *end;
+            *end = '\0';
+        }
+        if (stat(path, &st) != 0) {
+            size_t len = strlen(p);
+            int found = 0;
+            DIR *d;
+
+            p[-1] = '\0';                       /* the parent directory */
+            d = opendir(path[0] ? path : "/");
+            p[-1] = '/';
+            if (d) {
+                struct dirent *e;
+                while ((e = readdir(d)) != NULL) {
+                    if (strlen(e->d_name) == len && strcasecmp(e->d_name, p) == 0) {
+                        memcpy(p, e->d_name, len);
+                        found = 1;
+                        break;
+                    }
+                }
+                closedir(d);
+            }
+            if (!found) {
+                if (end)
+                    *end = saved;
+                return;
+            }
+        }
+        if (!end)
+            return;
+        *end = saved;
+        p = end + 1;
+    }
+}
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
@@ -1030,6 +1097,55 @@ translate:
             size_t n = strlen(host_path_buf);
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
+        }
+        fold_case(host_path_buf, strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
+
+        /* RECOMP_OVERLAY_DIR, as the Win32 backend reads it: ';'-separated
+         * directories searched in order for a file at the same relative
+         * path as one in the game dir; the first that has it wins. Game
+         * media only, not saves or caches; listings are not merged. Case is
+         * folded inside each overlay as in the game dir. */
+        if (base_dir == s_game_dir && !sub_dir && remainder_posix[0]) {
+#define OVERLAY_MAX 16
+            static char overlay[OVERLAY_MAX][MAX_PATH];
+            static int n_overlay = -1;              /* -1 unread */
+            int k;
+            if (n_overlay < 0) {
+                const char *e = getenv("RECOMP_OVERLAY_DIR");
+                n_overlay = 0;
+                while (e && *e && n_overlay < OVERLAY_MAX) {
+                    const char *end = strchr(e, ';');
+                    size_t len = end ? (size_t)(end - e) : strlen(e);
+                    struct stat st;
+                    if (len && len < MAX_PATH) {
+                        int dir;
+                        memcpy(overlay[n_overlay], e, len);
+                        overlay[n_overlay][len] = 0;
+                        strip_trailing_slash(overlay[n_overlay]);
+                        dir = stat(overlay[n_overlay], &st) == 0 && S_ISDIR(st.st_mode);
+                        fprintf(stderr, "  [PATH] overlay %s %s\n", overlay[n_overlay],
+                                dir ? "on" : "(not a directory, off)");
+                        if (dir)
+                            n_overlay++;
+                    }
+                    e = end ? end + 1 : NULL;
+                }
+                fflush(stderr);
+            }
+            for (k = 0; k < n_overlay; k++) {
+                char cand[MAX_PATH];
+                struct stat st;
+                if (snprintf(cand, sizeof cand, "%s/%s", overlay[k], remainder_posix)
+                        >= (int)sizeof cand)
+                    continue;
+                fold_case(cand, strlen(overlay[k]));
+                if (stat(cand, &st) == 0 && S_ISREG(st.st_mode)) {
+                    snprintf(host_path_buf, buf_size, "%s", cand);
+                    fprintf(stderr, "  [PATH] %s -> overlay %d\n", xbox_path, k);
+                    fflush(stderr);
+                    break;
+                }
+            }
         }
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);

@@ -162,11 +162,22 @@ int xa2_is_active(void)
 }
 
 /* Hand one EP period to the queue. SDL copies the samples, so the caller's
- * buffer is free on return. Nothing is ever refused by depth: the queue is
- * unbounded and pacing by queue depth holds it at the marks. */
+ * buffer is free on return. Pacing by queue depth holds the queue at the
+ * marks, but SDL's queue is unbounded and a device that stops pulling
+ * (WSLg's PulseAudio does, after a while) would let it grow for ever: the
+ * pacer only slows down. Past SDLA_QUEUE_CAP_BUFS device buffers a period is
+ * dropped, as a full XAudio2 queue drops it. */
+#define SDLA_QUEUE_CAP_BUFS 32
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
+    static unsigned dropped;
     if (!g_initialized || !g_dev || num_samples <= 0) return 0;
+    if (SDL_GetQueuedAudioSize(g_dev) / (SDLA_CHANNELS * sizeof(int16_t)) >=
+        (Uint32)(SDLA_QUEUE_CAP_BUFS * g_buf_samples)) {
+        if (dropped++ % 1500 == 0)                  /* ~8 s of periods */
+            fprintf(stderr, "[SDL2] device is not pulling: %u periods dropped\n", dropped);
+        return 0;
+    }
     if (SDL_QueueAudio(g_dev, samples,
                        (Uint32)num_samples * SDLA_CHANNELS * sizeof(int16_t)) != 0) {
         fprintf(stderr, "[SDL2] SDL_QueueAudio failed: %s\n", SDL_GetError());

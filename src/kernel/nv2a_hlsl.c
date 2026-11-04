@@ -19,7 +19,14 @@ typedef struct {
     char  *p;
     size_t size, len;
     int    overflow;
+    int    glsl;            /* GLSL 3.30 for the OpenGL back end, else HLSL */
 } Sb;
+
+/* One piece of source in each language. Most lines are the same in both:
+ * the GLSL preamble defines float4, saturate and the rest as GLSL spells
+ * them. What remains -- vectors initialised from a scalar, a swizzle on a
+ * scalar, casts, componentwise ?:, texture sampling -- goes through here. */
+#define L(s, h, g) ((s)->glsl ? (g) : (h))
 
 static void sb(Sb *s, const char *fmt, ...)
 {
@@ -57,6 +64,113 @@ static uint32_t fld(const uint32_t *w, int dword, int start, int len)
     return (w[dword] >> start) & ((1u << len) - 1u);
 }
 
+/* The GLSL spellings of the HLSL names the shared lines use. */
+static const char k_glsl_defines[] =
+    "#version 330 core\n"
+    "#define float4 vec4\n"
+    "#define float3 vec3\n"
+    "#define float2 vec2\n"
+    "#define uint4 uvec4\n"
+    "#define int4 ivec4\n"
+    "#define saturate(x) clamp((x), 0.0, 1.0)\n"
+    "#define frac fract\n"
+    "#define rsqrt inversesqrt\n";
+
+/* What reaches the pixel shader. In HLSL a struct; in GLSL an interface
+ * block, named i in the pixel shader and vo in the vertex shader, so the
+ * shared lines read i.t0 in both. */
+#define GLSL_V2F "V2F { vec4 d0; vec4 d1; vec4 t0; vec4 t1; vec4 t2; vec4 t3; float fog; }"
+
+/* vs_common in GLSL. The same uniforms in std140 blocks (whose layout for
+ * these all-vec4 members is the HLSL cbuffer's, so Nv2aHlslVsParams serves
+ * both), the attributes as in_a<n> (a0 is the address register), and the
+ * same helpers. to_clip differs on purpose: GL's window y runs up and its
+ * depth range is -w..w, so y is flipped (row 0 of the target is the top, as
+ * on Xbox; the back end flips the front-face winding to match) and z is
+ * moved from 0..w. */
+static void vs_common_glsl(Sb *s)
+{
+    int i;
+
+    sb(s, "%s", k_glsl_defines);
+    sb(s, "layout(std140) uniform VSC { vec4 c[192]; };\n"
+          "layout(std140) uniform VSD {\n"
+          "  vec4 g_adef[16]; uvec4 g_afmt[16]; vec4 g_vp; uvec4 g_roles;\n"
+          "  vec4 g_fog;   /* param 0, param 1, mode (0 off, 1 linear, 2 exp, 3 exp2), abs */\n"
+          "};\n");
+    for (i = 0; i < 16; i++)
+        sb(s, "layout(location = %d) in uvec4 in_a%d;\n", i, i);
+    sb(s, "struct VSOut {\n"
+          "  vec4 pos; vec4 d0; vec4 d1; vec4 t0; vec4 t1; vec4 t2; vec4 t3; float fog;\n"
+          "};\n"
+          "out " GLSL_V2F " vo;\n"
+          "vec4 decode(uvec4 r, uvec4 f, vec4 def) {\n"
+          "  vec4 v;\n"
+          "  switch (f.x) {\n"
+          "  case 1u: v = uintBitsToFloat(r); break;\n"
+          "  case 2u: v = vec4(r.z, r.y, r.x, r.w) / 255.0; break;\n"
+          "  case 3u: v = vec4(r) / 255.0; break;\n"
+          "  case 4u: v = max(vec4(ivec4(r << 16) >> 16) / 32767.0, -1.0); break;\n"
+          "  case 5u: v = vec4(ivec4(r << 16) >> 16); break;\n"
+          "  case 6u: {\n"
+          "    uint u = r.x;\n"
+          "    return vec4(float(int(u << 21) >> 21) / 1023.0,\n"
+          "                float(int(u << 10) >> 21) / 1023.0,\n"
+          "                float(int(u) >> 22) / 511.0, 1.0); }\n"
+          "  default: return def;\n"
+          "  }\n"
+          "  if (f.y < 2u) v.y = 0.0;\n"
+          "  if (f.y < 3u) v.z = 0.0;\n"
+          "  if (f.y < 4u) v.w = 1.0;\n"
+          "  return v;\n"
+          "}\n"
+          "vec4 mul0(vec4 a, vec4 b) {\n"
+          "  bvec4 z = bvec4(vec4(equal(a, vec4(0.0))) + vec4(equal(b, vec4(0.0))));\n"
+          "  return mix(a * b, vec4(0.0), z);\n"
+          "}\n"
+          "vec4 rcc(float x) {\n"
+          "  float r = 1.0 / x;\n"
+          "  if (r > 0.0) r = clamp(r, 5.42101e-20, 1.884467e19);\n"
+          "  else r = clamp(r, -1.884467e19, -5.42101e-20);\n"
+          "  return vec4(r);\n"
+          "}\n"
+          "vec4 vexp(float x) { float f = floor(x); return vec4(exp2(f), x - f, exp2(x), 1.0); }\n"
+          "vec4 vlog(float x) {\n"
+          "  x = abs(x);\n"
+          "  if (x == 0.0) return vec4(-uintBitsToFloat(0x7F800000u), 1.0, -uintBitsToFloat(0x7F800000u), 1.0);\n"
+          "  float e = floor(log2(x));\n"
+          "  return vec4(e, x / exp2(e), log2(x), 1.0);\n"
+          "}\n"
+          "vec4 vlit(vec4 c) {\n"
+          "  float d = max(c.x, 0.0), s = max(c.y, 0.0), p = clamp(c.w, -128.0, 128.0);\n"
+          "  return vec4(1.0, d, c.x > 0.0 ? pow(s, p) : 0.0, 1.0);\n"
+          "}\n"
+          "float fog_factor(float d) {\n"
+          "  float f = 1.0;\n"
+          "  if (g_fog.z == 1.0) f = g_fog.x + d * g_fog.y - 1.0;\n"
+          "  else if (g_fog.z == 2.0) f = g_fog.x + exp2(d * g_fog.y * 16.0) - 1.5;\n"
+          "  else if (g_fog.z == 3.0) f = g_fog.x + exp2(-d * d * g_fog.y * g_fog.y * 32.0) - 1.5;\n"
+          "  if (g_fog.w != 0.0) f = abs(f);\n"
+          "  return f;\n"
+          "}\n"
+          "vec4 to_clip(vec4 p, float w) {\n"
+          "  if (w == 0.0 || isinf(w) || isnan(w)) w = 1.0;\n"
+          "  return vec4((p.x * g_vp.x - 1.0) * w, (p.y * g_vp.y - 1.0) * w,\n"
+          "              (2.0 * p.z * g_vp.z - 1.0) * w, w);\n"
+          "}\n");
+}
+
+/* The GLSL entry point around vs_main. */
+static void vs_main_glsl(Sb *s)
+{
+    sb(s, "void main() {\n"
+          "  VSOut o = vs_main();\n"
+          "  gl_Position = o.pos;\n"
+          "  vo.d0 = o.d0; vo.d1 = o.d1; vo.t0 = o.t0; vo.t1 = o.t1;\n"
+          "  vo.t2 = o.t2; vo.t3 = o.t3; vo.fog = o.fog;\n"
+          "}\n");
+}
+
 /* The declarations every vertex shader starts with: the constant buffers,
  * the one input signature, the attribute decoder and the helpers that give
  * the vertex engine's arithmetic. */
@@ -64,6 +178,10 @@ static void vs_common(Sb *s)
 {
     int i;
 
+    if (s->glsl) {
+        vs_common_glsl(s);
+        return;
+    }
     sb(s, "cbuffer VSC : register(b0) { float4 c[192]; };\n"
           "cbuffer VSD : register(b1) {\n"
           "  float4 g_adef[16]; uint4 g_afmt[16]; float4 g_vp; uint4 g_roles;\n"
@@ -146,7 +264,8 @@ static void vs_inputs(Sb *s)
 {
     int i;
     for (i = 0; i < 16; i++)
-        sb(s, "  float4 v%d = decode(i.a%d, g_afmt[%d], g_adef[%d]);\n", i, i, i, i);
+        sb(s, L(s, "  float4 v%d = decode(i.a%d, g_afmt[%d], g_adef[%d]);\n",
+                   "  float4 v%d = decode(in_a%d, g_afmt[%d], g_adef[%d]);\n"), i, i, i, i);
 }
 
 static const char *const SWZ = "xyzw";
@@ -221,21 +340,22 @@ static const char *temp_name(uint32_t r, char buf[8])
     return NULL;
 }
 
-size_t nv2a_hlsl_vs(const Nv2aVpState *vp, char *buf, size_t size,
-                    int *writes_consts)
+static size_t gen_vs(const Nv2aVpState *vp, char *buf, size_t size,
+                     int *writes_consts, int glsl)
 {
-    Sb s = { buf, size, 0, 0 };
+    Sb s = { buf, size, 0, 0, glsl };
     uint32_t pc;
     int finished = 0, i;
 
     *writes_consts = 0;
     vs_common(&s);
-    sb(&s, "VSOut main(VSIn i) {\n");
+    sb(&s, L(&s, "VSOut main(VSIn i) {\n", "VSOut vs_main() {\n"));
     vs_inputs(&s);
     for (i = 0; i < NV2A_VP_TEMPS; i++)
-        sb(&s, "  float4 r%d = 0;\n", i);
-    sb(&s, "  float4 oPos = 0, oFog = 0, oPts = 0;\n"
-           "  float4 oD0 = float4(0,0,0,1), oD1 = float4(0,0,0,1);\n"
+        sb(&s, L(&s, "  float4 r%d = 0;\n", "  float4 r%d = float4(0);\n"), i);
+    sb(&s, L(&s, "  float4 oPos = 0, oFog = 0, oPts = 0;\n",
+                 "  float4 oPos = float4(0), oFog = float4(0), oPts = float4(0);\n"));
+    sb(&s, "  float4 oD0 = float4(0,0,0,1), oD1 = float4(0,0,0,1);\n"
            "  float4 oB0 = float4(0,0,0,1), oB1 = float4(0,0,0,1);\n"
            "  float4 oT0 = float4(0,0,0,1), oT1 = float4(0,0,0,1);\n"
            "  float4 oT2 = float4(0,0,0,1), oT3 = float4(0,0,0,1);\n"
@@ -258,28 +378,36 @@ size_t nv2a_hlsl_vs(const Nv2aVpState *vp, char *buf, size_t size,
         vs_src(&s, w, fld(w, 2, 11, 2), fld(w, 2, 13, 4), fld(w, 2, 25, 1), fld(w, 2, 17, 8));
         sb(&s, ";\n    float4 C = ");
         vs_src(&s, w, fld(w, 3, 28, 2), c_r, fld(w, 2, 10, 1), fld(w, 2, 2, 8));
-        sb(&s, ";\n    float4 M = 0, I = 0;\n");
+        sb(&s, L(&s, ";\n    float4 M = 0, I = 0;\n",
+                     ";\n    float4 M = float4(0), I = float4(0);\n"));
 
         switch (mac) {
         case MAC_MOV: sb(&s, "    M = A;\n"); break;
         case MAC_MUL: sb(&s, "    M = mul0(A, B);\n"); break;
         case MAC_ADD: sb(&s, "    M = A + C;\n"); break;
         case MAC_MAD: sb(&s, "    M = mul0(A, B) + C;\n"); break;
-        case MAC_DP3: sb(&s, "    { float4 p = mul0(A, B); M = (p.x + p.y + p.z).xxxx; }\n"); break;
-        case MAC_DPH: sb(&s, "    { float4 p = mul0(A, B); M = (p.x + p.y + p.z + B.w).xxxx; }\n"); break;
-        case MAC_DP4: sb(&s, "    { float4 p = mul0(A, B); M = (p.x + p.y + p.z + p.w).xxxx; }\n"); break;
+        case MAC_DP3: sb(&s, L(&s, "    { float4 p = mul0(A, B); M = (p.x + p.y + p.z).xxxx; }\n",
+                                   "    { float4 p = mul0(A, B); M = float4(p.x + p.y + p.z); }\n")); break;
+        case MAC_DPH: sb(&s, L(&s, "    { float4 p = mul0(A, B); M = (p.x + p.y + p.z + B.w).xxxx; }\n",
+                                   "    { float4 p = mul0(A, B); M = float4(p.x + p.y + p.z + B.w); }\n")); break;
+        case MAC_DP4: sb(&s, L(&s, "    { float4 p = mul0(A, B); M = (p.x + p.y + p.z + p.w).xxxx; }\n",
+                                   "    { float4 p = mul0(A, B); M = float4(p.x + p.y + p.z + p.w); }\n")); break;
         case MAC_DST: sb(&s, "    M = float4(1.0, A.y * B.y, A.z, B.w);\n"); break;
         case MAC_MIN: sb(&s, "    M = min(A, B);\n"); break;
         case MAC_MAX: sb(&s, "    M = max(A, B);\n"); break;
-        case MAC_SLT: sb(&s, "    M = (A < B) ? 1.0 : 0.0;\n"); break;
-        case MAC_SGE: sb(&s, "    M = (A >= B) ? 1.0 : 0.0;\n"); break;
+        case MAC_SLT: sb(&s, L(&s, "    M = (A < B) ? 1.0 : 0.0;\n",
+                                   "    M = float4(lessThan(A, B));\n")); break;
+        case MAC_SGE: sb(&s, L(&s, "    M = (A >= B) ? 1.0 : 0.0;\n",
+                                   "    M = float4(greaterThanEqual(A, B));\n")); break;
         default: break;
         }
         switch (ilu) {
         case ILU_MOV: sb(&s, "    I = C;\n"); break;
-        case ILU_RCP: sb(&s, "    I = (1.0 / C.x).xxxx;\n"); break;
+        case ILU_RCP: sb(&s, L(&s, "    I = (1.0 / C.x).xxxx;\n",
+                                   "    I = float4(1.0 / C.x);\n")); break;
         case ILU_RCC: sb(&s, "    I = rcc(C.x);\n"); break;
-        case ILU_RSQ: sb(&s, "    I = rsqrt(abs(C.x)).xxxx;\n"); break;
+        case ILU_RSQ: sb(&s, L(&s, "    I = rsqrt(abs(C.x)).xxxx;\n",
+                                   "    I = float4(rsqrt(abs(C.x)));\n")); break;
         case ILU_EXP: sb(&s, "    I = vexp(C.x);\n"); break;
         case ILU_LOG: sb(&s, "    I = vlog(C.x);\n"); break;
         case ILU_LIT: sb(&s, "    I = vlit(C);\n"); break;
@@ -313,7 +441,7 @@ size_t nv2a_hlsl_vs(const Nv2aVpState *vp, char *buf, size_t size,
             }
         }
         if (mac == MAC_ARL)
-            sb(&s, "    a0 = (int)floor(A.x);\n");
+            sb(&s, L(&s, "    a0 = (int)floor(A.x);\n", "    a0 = int(floor(A.x));\n"));
         sb(&s, "  }\n");
         if (fld(w, 3, 0, 1)) {
             finished = 1;
@@ -330,21 +458,36 @@ size_t nv2a_hlsl_vs(const Nv2aVpState *vp, char *buf, size_t size,
            "  o.fog = fog_factor(oFog.x);\n"
            "  return o;\n"
            "}\n");
+    if (glsl)
+        vs_main_glsl(&s);
     return sb_done(&s);
 }
 
-size_t nv2a_hlsl_vs_passthrough(char *buf, size_t size)
+size_t nv2a_hlsl_vs(const Nv2aVpState *vp, char *buf, size_t size,
+                    int *writes_consts)
 {
-    Sb s = { buf, size, 0, 0 };
+    return gen_vs(vp, buf, size, writes_consts, 0);
+}
+
+size_t nv2a_glsl_vs(const Nv2aVpState *vp, char *buf, size_t size,
+                    int *writes_consts)
+{
+    return gen_vs(vp, buf, size, writes_consts, 1);
+}
+
+static size_t gen_vs_passthrough(char *buf, size_t size, int glsl)
+{
+    Sb s = { buf, size, 0, 0, glsl };
 
     vs_common(&s);
-    sb(&s, "VSOut main(VSIn i) {\n"
-           "  float4 v[16];\n");
+    sb(&s, L(&s, "VSOut main(VSIn i) {\n", "VSOut vs_main() {\n"));
+    sb(&s, "  float4 v[16];\n");
     /* The array form, because two of the attributes are chosen at run time. */
     {
         int k;
         for (k = 0; k < 16; k++)
-            sb(&s, "  v[%d] = decode(i.a%d, g_afmt[%d], g_adef[%d]);\n", k, k, k, k);
+            sb(&s, L(&s, "  v[%d] = decode(i.a%d, g_afmt[%d], g_adef[%d]);\n",
+                         "  v[%d] = decode(in_a%d, g_afmt[%d], g_adef[%d]);\n"), k, k, k, k);
     }
     /* x, y in pixels, z in zeta units, and 1/rhw as w -- what the software
      * path does with the same vertex. */
@@ -358,7 +501,19 @@ size_t nv2a_hlsl_vs_passthrough(char *buf, size_t size)
            "  o.fog = 1.0;\n"
            "  return o;\n"
            "}\n");
+    if (glsl)
+        vs_main_glsl(&s);
     return sb_done(&s);
+}
+
+size_t nv2a_hlsl_vs_passthrough(char *buf, size_t size)
+{
+    return gen_vs_passthrough(buf, size, 0);
+}
+
+size_t nv2a_glsl_vs_passthrough(char *buf, size_t size)
+{
+    return gen_vs_passthrough(buf, size, 1);
 }
 
 /* ── Register combiners ──────────────────────────────────────────────── */
@@ -454,16 +609,17 @@ static void comb_stage(Sb *s, const Nv2aHlslPsKey *k, uint32_t i)
     if (k->control & 0x100u)
         sb(s, "    bool sel = saturate(r0.a) >= 0.5;\n");
     else
-        sb(s, "    bool sel = (((uint)(saturate(r0.a) * 255.0 + 0.5)) & 1u) != 0u;\n");
+        sb(s, L(s, "    bool sel = (((uint)(saturate(r0.a) * 255.0 + 0.5)) & 1u) != 0u;\n",
+                   "    bool sel = ((uint(saturate(r0.a) * 255.0 + 0.5)) & 1u) != 0u;\n"));
 
     sb(s, "    float3 A = "); comb_input(s, ci >> 24, 1);
     sb(s, ";\n    float3 B = "); comb_input(s, ci >> 16, 1);
     sb(s, ";\n    float3 C = "); comb_input(s, ci >> 8, 1);
     sb(s, ";\n    float3 D = "); comb_input(s, ci, 1);
     sb(s, ";\n");
-    if (cflags & 0x02u) sb(s, "    float3 ab = dot(A, B).xxx;\n");
+    if (cflags & 0x02u) sb(s, L(s, "    float3 ab = dot(A, B).xxx;\n", "    float3 ab = float3(dot(A, B));\n"));
     else                sb(s, "    float3 ab = A * B;\n");
-    if (cflags & 0x01u) sb(s, "    float3 cd = dot(C, D).xxx;\n");
+    if (cflags & 0x01u) sb(s, L(s, "    float3 cd = dot(C, D).xxx;\n", "    float3 cd = float3(dot(C, D));\n"));
     else                sb(s, "    float3 cd = C * D;\n");
     if (cflags & 0x04u) sb(s, "    float3 su = sel ? cd : ab;\n");
     else                sb(s, "    float3 su = ab + cd;\n");
@@ -510,13 +666,59 @@ uint32_t nv2a_hlsl_ps_tag(const Nv2aHlslPsKey *k)
     return (h | 0x404040u) & 0xFFFFFFu;     /* never too dark to see */
 }
 
-size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
+/* nv2a_hlsl_ps's declarations in GLSL, up to the locals of ps_main. One
+ * sampler per texture kind and stage, on units 0-3 (2D), 4-7 (cube), 8-11
+ * (3D) and 12-15 (depth), as the HLSL registers number them; the back end
+ * binds stage n's sampler object to all four of its units. */
+static void ps_head_glsl(Sb *s)
 {
-    Sb s = { buf, size, 0, 0 };
-    int st;
-    uint32_t i;
+    sb(s, "%s", k_glsl_defines);
+    sb(s, "uniform sampler2D tx0, tx1, tx2, tx3;\n"
+          "uniform samplerCube cx0, cx1, cx2, cx3;\n"
+          "uniform sampler3D tv0, tv1, tv2, tv3;\n"
+          "uniform sampler2D tz0, tz1, tz2, tz3;\n"
+          "float shadow_cmp(float f, float z, float r) {\n"
+          "  switch (int(f)) {\n"
+          "  case 1: return z < r ? 1.0 : 0.0;  case 2: return z == r ? 1.0 : 0.0;\n"
+          "  case 3: return z <= r ? 1.0 : 0.0; case 4: return z > r ? 1.0 : 0.0;\n"
+          "  case 5: return z != r ? 1.0 : 0.0; case 6: return z >= r ? 1.0 : 0.0;\n"
+          "  case 7: return 1.0; default: return 0.0;\n"
+          "  }\n"
+          "  return 0.0;\n"
+          "}\n"
+          "vec3 dm_unsigned(vec3 c) { return c; }\n"
+          "vec3 dm_d3d(vec3 c) { vec3 t = floor(c * 255.0 + 0.5);\n"
+          "  return clamp((t - 128.0) / 127.0, -1.0, 1.0); }\n"
+          "vec3 dm_gl(vec3 c) { vec3 t = floor(c * 255.0 + 0.5);\n"
+          "  return mix((t + 0.5) / 127.5, (t - 255.5) / 127.5, greaterThanEqual(t, vec3(128.0))); }\n"
+          "vec3 dm_signed(vec3 c) { vec3 t = floor(c * 255.0 + 0.5);\n"
+          "  return clamp(mix(t, t - 256.0, greaterThanEqual(t, vec3(128.0))) / 127.0, -1.0, 1.0); }\n"
+          "layout(std140) uniform PSC {\n"
+          "  vec4 cf0[8]; vec4 cf1[8]; vec4 ff0; vec4 ff1; vec4 fogc;\n"
+          "  vec4 tsc[4]; uvec4 atest; vec4 tdz[4];\n"
+          "};\n"
+          "in " GLSL_V2F " i;\n"
+          "out vec4 frag_color;\n"
+          "bool cmp(uint f, float a, float b) {\n"
+          "  switch (f) {\n"
+          "  case 0x200u: return false;  case 0x201u: return a < b;\n"
+          "  case 0x202u: return a == b; case 0x203u: return a <= b;\n"
+          "  case 0x204u: return a > b;  case 0x205u: return a != b;\n"
+          "  case 0x206u: return a >= b; default: return true;\n"
+          "  }\n"
+          "  return true;\n"
+          "}\n"
+          "vec4 ps_main() {\n"
+          "  vec4 zero = vec4(0), c0 = vec4(0), c1 = vec4(0), sum = vec4(0), ef = vec4(0);\n"
+          "  vec4 v0 = saturate(i.d0), v1 = saturate(i.d1);\n"
+          "  vec4 t0 = vec4(0), t1 = vec4(0), t2 = vec4(0), t3 = vec4(0);\n"
+          "  bool kill = false;\n");
+}
 
-    sb(&s, "Texture2D tx0 : register(t0); Texture2D tx1 : register(t1);\n"
+/* The pixel shader's declarations, up to the locals of main. */
+static void ps_head_hlsl(Sb *s)
+{
+    sb(s, "Texture2D tx0 : register(t0); Texture2D tx1 : register(t1);\n"
            "Texture2D tx2 : register(t2); Texture2D tx3 : register(t3);\n"
            "TextureCube cx0 : register(t4); TextureCube cx1 : register(t5);\n"
            "TextureCube cx2 : register(t6); TextureCube cx3 : register(t7);\n"
@@ -573,6 +775,18 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
            "  float4 v0 = saturate(i.d0), v1 = saturate(i.d1);\n"
            "  float4 t0 = 0, t1 = 0, t2 = 0, t3 = 0;\n"
            "  bool kill = false;\n");
+}
+
+static size_t gen_ps(const Nv2aHlslPsKey *k, char *buf, size_t size, int glsl)
+{
+    Sb s = { buf, size, 0, 0, glsl };
+    int st;
+    uint32_t i;
+
+    if (glsl)
+        ps_head_glsl(&s);
+    else
+        ps_head_hlsl(&s);
 
     /* The texture stages, before anything that could discard, so every
      * sample has its derivatives. */
@@ -596,15 +810,23 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
         case NV2A_TEXMODE_NONE:
             break;
         case NV2A_TEXMODE_CUBE:
-            sb(&s, "  t%d = cx%d.Sample(s%d, i.t%d.xyz);\n", st, st, st, st);
-            sb(&s, "  if (tsc[%d].w == 0.0) t%d = 0;\n", st, st);
+            if (glsl)
+                sb(&s, "  t%d = texture(cx%d, i.t%d.xyz);\n", st, st, st);
+            else
+                sb(&s, "  t%d = cx%d.Sample(s%d, i.t%d.xyz);\n", st, st, st, st);
+            sb(&s, L(&s, "  if (tsc[%d].w == 0.0) t%d = 0;\n",
+                         "  if (tsc[%d].w == 0.0) t%d = float4(0);\n"), st, st);
             break;
         case 0x11:                                   /* DOT_PRODUCT */
             sb(&s, "  dot%d = dot(i.t%d.xyz, %s(t%u.rgb));\n", st == 1 ? 1 : 2, st, dm, in_st);
             break;
         case 0x09:                                   /* DOT_ST */
-            sb(&s, "  t%d = tx%d.Sample(s%d, float2(dot1, dot(i.t%d.xyz, %s(t%u.rgb))) * tsc[%d].xy);\n",
-               st, st, st, st, dm, in_st, st);
+            if (glsl)
+                sb(&s, "  t%d = texture(tx%d, float2(dot1, dot(i.t%d.xyz, %s(t%u.rgb))) * tsc[%d].xy);\n",
+                   st, st, st, dm, in_st, st);
+            else
+                sb(&s, "  t%d = tx%d.Sample(s%d, float2(dot1, dot(i.t%d.xyz, %s(t%u.rgb))) * tsc[%d].xy);\n",
+                   st, st, st, st, dm, in_st, st);
             break;
         case 0x0B:                                   /* DOT_RFLCT_DIFF */
         case 0x0C:                                   /* DOT_RFLCT_SPEC */
@@ -626,8 +848,12 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
                        "    float3 r = 2.0 * n * dot(n, e) / max(dot(n, n), 1e-8) - e;\n");
             else
                 sb(&s, "    float3 r = n;\n");
-            sb(&s, "    t%d = cx%d.Sample(s%d, r); }\n", st, st, st);
-            sb(&s, "  if (tsc[%d].w == 0.0) t%d = 0;\n", st, st);
+            if (glsl)
+                sb(&s, "    t%d = texture(cx%d, r); }\n", st, st);
+            else
+                sb(&s, "    t%d = cx%d.Sample(s%d, r); }\n", st, st, st);
+            sb(&s, L(&s, "  if (tsc[%d].w == 0.0) t%d = 0;\n",
+                         "  if (tsc[%d].w == 0.0) t%d = float4(0);\n"), st, st);
             break;
         }
         case NV2A_TEXMODE_2D_PROJECTIVE:
@@ -642,31 +868,46 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
              * with all three coordinates from tv<n>), 3 a depth surface
              * (tz<n>, compared), 4 a depth texture with no surface drawn
              * behind it (read as passing, nothing in shadow). */
-            sb(&s, "    if (tsc[%d].w == 2.0) t%d = tv%d.Sample(s%d, tc.xyz / q);\n"
-                   "    else if (tsc[%d].w == 3.0) t%d = shadow_cmp(tdz[%d].y,\n"
-                   "        tz%d.SampleLevel(s%d, tc.xy / q * tsc[%d].xy, 0).r, tc.z / q * tdz[%d].x).xxxx;\n"
-                   "    else if (tsc[%d].w == 4.0) t%d = 1.0;\n"
-                   "    else t%d = tx%d.Sample(s%d, tc.xy / q * tsc[%d].xy);\n"
-                   "    if (tsc[%d].z > 0.0) t%d.a = 1.0;\n"
-                   "    if (tsc[%d].w == 0.0) t%d = 0;\n  }\n",
-               st, st, st, st,
-               st, st, st, st, st, st, st,
-               st, st,
-               st, st, st, st, st, st, st, st);
+            if (glsl)
+                sb(&s, "    if (tsc[%d].w == 2.0) t%d = texture(tv%d, tc.xyz / q);\n"
+                       "    else if (tsc[%d].w == 3.0) t%d = float4(shadow_cmp(tdz[%d].y,\n"
+                       "        textureLod(tz%d, tc.xy / q * tsc[%d].xy, 0.0).r, tc.z / q * tdz[%d].x));\n"
+                       "    else if (tsc[%d].w == 4.0) t%d = float4(1.0);\n"
+                       "    else t%d = texture(tx%d, tc.xy / q * tsc[%d].xy);\n"
+                       "    if (tsc[%d].z > 0.0) t%d.a = 1.0;\n"
+                       "    if (tsc[%d].w == 0.0) t%d = float4(0);\n  }\n",
+                   st, st, st,
+                   st, st, st, st, st, st,
+                   st, st,
+                   st, st, st, st, st, st, st);
+            else
+                sb(&s, "    if (tsc[%d].w == 2.0) t%d = tv%d.Sample(s%d, tc.xyz / q);\n"
+                       "    else if (tsc[%d].w == 3.0) t%d = shadow_cmp(tdz[%d].y,\n"
+                       "        tz%d.SampleLevel(s%d, tc.xy / q * tsc[%d].xy, 0).r, tc.z / q * tdz[%d].x).xxxx;\n"
+                       "    else if (tsc[%d].w == 4.0) t%d = 1.0;\n"
+                       "    else t%d = tx%d.Sample(s%d, tc.xy / q * tsc[%d].xy);\n"
+                       "    if (tsc[%d].z > 0.0) t%d.a = 1.0;\n"
+                       "    if (tsc[%d].w == 0.0) t%d = 0;\n  }\n",
+                   st, st, st, st,
+                   st, st, st, st, st, st, st,
+                   st, st,
+                   st, st, st, st, st, st, st, st);
             break;
         }
         case NV2A_TEXMODE_PASS_THROUGH:
             sb(&s, "  t%d = i.t%d;\n", st, st);
             break;
         case NV2A_TEXMODE_CLIP_PLANE:
-            sb(&s, "  if (any(i.t%d < 0.0)) kill = true;\n", st);
+            sb(&s, L(&s, "  if (any(i.t%d < 0.0)) kill = true;\n",
+                         "  if (any(lessThan(i.t%d, float4(0.0)))) kill = true;\n"), st);
             break;
         default:
             sb(&s, "  // stage %d: mode 0x%X not implemented\n", st, mode);
             break;
         }
     }
-    sb(&s, "  if (atest.w == 11u) t1 = 1.0;   /* RECOMP_GPU_PS_DEBUG=11: stage 1 white */\n");
+    sb(&s, L(&s, "  if (atest.w == 11u) t1 = 1.0;   /* RECOMP_GPU_PS_DEBUG=11: stage 1 white */\n",
+                 "  if (atest.w == 11u) t1 = float4(1.0);   /* RECOMP_GPU_PS_DEBUG=11: stage 1 white */\n"));
     {   /* =18: each program in its own colour (the DRAWDUMP tag) */
         uint32_t tag = nv2a_hlsl_ps_tag(k);
         sb(&s, "  if (atest.w == 18u) return float4(%u, %u, %u, 255) / 255.0;\n",
@@ -674,8 +915,10 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
     }
     sb(&s,
            "  float4 fog = float4(fogc.rgb, saturate(i.fog));\n"
-           "  if (atest.w == 4u) fog.a = 1.0;   /* RECOMP_GPU_PS_DEBUG=4: no fog */\n"
-           "  if (atest.w == 5u) return float4(saturate(i.fog).xxx, 1.0); /* =5: fog factor */\n"
+           "  if (atest.w == 4u) fog.a = 1.0;   /* RECOMP_GPU_PS_DEBUG=4: no fog */\n");
+    sb(&s, L(&s, "  if (atest.w == 5u) return float4(saturate(i.fog).xxx, 1.0); /* =5: fog factor */\n",
+                 "  if (atest.w == 5u) return float4(float3(saturate(i.fog)), 1.0); /* =5: fog factor */\n"));
+    sb(&s,
            "  if (atest.w == 6u) return float4(t1.rgb, 1.0);   /* =6..8: texture stage 1..3 */\n"
            "  if (atest.w == 7u) return float4(t2.rgb, 1.0);\n"
            "  if (atest.w == 8u) return float4(t3.rgb, 1.0);\n"
@@ -683,9 +926,10 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
            "  if (atest.w == 12u) return float4(saturate(i.t1.xyz * 0.5 + 0.5), 1.0); /* =12: t1 raw */\n"
            "  if (atest.w == 13u) return float4(tsc[0].w, tsc[1].w, tsc[2].w, 2.0) * 0.5; /* =13: what stages 0-2 have bound (tsc.w / 2) */\n"
            "  if (atest.w == 10u) { float q1 = i.t1.w != 0.0 ? i.t1.w : 1.0;   /* =10: stage-1 coords */\n"
-           "    return float4(frac(i.t1.xy / q1), i.t1.w == 0.0 ? 1.0 : 0.0, 1.0); }\n"
-           "  float4 r0 = float4(0, 0, 0, t0.a), r1 = 0;\n"
-           "  float4 outc;\n");
+           "    return float4(frac(i.t1.xy / q1), i.t1.w == 0.0 ? 1.0 : 0.0, 1.0); }\n");
+    sb(&s, L(&s, "  float4 r0 = float4(0, 0, 0, t0.a), r1 = 0;\n",
+                 "  float4 r0 = float4(0, 0, 0, t0.a), r1 = float4(0);\n"));
+    sb(&s, "  float4 outc;\n");
 
     if (!k->programmed) {
         /* Before the title has programmed the combiners: texture times
@@ -719,10 +963,23 @@ size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
            "  if (atest.w == 3u) return float4(1.0, 0.0, 1.0, 1.0);\n");
     sb(&s, "  if (kill) discard;\n"
            "  if (atest.x != 0u) {\n"
-           "    float a = floor(saturate(outc.a) * 255.0 + 0.5);\n"
-           "    if (!cmp(atest.y, a, (float)(atest.z & 0xFFu))) discard;\n"
-           "  }\n"
+           "    float a = floor(saturate(outc.a) * 255.0 + 0.5);\n");
+    sb(&s, L(&s, "    if (!cmp(atest.y, a, (float)(atest.z & 0xFFu))) discard;\n",
+                 "    if (!cmp(atest.y, a, float(atest.z & 0xFFu))) discard;\n"));
+    sb(&s, "  }\n"
            "  return outc;\n"
            "}\n");
+    if (glsl)
+        sb(&s, "void main() { frag_color = ps_main(); }\n");
     return sb_done(&s);
+}
+
+size_t nv2a_hlsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
+{
+    return gen_ps(k, buf, size, 0);
+}
+
+size_t nv2a_glsl_ps(const Nv2aHlslPsKey *k, char *buf, size_t size)
+{
+    return gen_ps(k, buf, size, 1);
 }
