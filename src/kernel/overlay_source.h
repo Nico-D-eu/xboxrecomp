@@ -9,8 +9,8 @@
  * the title's own picture. The pixels must stay valid until the matching
  * release, which follows at once. They are drawn into the overlay's
  * destination rectangle, with its colour key. Called on the render thread.
- * The D3D11 renderer honours it; the others still show the title's own
- * picture.
+ * The D3D11 and OpenGL renderers honour it; the software rasteriser still
+ * shows the title's own picture.
  *
  * Its own header, because the renderers do not include kernel.h.
  */

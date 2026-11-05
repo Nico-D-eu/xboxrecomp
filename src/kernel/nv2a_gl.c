@@ -25,6 +25,7 @@
 
 #include "nv2a_d3d11.h"
 #include "nv2a_hlsl.h"
+#include "overlay_source.h"       /* g_xbox_overlay_source */
 #include "../d3d/d3d8_swizzle.h"
 
 #include <SDL.h>
@@ -1897,7 +1898,40 @@ static void overlay_compose(const GlOverlay *o, uint32_t *px, uint32_t w, uint32
     const uint8_t *src = guest() + o->va;
     const uint32_t S = (uint32_t)gpu_scale();
     const uint32_t ox = o->x * S, oy = o->y * S, ow = o->ow * S, oh = o->oh * S;
+    const XboxOverlaySource *rep = g_xbox_overlay_source;
     uint32_t dy, dx;
+
+    /* The project's picture (g_xbox_overlay_source), when it has one for
+     * this frame: the whole of it into the destination rectangle, with the
+     * colour key, as nv2a_d3d11.c draws it. Nearest sample: a movie copy is
+     * larger than the rectangle, so this is a downscale. */
+    if (rep) {
+        uint32_t rw = 0, rh = 0, rp = 0;
+        const uint8_t *rpx = (const uint8_t *)rep->acquire(&rw, &rh, &rp);
+        if (rpx) {
+            static uint32_t said_w, said_h;
+            if (rw && rh && rw <= 8192 && rh <= 8192 && rp >= rw * 4u) {
+                if (said_w != rw || said_h != rh) {
+                    fprintf(stderr, "  [GL] video overlay: the project's picture, %ux%u\n", rw, rh);
+                    said_w = rw;
+                    said_h = rh;
+                }
+                for (dy = 0; dy < oh && oy + dy < h; dy++) {
+                    uint32_t sy = (uint32_t)(((uint64_t)dy * rh + rh / 2) / oh);
+                    const uint32_t *row = (const uint32_t *)(rpx + (size_t)(sy < rh ? sy : rh - 1) * rp);
+                    uint32_t *out = px + (size_t)(oy + dy) * w;
+                    for (dx = 0; dx < ow && ox + dx < w; dx++) {
+                        uint32_t sx = (uint32_t)(((uint64_t)dx * rw + rw / 2) / ow);
+                        if (o->keyed && (out[ox + dx] & 0xFFFFFFu) != o->key)
+                            continue;
+                        out[ox + dx] = 0xFF000000u | row[sx < rw ? sx : rw - 1];
+                    }
+                }
+            }
+            rep->release();
+            return;
+        }
+    }
     float sx_step = ((float)o->w - o->s0) / (float)ow;
     float sy_step = (float)o->h / (float)oh;
 
