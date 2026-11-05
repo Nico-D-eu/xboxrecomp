@@ -120,6 +120,27 @@ static uint32_t color_bpp(uint32_t format)
     }
 }
 
+/* RECOMP_GPU_SCALE=<n>, as in nv2a_d3d11.c: every colour and depth surface
+ * is n times the guest's size in each direction, with viewports, scissors,
+ * clears, the frame read back for the window and the video overlay scaled
+ * to match. GlSurface keeps the guest's size -- texture coordinates of
+ * surfaces sampled as textures (render to texture, shadow maps) work in
+ * it -- and only the GL textures are larger. Nothing here writes rendered
+ * pixels back into guest memory, so the title cannot tell. 1 (default) to 8.
+ * The frame goes to the window through the CPU, so each step up costs
+ * read-back bandwidth: 2 is 14.7 MB a frame at 1280x720. */
+static int gpu_scale(void)
+{
+    static int sc = 0;
+    if (!sc) {
+        const char *e = getenv("RECOMP_GPU_SCALE");
+        sc = e ? atoi(e) : 1;
+        if (sc < 1) sc = 1;
+        if (sc > 8) sc = 8;
+    }
+    return sc;
+}
+
 static int draw_init(void);
 
 static int init(void)
@@ -194,8 +215,8 @@ static GlSurface *surface(GlSurface *tab, uint32_t va, uint32_t w, uint32_t h, i
     if (color) {
         glGenTextures(1, &e->obj);
         glBindTexture(GL_TEXTURE_2D, e->obj);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
-                     GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)(w * gpu_scale()),
+                     (GLsizei)(h * gpu_scale()), 0, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         /* One level: complete under any sampler, mipmapped ones too. */
@@ -205,8 +226,8 @@ static GlSurface *surface(GlSurface *tab, uint32_t va, uint32_t w, uint32_t h, i
          * as shadow maps (the shader compares, stage tz<n>). */
         glGenTextures(1, &e->obj);
         glBindTexture(GL_TEXTURE_2D, e->obj);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, (GLsizei)w, (GLsizei)h, 0,
-                     GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, (GLsizei)(w * gpu_scale()),
+                     (GLsizei)(h * gpu_scale()), 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
@@ -269,7 +290,7 @@ static int bind_targets(const Nv2aHwDraw *d, int want_color, int want_depth,
     if (!s_att_complete)
         return 0;
     if (s_vp_w != *w || s_vp_h != *h) {
-        glViewport(0, 0, (GLsizei)*w, (GLsizei)*h);
+        glViewport(0, 0, (GLsizei)(*w * gpu_scale()), (GLsizei)(*h * gpu_scale()));
         s_vp_w = *w;
         s_vp_h = *h;
     }
@@ -287,7 +308,8 @@ static void do_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color, uint32
     if (!bind_targets(d, (flags & 0xF0u) != 0, (flags & 0x03u) != 0, &w, &h))
         return;
     glEnable(GL_SCISSOR_TEST);
-    glScissor((GLint)d->clip_x, (GLint)d->clip_y, (GLsizei)d->clip_w, (GLsizei)d->clip_h);
+    glScissor((GLint)(d->clip_x * gpu_scale()), (GLint)(d->clip_y * gpu_scale()),
+              (GLsizei)(d->clip_w * gpu_scale()), (GLsizei)(d->clip_h * gpu_scale()));
     /* A clear writes whatever the flags name, whatever the masks. */
     if ((flags & 0xF0u) && d->color_va) {
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -1716,7 +1738,8 @@ static void draw_impl(const Nv2aHwDraw *d)
     /* Fixed function: NV2A's values are GL's enums. */
     glUseProgram(prog);
     glEnable(GL_SCISSOR_TEST);
-    glScissor((GLint)d->clip_x, (GLint)d->clip_y, (GLsizei)d->clip_w, (GLsizei)d->clip_h);
+    glScissor((GLint)(d->clip_x * gpu_scale()), (GLint)(d->clip_y * gpu_scale()),
+              (GLsizei)(d->clip_w * gpu_scale()), (GLsizei)(d->clip_h * gpu_scale()));
     glColorMask((d->color_mask & 0x00010000u) != 0, (d->color_mask & 0x00000100u) != 0,
                 (d->color_mask & 0x00000001u) != 0, (d->color_mask & 0x01000000u) != 0);
     if (d->blend_enable) {
@@ -1867,28 +1890,31 @@ static uint32_t yuv_argb(int y, int u, int v)
 }
 
 /* The overlay into px (w x h), nearest sample, as the shader in
- * nv2a_d3d11.c maps it: destination in frame pixels, source from s0. */
+ * nv2a_d3d11.c maps it: destination in frame pixels (the guest's, times
+ * the render scale), source from s0. */
 static void overlay_compose(const GlOverlay *o, uint32_t *px, uint32_t w, uint32_t h)
 {
     const uint8_t *src = guest() + o->va;
+    const uint32_t S = (uint32_t)gpu_scale();
+    const uint32_t ox = o->x * S, oy = o->y * S, ow = o->ow * S, oh = o->oh * S;
     uint32_t dy, dx;
-    float sx_step = ((float)o->w - o->s0) / (float)o->ow;
-    float sy_step = (float)o->h / (float)o->oh;
+    float sx_step = ((float)o->w - o->s0) / (float)ow;
+    float sy_step = (float)o->h / (float)oh;
 
-    for (dy = 0; dy < o->oh && o->y + dy < h; dy++) {
+    for (dy = 0; dy < oh && oy + dy < h; dy++) {
         uint32_t sy = (uint32_t)(((float)dy + 0.5f) * sy_step);
         const uint8_t *row = src + (size_t)(sy < o->h ? sy : o->h - 1) * o->pitch;
-        uint32_t *out = px + (size_t)(o->y + dy) * w;
-        for (dx = 0; dx < o->ow && o->x + dx < w; dx++) {
+        uint32_t *out = px + (size_t)(oy + dy) * w;
+        for (dx = 0; dx < ow && ox + dx < w; dx++) {
             float fx = o->s0 + ((float)dx + 0.5f) * sx_step;
             uint32_t sxp = (uint32_t)fx, pair = sxp / 2;
             const uint8_t *q;
             if (sxp >= o->w)
                 sxp = o->w - 1, pair = sxp / 2;
-            if (o->keyed && (out[o->x + dx] & 0xFFFFFFu) != o->key)
+            if (o->keyed && (out[ox + dx] & 0xFFFFFFu) != o->key)
                 continue;
             q = row + (size_t)pair * 4;           /* Y0 U Y1 V */
-            out[o->x + dx] = yuv_argb((sxp & 1) ? q[2] : q[0], q[1], q[3]);
+            out[ox + dx] = yuv_argb((sxp & 1) ? q[2] : q[0], q[1], q[3]);
         }
     }
 }
@@ -1939,10 +1965,13 @@ static void overlay_tick(void)
     if (now_ns() - s_last_present_ns < 16000000ull || !overlay_read(&o))
         return;
     if (!s_base) {                    /* nothing flipped yet: black, big enough */
-        if (o.x + o.ow > s_base_w)
-            s_base_w = o.x + o.ow;
-        if (o.y + o.oh > s_base_h)
-            s_base_h = o.y + o.oh;
+        const uint32_t S = (uint32_t)gpu_scale();
+        if (s_base_w < 640 * S)
+            s_base_w = 640 * S, s_base_h = 480 * S;
+        if ((o.x + o.ow) * S > s_base_w)
+            s_base_w = (o.x + o.ow) * S;
+        if ((o.y + o.oh) * S > s_base_h)
+            s_base_h = (o.y + o.oh) * S;
         if (!keep(&s_base, &s_base_cap, (size_t)s_base_w * s_base_h))
             return;
         memset(s_base, 0, (size_t)s_base_w * s_base_h * 4);
@@ -1954,6 +1983,7 @@ static void flip_impl(uint32_t color_va)
 {
     GlSurface *e;
     size_t need;
+    uint32_t sw, sh;
     int k, j;
 
     if (!on_thread())
@@ -1970,7 +2000,9 @@ static void flip_impl(uint32_t color_va)
     /* Start this frame's read. */
     k = s_pbo_next;
     s_pbo_next ^= 1;
-    need = (size_t)e->w * e->h * 4;
+    sw = e->w * (uint32_t)gpu_scale();
+    sh = e->h * (uint32_t)gpu_scale();
+    need = (size_t)sw * sh * 4;
     glBindBuffer(GL_PIXEL_PACK_BUFFER, s_pbo[k]);
     if (s_pbo_cap[k] < need) {
         glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)need, NULL, GL_STREAM_READ);
@@ -1980,12 +2012,12 @@ static void flip_impl(uint32_t color_va)
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->obj, 0);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, (GLsizei)e->w, (GLsizei)e->h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
+    glReadPixels(0, 0, (GLsizei)sw, (GLsizei)sh, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
     if (s_pbo_fence[k])
         glDeleteSync(s_pbo_fence[k]);
     s_pbo_fence[k] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    s_pbo_w[k] = e->w;
-    s_pbo_h[k] = e->h;
+    s_pbo_w[k] = sw;
+    s_pbo_h[k] = sh;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, s_fbo);
 
     /* Show the one started at the last flip. */
@@ -2504,7 +2536,8 @@ static void vis_write(uint32_t va, uint64_t samples)
     s = (uint32_t *)(guest() + va);
     s[0] = (uint32_t)now;
     s[1] = (uint32_t)(now >> 32);
-    s[2] = (uint32_t)samples;
+    /* In the guest's pixels: a scaled surface has S*S samples for each. */
+    s[2] = (uint32_t)(samples / (uint64_t)(gpu_scale() * gpu_scale()));
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     s[3] = 0;                                      /* done */
     s_vis_cache_va[k] = va;
