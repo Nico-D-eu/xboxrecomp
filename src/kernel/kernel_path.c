@@ -1073,6 +1073,10 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     return TRUE;
 
 translate:
+    /* The project's hook sees every game path, as on Windows (a movie pack
+     * needs to know which movie is being opened). */
+    if (g_xbox_path_hook)
+        g_xbox_path_hook(xbox_path);
     {
         char remainder_posix[MAX_PATH];
         snprintf(remainder_posix, sizeof(remainder_posix), "%s", remainder);
