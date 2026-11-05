@@ -2876,6 +2876,265 @@ static const char s_blit_hlsl[] =
     "}\n"
     "float4 ps_hud(V i) : SV_Target { return tx.Sample(sm, i.uv); }\n";
 
+/* ── Upscaling and sharpening at present (RECOMP_GPU_UPSCALE, _SHARPEN) ──
+ *
+ * AMD FidelityFX Super Resolution 1 (MIT; the algorithm as AMD published it
+ * in ffx_fsr1.h, written out here for HLSL 5 with plain Loads):
+ *  - EASU scales the finished picture up to the window: 12 source texels
+ *    around the output pixel, an edge direction and length from their luma,
+ *    and a Lanczos-like lobe stretched along the edge, clamped to the
+ *    nearest 2x2 so it does not ring.
+ *  - RCAS sharpens at output size, with the strength cut back wherever it
+ *    would push a pixel past its four neighbours' range (and in flat noise).
+ * Both read texels by integer position: f0.xy = source texels per output
+ * pixel, f0.zw = the viewport's top-left in the target, f1.xy = the source
+ * size (Loads clamp to it), f1.z = RCAS strength (0..1). They run on the
+ * blit's vertex shader; only SV_Position is used. */
+static const char s_fsr_hlsl[] =
+    "cbuffer F : register(b0) { float4 f0; float4 f1; };\n"
+    "Texture2D tx : register(t0);\n"
+    "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "float3 ld(int2 p) { return tx.Load(int3(clamp(p, int2(0, 0), int2(f1.xy) - 1), 0)).rgb; }\n"
+    "float lu(float3 c) { return c.b * 0.5 + (c.r * 0.5 + c.g); }\n"
+    /* One of the four bilinear corners: its weight w, and the luma of the
+     * texel (c) and its north, west, east, south neighbours. */
+    "void easu_set(inout float2 dir, inout float len, float w,\n"
+    "              float n, float wl, float c, float el, float s) {\n"
+    "  float lx = max(abs(el - c), abs(c - wl)); lx = lx > 0 ? 1.0 / lx : 0;\n"
+    "  float dx = el - wl;\n"
+    "  dir.x += dx * w; lx = saturate(abs(dx) * lx); len += lx * lx * w;\n"
+    "  float ly = max(abs(s - c), abs(c - n)); ly = ly > 0 ? 1.0 / ly : 0;\n"
+    "  float dy = s - n;\n"
+    "  dir.y += dy * w; ly = saturate(abs(dy) * ly); len += ly * ly * w;\n"
+    "}\n"
+    "void easu_tap(inout float3 ac, inout float aw, float2 off, float2 dir, float2 len,\n"
+    "              float lob, float clp, float3 c) {\n"
+    "  float2 v = float2(dot(off, dir), dot(off, float2(-dir.y, dir.x))) * len;\n"
+    "  float d2 = min(dot(v, v), clp);\n"
+    "  float wb = 0.4 * d2 - 1.0, wa = lob * d2 - 1.0;\n"
+    "  wb *= wb; wa *= wa;\n"
+    "  wb = 1.5625 * wb - 0.5625;\n"
+    "  ac += c * (wb * wa); aw += wb * wa;\n"
+    "}\n"
+    /*        b c
+     *      e f g h      f is the texel at or above-left of the sample
+     *      i j k l
+     *        n o                                                         */
+    "float4 ps_easu(V i) : SV_Target {\n"
+    "  float2 pp = (i.p.xy - f0.zw) * f0.xy - 0.5;\n"
+    "  float2 fp = floor(pp); pp -= fp;\n"
+    "  int2 q = int2(fp);\n"
+    "  float3 b = ld(q + int2(0, -1)), c = ld(q + int2(1, -1));\n"
+    "  float3 e = ld(q + int2(-1, 0)), f = ld(q), g = ld(q + int2(1, 0)), h = ld(q + int2(2, 0));\n"
+    "  float3 ii = ld(q + int2(-1, 1)), j = ld(q + int2(0, 1)), k = ld(q + int2(1, 1));\n"
+    "  float3 l = ld(q + int2(2, 1)), n = ld(q + int2(0, 2)), o = ld(q + int2(1, 2));\n"
+    "  float bL = lu(b), cL = lu(c), eL = lu(e), fL = lu(f), gL = lu(g), hL = lu(h);\n"
+    "  float iL = lu(ii), jL = lu(j), kL = lu(k), lL = lu(l), nL = lu(n), oL = lu(o);\n"
+    "  float2 dir = 0; float len = 0;\n"
+    "  easu_set(dir, len, (1 - pp.x) * (1 - pp.y), bL, eL, fL, gL, jL);\n"
+    "  easu_set(dir, len, pp.x * (1 - pp.y), cL, fL, gL, hL, kL);\n"
+    "  easu_set(dir, len, (1 - pp.x) * pp.y, fL, iL, jL, kL, nL);\n"
+    "  easu_set(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);\n"
+    "  float dr = dot(dir, dir);\n"
+    "  dir = dr < 1.0 / 32768.0 ? float2(1, 0) : dir * rsqrt(dr);\n"
+    "  len = len * 0.5; len *= len;\n"
+    "  float st = dot(dir, dir) / max(abs(dir.x), abs(dir.y));\n"
+    "  float2 len2 = float2(1 + (st - 1) * len, 1 - 0.5 * len);\n"
+    "  float lob = 0.5 + ((0.25 - 0.04) - 0.5) * len;\n"
+    "  float clp = 1.0 / lob;\n"
+    "  float3 mn = min(min(f, g), min(j, k)), mx = max(max(f, g), max(j, k));\n"
+    "  float3 ac = 0; float aw = 0;\n"
+    "  easu_tap(ac, aw, float2(0, -1) - pp, dir, len2, lob, clp, b);\n"
+    "  easu_tap(ac, aw, float2(1, -1) - pp, dir, len2, lob, clp, c);\n"
+    "  easu_tap(ac, aw, float2(-1, 1) - pp, dir, len2, lob, clp, ii);\n"
+    "  easu_tap(ac, aw, float2(0, 1) - pp, dir, len2, lob, clp, j);\n"
+    "  easu_tap(ac, aw, float2(0, 0) - pp, dir, len2, lob, clp, f);\n"
+    "  easu_tap(ac, aw, float2(-1, 0) - pp, dir, len2, lob, clp, e);\n"
+    "  easu_tap(ac, aw, float2(1, 1) - pp, dir, len2, lob, clp, k);\n"
+    "  easu_tap(ac, aw, float2(2, 1) - pp, dir, len2, lob, clp, l);\n"
+    "  easu_tap(ac, aw, float2(2, 0) - pp, dir, len2, lob, clp, h);\n"
+    "  easu_tap(ac, aw, float2(1, 0) - pp, dir, len2, lob, clp, g);\n"
+    "  easu_tap(ac, aw, float2(1, 2) - pp, dir, len2, lob, clp, o);\n"
+    "  easu_tap(ac, aw, float2(0, 2) - pp, dir, len2, lob, clp, n);\n"
+    "  return float4(min(mx, max(mn, ac / aw)), 1);\n"
+    "}\n"
+    /*   b
+     * d e f
+     *   h    */
+    "float4 ps_rcas(V i) : SV_Target {\n"
+    "  int2 q = int2(i.p.xy - f0.zw);\n"
+    "  float3 b = ld(q + int2(0, -1)), d = ld(q + int2(-1, 0)), e = ld(q);\n"
+    "  float3 f = ld(q + int2(1, 0)), h = ld(q + int2(0, 1));\n"
+    "  float bL = lu(b), dL = lu(d), eL = lu(e), fL = lu(f), hL = lu(h);\n"
+    "  float nz = 0.25 * (bL + dL + fL + hL) - eL;\n"
+    "  float rg = max(max(max(bL, dL), max(eL, fL)), hL) - min(min(min(bL, dL), min(eL, fL)), hL);\n"
+    "  nz = 1.0 - 0.5 * saturate(abs(nz) / max(rg, 1.0 / 65536.0));\n"
+    "  float3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));\n"
+    "  float3 hmin = mn4 / max(4.0 * mx4, 1.0 / 65536.0);\n"
+    "  float3 hmax = (1.0 - mx4) / min(4.0 * mn4 - 4.0, -1.0 / 65536.0);\n"
+    "  float3 lb = max(-hmin, hmax);\n"
+    "  float lobe = max(-(0.25 - 1.0 / 16.0), min(max(max(lb.r, lb.g), lb.b), 0.0)) * f1.z * nz;\n"
+    "  return float4((lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0), 1);\n"
+    "}\n";
+
+static ID3D11PixelShader *s_easu_ps, *s_rcas_ps;
+static ID3D11Buffer *s_fsr_cb;
+static int s_upscale;                    /* 1: FSR 1 when the window is larger */
+static float s_sharpen;                  /* RCAS strength, 0 = off */
+
+/* An output-sized (or source-sized) picture between passes. */
+typedef struct {
+    ID3D11Texture2D *tex;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;
+    UINT w, h;
+} PostTex;
+static PostTex s_post_a, s_post_b;
+
+static int post_tex(PostTex *t, UINT w, UINT h)
+{
+    D3D11_TEXTURE2D_DESC td;
+    if (t->tex && t->w == w && t->h == h)
+        return 1;
+    if (t->srv) ID3D11ShaderResourceView_Release(t->srv);
+    if (t->rtv) ID3D11RenderTargetView_Release(t->rtv);
+    if (t->tex) ID3D11Texture2D_Release(t->tex);
+    memset(t, 0, sizeof *t);
+    memset(&td, 0, sizeof td);
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &t->tex)))
+        return 0;
+    ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)t->tex, NULL, &t->rtv);
+    ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t->tex, NULL, &t->srv);
+    t->w = w;
+    t->h = h;
+    return t->rtv && t->srv;
+}
+
+/* RECOMP_GPU_UPSCALE=fsr (or bilinear, the default) and RECOMP_GPU_SHARPEN
+ * (0..1; with FSR it defaults to 0.8, otherwise to 0). Compiles the shaders
+ * only when one of them is on. */
+static void post_init(void)
+{
+    const char *up = getenv("RECOMP_GPU_UPSCALE"), *sh = getenv("RECOMP_GPU_SHARPEN");
+    ID3DBlob *b = NULL, *err = NULL;
+
+    s_upscale = up && (!_stricmp(up, "fsr") || !_stricmp(up, "fsr1"));
+    s_sharpen = s_upscale ? 0.8f : 0.0f;
+    if (sh && *sh)
+        s_sharpen = (float)atof(sh);
+    if (s_sharpen < 0.0f) s_sharpen = 0.0f;
+    if (s_sharpen > 1.0f) s_sharpen = 1.0f;
+    if (!s_upscale && s_sharpen <= 0.0f)
+        return;
+    if (s_upscale) {
+        if (SUCCEEDED(D3DCompile(s_fsr_hlsl, sizeof s_fsr_hlsl - 1, NULL, NULL, NULL,
+                                 "ps_easu", "ps_5_0", 0, 0, &b, &err))) {
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                           ID3D10Blob_GetBufferSize(b), NULL, &s_easu_ps);
+            ID3D10Blob_Release(b);
+        } else {
+            fprintf(stderr, "  [D3D11] FSR shader: %s\n",
+                    err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+            s_upscale = 0;
+        }
+    }
+    if (s_sharpen > 0.0f) {
+        if (SUCCEEDED(D3DCompile(s_fsr_hlsl, sizeof s_fsr_hlsl - 1, NULL, NULL, NULL,
+                                 "ps_rcas", "ps_5_0", 0, 0, &b, &err))) {
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                           ID3D10Blob_GetBufferSize(b), NULL, &s_rcas_ps);
+            ID3D10Blob_Release(b);
+        } else {
+            fprintf(stderr, "  [D3D11] RCAS shader: %s\n",
+                    err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+            s_sharpen = 0.0f;
+        }
+    }
+    s_fsr_cb = make_buffer(32, D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DYNAMIC, NULL);
+    fprintf(stderr, "  [D3D11] upscale %s, sharpen %.2f\n",
+            s_upscale ? "FSR 1" : "bilinear", (double)s_sharpen);
+}
+
+static void post_cb(float sx, float sy, float ox, float oy, UINT w, UINT h, float sharpen)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_fsr_cb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float c[8] = { sx, sy, ox, oy, (float)w, (float)h, sharpen, 0.0f };
+        memcpy(m.pData, c, sizeof c);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_fsr_cb, 0);
+    }
+}
+
+static void post_draw(ID3D11PixelShader *ps, ID3D11ShaderResourceView *srv, ID3D11Buffer *cb,
+                      ID3D11RenderTargetView *rtv, const D3D11_VIEWPORT *v)
+{
+    ID3D11ShaderResourceView *none = NULL;
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, NULL);
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, v);
+    ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &cb);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &srv);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+}
+
+static int post_active(void)
+{
+    return (s_upscale && s_easu_ps) || (s_sharpen > 0.0f && s_rcas_ps);
+}
+
+/* The picture into the back buffer's viewport *vp (whole pixels) through
+ * FXAA (if on), EASU (when the window is larger than the source) and RCAS.
+ * The blit's vertex shader, constant buffer and sampler are already bound.
+ * Leaves the back buffer bound. Returns 0 if a texture could not be made. */
+static int post_present(RtEntry *rt, uint32_t w, uint32_t h, const D3D11_VIEWPORT *vp)
+{
+    UINT sw = w * (UINT)gpu_scale(), sh = h * (UINT)gpu_scale();
+    UINT ow = (UINT)vp->Width, oh = (UINT)vp->Height;
+    ID3D11PixelShader *first = s_blit_fxaa_ps ? s_blit_fxaa_ps : s_blit_ps;
+    int sharpen = s_sharpen > 0.0f && s_rcas_ps;
+    D3D11_VIEWPORT full = { 0, 0, 0, 0, 0.0f, 1.0f };
+
+    if (s_upscale && s_easu_ps && (ow > sw || oh > sh)) {
+        ID3D11ShaderResourceView *src = rt->srv;
+        if (s_blit_fxaa_ps) {
+            if (!post_tex(&s_post_a, sw, sh))
+                return 0;
+            full.Width = (float)sw; full.Height = (float)sh;
+            post_draw(s_blit_fxaa_ps, rt->srv, s_blit_cb, s_post_a.rtv, &full);
+            src = s_post_a.srv;
+        }
+        if (!sharpen) {
+            post_cb((float)sw / (float)ow, (float)sh / (float)oh, vp->TopLeftX, vp->TopLeftY,
+                    sw, sh, 0.0f);
+            post_draw(s_easu_ps, src, s_fsr_cb, s_bb_rtv, vp);
+            return 1;
+        }
+        if (!post_tex(&s_post_b, ow, oh))
+            return 0;
+        full.Width = (float)ow; full.Height = (float)oh;
+        post_cb((float)sw / (float)ow, (float)sh / (float)oh, 0.0f, 0.0f, sw, sh, 0.0f);
+        post_draw(s_easu_ps, src, s_fsr_cb, s_post_b.rtv, &full);
+    } else {
+        if (!sharpen) {
+            post_draw(first, rt->srv, s_blit_cb, s_bb_rtv, vp);
+            return 1;
+        }
+        if (!post_tex(&s_post_b, ow, oh))
+            return 0;
+        full.Width = (float)ow; full.Height = (float)oh;
+        post_draw(first, rt->srv, s_blit_cb, s_post_b.rtv, &full);
+    }
+    post_cb(1.0f, 1.0f, vp->TopLeftX, vp->TopLeftY, ow, oh, s_sharpen);
+    post_draw(s_rcas_ps, s_post_b.srv, s_fsr_cb, s_bb_rtv, vp);
+    return 1;
+}
+
 static int present_init(HWND hwnd)
 {
     IDXGIDevice *dxgi = NULL;
@@ -2970,6 +3229,7 @@ static int present_init(HWND hwnd)
     smp.MaxLOD = D3D11_FLOAT32_MAX;
     ID3D11Device_CreateSamplerState(s_dev, &smp, &s_blit_smp);
     s_blit_cb = make_buffer(16, D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DYNAMIC, NULL);
+    post_init();
     xbox_FramebufferWindowClaim();
     fprintf(stderr, "  [D3D11] presenting through a swap chain on the window\n");
     return 1;
@@ -3307,13 +3567,15 @@ static void hud_draw(uint32_t rw, uint32_t rh)
                 SetTextColor(dc, RGB(255, 255, 255));
             }
             snprintf(text, sizeof text,
-                     "%.1f fps   game %ux%u x%d%s%s\n"
+                     "%.1f fps   game %ux%u x%d%s%s%s%s\n"
                      "texture pack: %u replaced, %u not in the pack\n"
                      "overlays: %s\n"
                      "build: %s",
                      s_hud_fps, rw, rh, gpu_scale(),
                      s_blit_fxaa_ps ? "   FXAA" : "",
                      getenv("RECOMP_GPU_ANISO") ? "   aniso" : "",
+                     s_upscale && s_easu_ps ? "   FSR" : "",
+                     s_sharpen > 0.0f && s_rcas_ps ? "   sharpen" : "",
                      s_pack_loaded, s_pack_misses, ov && *ov ? ov : "none",
                      ver && *ver ? ver : "unknown");
             if (px && !s_hud_tex) {
@@ -3429,6 +3691,13 @@ static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
     vp.TopLeftY = ((float)ch - vp.Height) * 0.5f;
     vp.MinDepth = 0.0f;
     vp.MaxDepth = 1.0f;
+    if (post_active()) {
+        /* FSR and RCAS work in whole pixels. */
+        vp.Width = (float)(UINT)(vp.Width + 0.5f);
+        vp.Height = (float)(UINT)(vp.Height + 0.5f);
+        vp.TopLeftX = (float)(UINT)(((float)cw - vp.Width) * 0.5f);
+        vp.TopLeftY = (float)(UINT)(((float)ch - vp.Height) * 0.5f);
+    }
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         float uv[4] = { rt ? (float)w / (float)rt->w : 1.0f, rt ? (float)h / (float)rt->h : 1.0f,
@@ -3448,7 +3717,11 @@ static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
                                     NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
-    if (rt) {
+    if (rt && post_active()) {
+        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
+        if (!post_present(rt, w, h, &vp))
+            post_draw(s_blit_ps, rt->srv, s_blit_cb, s_bb_rtv, &vp);
+    } else if (rt) {
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
         ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
         ID3D11DeviceContext_Draw(s_ctx, 3, 0);
