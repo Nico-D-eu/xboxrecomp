@@ -2047,10 +2047,18 @@ static void bridge_RtlLeaveCriticalSection(void)
     g_eax = 0;
 }
 
+/* A thread polling the clock at raised IRQL takes the pending APU interrupt
+ * here (kernel_hal.c, xbox_IrqlPollPoint). Before the clock is read, so the
+ * time the caller sees includes the routine's run. */
+extern void xbox_IrqlPollPoint(void);
+
 /* ── KeQueryPerformanceCounter / Frequency (ordinals 126, 127) ─ */
 static void bridge_KeQueryPerformanceCounter(void)
 {
-    LARGE_INTEGER li = xbox_KeQueryPerformanceCounter();
+    LARGE_INTEGER li;
+
+    xbox_IrqlPollPoint();
+    li = xbox_KeQueryPerformanceCounter();
     g_eax = (uint32_t)li.LowPart;
     g_edx = (uint32_t)li.HighPart;
 }
@@ -2065,7 +2073,10 @@ static void bridge_KeQueryPerformanceFrequency(void)
 /* ── KeQuerySystemTime (ordinal 128) ─────────────────────── */
 static void bridge_KeQuerySystemTime(void)
 {
-    uint32_t time_ptr = STACK_ARG(0);
+    uint32_t time_ptr;
+
+    xbox_IrqlPollPoint();
+    time_ptr = STACK_ARG(0);
     xbox_KeQuerySystemTime(XBOX_TO_NATIVE(time_ptr));
     g_eax = 0;
 }
@@ -4013,6 +4024,26 @@ static void timer_health(int ev)
  * through the kernel; if it delivers on its own thread (upstream's apu_core)
  * it sets neither and this does nothing. On the paced loop, only with the
  * one-CPU gate free (a level line: the next pass takes it). */
+/* Set while DirectSound's APU routine runs, on the timer thread or on a
+ * raised thread polling the clock (xbox_IrqlPollPoint): never both at once. */
+static volatile LONG g_apu_isr_busy;
+
+/* The APU routine on the calling thread, which polls the clock at raised
+ * IRQL (kernel_hal.c saves and restores its registers around this). 1 when
+ * it ran. */
+int xbox_KernelApuIsrHere(void)
+{
+    int claimed;
+
+    if (!g_xbox_apu_irq_line || !xbox_GetConnectedInterrupt(5))
+        return 0;
+    if (InterlockedCompareExchange(&g_apu_isr_busy, 1, 0) != 0)
+        return 0;
+    claimed = kernel_call_isr(5);
+    InterlockedExchange(&g_apu_isr_busy, 0);
+    return claimed >= 0;
+}
+
 static void kernel_apu_line_service(int gated)
 {
     if (g_xbox_apu_irq_poll)
@@ -4022,7 +4053,13 @@ static void kernel_apu_line_service(int gated)
         int claimed;
         if (gated && !xbox_DispatchGateTryEnter())
             return;
+        if (InterlockedCompareExchange(&g_apu_isr_busy, 1, 0) != 0) {
+            if (gated)
+                xbox_DispatchGateLeave();
+            return;                     /* a raised thread has it; level line */
+        }
         claimed = kernel_call_isr(5);
+        InterlockedExchange(&g_apu_isr_busy, 0);
         if (gated)
             xbox_DispatchGateLeave();
         timer_health(2);
