@@ -3014,23 +3014,17 @@ static int post_tex(PostTex *t, UINT w, UINT h)
     return t->rtv && t->srv;
 }
 
-/* RECOMP_GPU_UPSCALE=fsr (or bilinear, the default) and RECOMP_GPU_SHARPEN
- * (0..1; with FSR it defaults to 0.8, otherwise to 0). Compiles the shaders
- * only when one of them is on. */
-static void post_init(void)
+/* Compiles what s_upscale and s_sharpen need and is not there yet; turns a
+ * pass off if its shader does not compile. */
+static void post_compile(void)
 {
-    const char *up = getenv("RECOMP_GPU_UPSCALE"), *sh = getenv("RECOMP_GPU_SHARPEN");
     ID3DBlob *b = NULL, *err = NULL;
 
-    s_upscale = up && (!_stricmp(up, "fsr") || !_stricmp(up, "fsr1"));
-    s_sharpen = s_upscale ? 0.8f : 0.0f;
-    if (sh && *sh)
-        s_sharpen = (float)atof(sh);
     if (s_sharpen < 0.0f) s_sharpen = 0.0f;
     if (s_sharpen > 1.0f) s_sharpen = 1.0f;
     if (!s_upscale && s_sharpen <= 0.0f)
         return;
-    if (s_upscale) {
+    if (s_upscale && !s_easu_ps) {
         if (SUCCEEDED(D3DCompile(s_fsr_hlsl, sizeof s_fsr_hlsl - 1, NULL, NULL, NULL,
                                  "ps_easu", "ps_5_0", 0, 0, &b, &err))) {
             ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
@@ -3042,7 +3036,7 @@ static void post_init(void)
             s_upscale = 0;
         }
     }
-    if (s_sharpen > 0.0f) {
+    if (s_sharpen > 0.0f && !s_rcas_ps) {
         if (SUCCEEDED(D3DCompile(s_fsr_hlsl, sizeof s_fsr_hlsl - 1, NULL, NULL, NULL,
                                  "ps_rcas", "ps_5_0", 0, 0, &b, &err))) {
             ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
@@ -3054,9 +3048,47 @@ static void post_init(void)
             s_sharpen = 0.0f;
         }
     }
-    s_fsr_cb = make_buffer(32, D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DYNAMIC, NULL);
-    fprintf(stderr, "  [D3D11] upscale %s, sharpen %.2f\n",
-            s_upscale ? "FSR 1" : "bilinear", (double)s_sharpen);
+    if (!s_fsr_cb)
+        s_fsr_cb = make_buffer(32, D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_DYNAMIC, NULL);
+}
+
+/* RECOMP_GPU_UPSCALE=fsr (or bilinear, the default) and RECOMP_GPU_SHARPEN
+ * (0..1; with FSR it defaults to 0.8, otherwise to 0). */
+static void post_init(void)
+{
+    const char *up = getenv("RECOMP_GPU_UPSCALE"), *sh = getenv("RECOMP_GPU_SHARPEN");
+
+    s_upscale = up && (!_stricmp(up, "fsr") || !_stricmp(up, "fsr1"));
+    s_sharpen = s_upscale ? 0.8f : 0.0f;
+    if (sh && *sh)
+        s_sharpen = (float)atof(sh);
+    post_compile();
+    if (s_upscale || s_sharpen > 0.0f)
+        fprintf(stderr, "  [D3D11] upscale %s, sharpen %.2f\n",
+                s_upscale ? "FSR 1" : "bilinear", (double)s_sharpen);
+}
+
+/* A settings menu changing them while the game runs (amped2's Mods and
+ * Graphics screen): any thread; the render thread picks it up at its next
+ * present. */
+static volatile LONG s_post_req;          /* 1: s_post_req_* are new */
+static volatile LONG s_post_req_upscale;
+static volatile float s_post_req_sharpen;
+
+void xbox_GpuSetPost(int upscale, float sharpen)
+{
+    s_post_req_upscale = upscale != 0;
+    s_post_req_sharpen = sharpen;
+    InterlockedExchange(&s_post_req, 1);
+}
+
+static void post_apply_request(void)
+{
+    if (!InterlockedExchange(&s_post_req, 0))
+        return;
+    s_upscale = (int)s_post_req_upscale;
+    s_sharpen = s_post_req_sharpen;
+    post_compile();
 }
 
 static void post_cb(float sx, float sy, float ox, float oy, UINT w, UINT h, float sharpen)
@@ -3656,6 +3688,7 @@ static int present_frame(RtEntry *rt, uint32_t w, uint32_t h)
         s_present_mode = 0;
         return 0;
     }
+    post_apply_request();
     GetClientRect(hwnd, &cr);
     cw = (UINT)(cr.right - cr.left);
     ch = (UINT)(cr.bottom - cr.top);
@@ -4681,5 +4714,8 @@ int  nv2a_d3d11_frames_in_flight(void) { return nv2a_gl_frames_in_flight(); }
 void nv2a_d3d11_report(void) { nv2a_gl_report(); }
 void nv2a_d3d11_zpass(int enable) { nv2a_gl_zpass(enable); }
 void nv2a_d3d11_get_report(uint32_t va, uint32_t va_alt) { nv2a_gl_get_report(va, va_alt); }
+
+/* FSR 1 and sharpening are D3D11-only so far. */
+void xbox_GpuSetPost(int upscale, float sharpen) { (void)upscale; (void)sharpen; }
 
 #endif
