@@ -1982,8 +1982,12 @@ static int init(void)
      * the integrated GPU. RECOMP_GPU_ADAPTER=default keeps the default. */
     if (!getenv("RECOMP_GPU_ADAPTER")
             || _stricmp(getenv("RECOMP_GPU_ADAPTER"), "default") != 0) {
+        /* Our own copy of IID_IDXGIFactory6: dxguid.lib in Windows SDK
+         * 10.0.19041 and older does not export it, and the link fails. */
+        static const IID iid_factory6 = { 0xc1b6694f, 0xff09, 0x44a9,
+            { 0xb0, 0x3c, 0x77, 0x90, 0x0a, 0x0a, 0x1d, 0x17 } };
         IDXGIFactory6 *f6 = NULL;
-        if (SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory6, (void **)&f6))) {
+        if (SUCCEEDED(CreateDXGIFactory1(&iid_factory6, (void **)&f6))) {
             IDXGIFactory6_EnumAdapterByGpuPreference(f6, 0,
                     DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, &IID_IDXGIAdapter1,
                     (void **)&adapter);
