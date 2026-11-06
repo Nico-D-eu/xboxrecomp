@@ -62,6 +62,8 @@ static int env_cached(int *slot, const char *name)
     return *slot;
 }
 static int s_env_verbose = -1, s_env_vp_off = -1, s_env_batch_trace = -1;
+static int s_env_fog_off_log = -1;
+static unsigned s_fog_off_draws;            /* draws since the fog off marker */
 
 static Nv2aVpState s_vp;
 static Nv2aCombiner s_comb;
@@ -343,6 +345,10 @@ static struct {
     uint32_t zpitch, blend_eq, blend_color;
     uint32_t fog_enable, fog_mode, shadow_func;
     float    fog_param[3];
+    /* NO_OPERATION 0x52460001 / 0x52460000 ("RF"): a game's hand code
+     * turns fog off for the draws between them (RE-Amped2: snowmen seen
+     * from far away). Not a hardware state; real hardware ignores it. */
+    uint32_t fog_off;
     uint32_t cull_enable, cull_face, front_face;
     uint32_t stencil_test, stencil_mask, stencil_func, stencil_ref,
              stencil_func_mask, stencil_fail, stencil_zfail, stencil_zpass;
@@ -2289,7 +2295,8 @@ static void hw_fill_targets(Nv2aHwDraw *d)
     d->cull_enable = s_gpu.cull_enable;
     d->cull_face = s_gpu.cull_face;
     d->front_face = s_gpu.front_face;
-    d->fog_enable = s_gpu.fog_enable;
+    d->fog_enable = s_gpu.fog_off ? 0u : s_gpu.fog_enable;
+    s_fog_off_draws += s_gpu.fog_off;
     d->fog_mode = s_gpu.fog_mode;
     d->shadow_func = s_gpu.shadow_func;
     memcpy(d->fog_param, s_gpu.fog_param, sizeof d->fog_param);
@@ -3383,6 +3390,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.color_mask = param;
         break;
     case 0x02A4: s_gpu.fog_enable = param; break;         /* SET_FOG_ENABLE */
+    case 0x0100:                                          /* NO_OPERATION */
+        if ((param & 0xFFFFFFFEu) == 0x52460000u) {       /* fog off marker */
+            static unsigned logged;
+            if (!(param & 1u) && s_gpu.fog_off && logged < 16
+                    && env_cached(&s_env_fog_off_log, "RECOMP_FOG_OFF_LOG")) {
+                logged++;
+                fprintf(stderr, "  [GPU] fog off for %u draw(s)\n", s_fog_off_draws);
+            }
+            s_gpu.fog_off = param & 1u;
+            s_fog_off_draws = 0;
+        }
+        break;
     case 0x029C: s_gpu.fog_mode = param; break;           /* SET_FOG_MODE */
     case 0x1E6C: s_gpu.shadow_func = param & 7u; break;   /* SET_SHADOW_DEPTH_FUNC */
     case 0x17C8:                                          /* CLEAR_REPORT_VALUE */
