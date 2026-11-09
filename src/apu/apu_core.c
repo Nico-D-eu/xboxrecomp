@@ -304,7 +304,7 @@ static int64_t g_apu_frame_us, g_apu_frame_max_us;   /* in se_frame */
 static int64_t g_apu_relock_us;                      /* re-taking the lock */
 static unsigned g_apu_underruns, g_apu_overruns;     /* output queue empty / full */
 static unsigned g_apu_stalls;                        /* waits on a trapped front end */
-static volatile long g_apu_health_stalls;            /* the same, for [HEALTH] */
+static volatile LONG g_apu_health_stalls;            /* the same, for [HEALTH] */
 
 /* For the kernel's [HEALTH] line: frames a second over the last second, and
  * trapped-front-end waits since the last call. */

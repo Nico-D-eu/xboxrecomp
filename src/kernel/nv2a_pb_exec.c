@@ -3544,7 +3544,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * RECOMP_FLIP_INTERVAL=<n> waits n vblanks instead of one, and
          * RECOMP_FLIP_NOWAIT=1 flips at once, as before. */
         {
-            extern volatile long g_xbox_vblank_count;
+            extern volatile LONG g_xbox_vblank_count;
             static long last_vb;
             static int nowait = -1;
             static long interval = 1;
