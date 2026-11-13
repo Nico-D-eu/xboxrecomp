@@ -204,7 +204,7 @@ int xbox_PhysSplit(void)
 
 /* RECOMP_PHYS_TRACE: report a page asked for from one store after the
  * other (a collision the flag table would have lost). Counted always. */
-volatile long g_xbox_phys_flips;
+volatile LONG g_xbox_phys_flips;
 
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
 

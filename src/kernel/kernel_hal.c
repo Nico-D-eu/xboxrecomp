@@ -251,14 +251,14 @@ static LARGE_INTEGER s_disp_t0;              /* when the owner took it */
 /* For the timer thread's [HEALTH] line (kernel_bridge.c), reset as it prints:
  * contended acquires and the time spent in them, and the longest hold with
  * the guest site that raised. */
-volatile long g_disp_health_waits, g_disp_health_wait_us;
-volatile long g_disp_health_maxhold_us;
+volatile LONG g_disp_health_waits, g_disp_health_wait_us;
+volatile LONG g_disp_health_maxhold_us;
 volatile uint32_t g_disp_health_maxhold_site;
 static uint32_t s_disp_site;                 /* the owner's guest caller */
 static XBOX_THREAD_LOCAL int s_disp_held;    /* this thread's raise took it */
 static volatile LONG s_disp_timeouts;
 /* Every acquire that gave up, for [HEALTH]. */
-volatile long g_disp_health_timeouts;
+volatile LONG g_disp_health_timeouts;
 /* The owner took it to run a DPC (xbox_DispatchLockAcquireForDpc). A raise
  * queued behind a DPC waits at most XBOX_DPC_HOLD_WAIT_MS: a DPC normally
  * takes microseconds, and the one that does not is waiting on something a
@@ -297,7 +297,7 @@ int xbox_DispatchLockAcquire(unsigned timeout_ms)
                 InterlockedIncrement(&g_disp_health_waits);
                 if (wait0.QuadPart)
                     InterlockedExchangeAdd(&g_disp_health_wait_us,
-                        (long)((s_disp_t0.QuadPart - wait0.QuadPart) * 1000000 / f.QuadPart));
+                        (LONG)((s_disp_t0.QuadPart - wait0.QuadPart) * 1000000 / f.QuadPart));
             }
             s_disp_site = g_xbox_kernel_caller;
             return 1;
@@ -1824,7 +1824,7 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
          * count's parity matches the field, so a constant 0 let it count one
          * and stop -- and GetOverlayUpdateStatus, which compares that count
          * with the one UpdateOverlay saw, never said an XMV frame was shown. */
-        extern volatile long g_xbox_vblank_count;
+        extern volatile LONG g_xbox_vblank_count;
         *Result = (ULONG)g_xbox_vblank_count & 1u;
         break;
     }

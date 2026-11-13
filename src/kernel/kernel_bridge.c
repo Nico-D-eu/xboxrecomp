@@ -3054,7 +3054,7 @@ static int kernel_call_isr(uint32_t vector)
  * frame loop at whatever rate it could draw. Bumped by whichever vblank
  * source runs: ours (kernel_vblank_tick, the default timer loop) or
  * upstream's 60 Hz schedule (kernel_vblank_count, the paced loop). */
-volatile long g_xbox_vblank_count;
+volatile LONG g_xbox_vblank_count;
 
 /* The APU's interrupt line and the hook that folds its pending events into
  * it; src/apu sets both when it starts, so the kernel needs no APU. */
@@ -3968,8 +3968,8 @@ extern int  xbox_DispatchLockEnabled(void);
  * and trapped-front-end waits. */
 static void timer_health(int ev)
 {
-    extern volatile long g_disp_health_waits, g_disp_health_wait_us, g_disp_health_maxhold_us;
-    extern volatile long g_disp_health_timeouts;
+    extern volatile LONG g_disp_health_waits, g_disp_health_wait_us, g_disp_health_maxhold_us;
+    extern volatile LONG g_disp_health_timeouts;
     extern volatile uint32_t g_disp_health_maxhold_site;
     extern int mcpx_apu_health(long *stalls, long *idle_linked);
     extern int xbox_IrqlRaisedCount(void);
@@ -3995,8 +3995,8 @@ static void timer_health(int ev)
                 " guest 0x%08X; APU %d frames/s, %ld trapped-FE waits, %ld idle voices"
                 " linked\n",
                 passes, passes ? raised_seen * 100u / passes : 0u, held, apu_isr,
-                g_disp_health_waits, g_disp_health_wait_us / 1000, g_disp_health_timeouts,
-                g_disp_health_maxhold_us / 1000, g_disp_health_maxhold_site, rate, stalls,
+                (long)g_disp_health_waits, (long)g_disp_health_wait_us / 1000, (long)g_disp_health_timeouts,
+                (long)g_disp_health_maxhold_us / 1000, g_disp_health_maxhold_site, rate, stalls,
                 idle_linked);
         fflush(stderr);
     }
