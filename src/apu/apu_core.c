@@ -667,9 +667,31 @@ static void *mcpx_apu_frame_thread(void *arg)
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
     bool stalled = false;     /* waiting out a trapped front end */
     int64_t trap_since_us = 0;  /* when the current trap began (0: none) */
+    static int log_on = -1;
+    static uint64_t passes;
+    int64_t log_last = 0;
+    if (log_on < 0)
+        log_on = getenv("RECOMP_APU_THREAD_LOG") != NULL;
+    if (log_on)
+        fprintf(stderr, "[APU] frame thread started\n");
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
+        /* RECOMP_APU_THREAD_LOG: once a second, what the loop is doing --
+         * for a host where it makes no frames (seen on an Android phone). */
+        if (log_on) {
+            int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            passes++;
+            if (now - log_last >= 1000000) {
+                log_last = now;
+                fprintf(stderr, "[APU] loop: %llu passes, pause %d, idle %d, xcntmode %d,"
+                        " fectl %08X, out active %d, queued %d, tone %d, mixers %d\n",
+                        (unsigned long long)passes, (int)d->pause_requested, (int)d->is_idle,
+                        (int)GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]), NV_PAPU_SECTL_XCNTMODE),
+                        (unsigned)qatomic_read(&d->regs[NV_PAPU_FECTL]), xa2_is_active(),
+                        xa2_queued(), (int)g_test_tone.active, (int)g_mixer_active_count);
+            }
+        }
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
             d->is_idle = true;
             qemu_cond_signal(&d->idle_cond);

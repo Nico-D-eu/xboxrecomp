@@ -741,11 +741,37 @@ static DWORD_PTR process_mask_capture(void)
     return mask;
 }
 
+/* A larger alternate signal stack for the calling thread (Android only).
+ * Android's runtime chains every signal handler through its own, which
+ * runs on bionic's per-thread alternate stack of 32 KB; the title's
+ * trapped-register emulation (fault handler -> MMIO decode -> device model)
+ * needs more, and on a phone it overflowed that stack, faulted on its own
+ * first push and looped there (some 470,000 faults a second, the game
+ * stalled before the front end). Elsewhere handlers run on the thread's
+ * own stack and nothing is changed. */
+void xbox_PosixBigSignalStack(void)
+{
+#if defined(__ANDROID__)
+    enum { SZ = 512 * 1024 };
+    stack_t ss;
+    void *p = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED)
+        return;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_sp = p;
+    ss.ss_size = SZ;
+    if (sigaltstack(&ss, NULL) != 0)
+        munmap(p, SZ);
+#endif
+}
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+
+    xbox_PosixBigSignalStack();
 
 #if defined(__linux__) && !defined(__ANDROID__)   /* bionic: no pthread_setaffinity_np */
     /* The process mask, not the creator's: see process_mask_capture. */

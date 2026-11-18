@@ -297,11 +297,14 @@ static void set_fullscreen(SDL_Window *win, int on)
         s_fullscreen = on;
 }
 
+extern void xbox_PosixBigSignalStack(void);   /* win32_compat.c */
+
 static void *guest_thread(void *arg)
 {
     SDL_Event ev;
 
     (void)arg;
+    xbox_PosixBigSignalStack();   /* Android: room for the MMIO trap */
     s_guest_rc = s_guest_main();
     memset(&ev, 0, sizeof ev);
     ev.type = s_guest_done_event;
