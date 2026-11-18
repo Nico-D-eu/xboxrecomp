@@ -55,12 +55,21 @@ if(WIN32)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto,
     # and SDL2 + epoxy for the executor's OpenGL back end (nv2a_gl.c).
-    find_package(OpenSSL REQUIRED)
     find_package(SDL2 REQUIRED)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(EPOXY REQUIRED IMPORTED_TARGET epoxy)
-    target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
-    target_link_libraries(xbox_kernel PRIVATE SDL2::SDL2 PkgConfig::EPOXY)
+    if(ANDROID)
+        # Android: the system's GLES 3.2 (every entry point is exported by
+        # libGLESv3) behind a small epoxy/gl.h, and no OpenSSL, which no
+        # source here includes any more.
+        target_include_directories(xbox_kernel PRIVATE ${XBOXRECOMP_SRC_DIR}/platform/android)
+        target_link_libraries(xbox_kernel PUBLIC platform)
+        target_link_libraries(xbox_kernel PRIVATE SDL2::SDL2 GLESv3 EGL)
+    else()
+        find_package(OpenSSL REQUIRED)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(EPOXY REQUIRED IMPORTED_TARGET epoxy)
+        target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+        target_link_libraries(xbox_kernel PRIVATE SDL2::SDL2 PkgConfig::EPOXY)
+    endif()
 endif()
 
 if(MSVC)

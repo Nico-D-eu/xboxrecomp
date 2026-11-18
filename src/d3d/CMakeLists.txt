@@ -22,8 +22,15 @@ else()
         d3d8_gl.c
     )
     find_package(SDL2 REQUIRED)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(EPOXY REQUIRED epoxy)
+    if(ANDROID)
+        # The system's GLES behind src/platform/android/epoxy/gl.h (see the
+        # kernel's CMakeLists).
+        set(EPOXY_INCLUDE_DIRS ${CMAKE_CURRENT_LIST_DIR}/../platform/android)
+        set(EPOXY_LINK_LIBRARIES GLESv3 EGL)
+    else()
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(EPOXY REQUIRED epoxy)
+    endif()
     target_include_directories(xbox_d3d8 PRIVATE ${EPOXY_INCLUDE_DIRS})
     # EPOXY_LINK_LIBRARIES, not EPOXY_LIBRARIES: the latter is the bare name
     # `epoxy`, which only resolves if EPOXY_LIBRARY_DIRS happens to be on the

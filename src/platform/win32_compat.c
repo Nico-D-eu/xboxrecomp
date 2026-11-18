@@ -29,6 +29,9 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#if defined(__ANDROID__)
+#include <sys/syscall.h>   /* __NR_memfd_create */
+#endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -744,7 +747,7 @@ static void *thread_trampoline(void *arg)
     t_self_obj = o;
     t_tid      = o->tid;
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)   /* bionic: no pthread_setaffinity_np */
     /* The process mask, not the creator's: see process_mask_capture. */
     if (s_process_mask) {
         cpu_set_t set;
@@ -870,7 +873,9 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_THREAD) return FALSE;
-    pthread_cancel(o->thread);
+#if !defined(__ANDROID__)
+    pthread_cancel(o->thread);   /* bionic has no pthread_cancel: the thread is only marked */
+#endif
     pthread_mutex_lock(&o->lock);
     o->exit_code = exitCode;
     o->exited    = 1;
@@ -901,7 +906,7 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
     if (!mask)
         return 0;
     process_mask_capture();   /* before this thread's mask shrinks */
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)   /* bionic: no pthread_setaffinity_np */
     {
         DWORD_PTR prev = 0;
         cpu_set_t set;
@@ -1425,6 +1430,11 @@ VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
     memset_s(ptr, cnt, 0, cnt);
+#elif defined(__ANDROID__)
+    /* bionic has no explicit_bzero: a volatile store the compiler keeps. */
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (cnt--)
+        *p++ = 0;
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -1736,6 +1746,10 @@ static int anon_map_fd(const char *name)
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
+#elif defined(__ANDROID__)
+    /* bionic declares memfd_create only from API 30; the syscall is in
+     * every kernel Android ships (3.17+). */
+    return (int)syscall(__NR_memfd_create, name ? name : "xbox_map", 0);
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif
