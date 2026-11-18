@@ -153,6 +153,13 @@ static int init(void)
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+#if defined(__APPLE__)
+    /* macOS hands out a core context (3.2 up to 4.1) only when it is also
+     * forward-compatible; without the flag it falls back to legacy 2.1 and
+     * the 3.3 request fails. Everything here is core-only already, and the
+     * one call above 4.1 (glBufferStorage) is behind s_persistent. */
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+#endif
     /* Hidden: it only owns the context. Everything is drawn into
      * framebuffer objects and reaches the screen through the window. */
     s_win = SDL_CreateWindow("nv2a_gl", 0, 0, 16, 16, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);

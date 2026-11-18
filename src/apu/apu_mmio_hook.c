@@ -285,3 +285,65 @@ bool apu_hook_handle_mmio(mmio_ctx_t ctx, uintptr_t fault_addr,
 }
 
 #endif /* _WIN32 || __x86_64__ */
+
+#if !defined(_WIN32) && defined(__aarch64__)
+/* POSIX arm64: the same hook over sigaction + ucontext, with the A64 decoder
+ * (src/platform/mmio_decode_a64.h). The host's fault handler reaches it
+ * through xbox_PosixMmioFault before it reports a crash. Upstream v0.16.0
+ * has this block; it was lost when this fork kept its own APU, so an arm64
+ * build failed to link. */
+#include <signal.h>
+#include "../platform/mmio_decode_a64.h"
+
+#define APU_MMIO_BASE  0xFE800000u
+#define APU_MMIO_SIZE  0x00080000u
+
+static int g_apu_mmio_decode_fail;
+
+/* The model's registers are 32-bit, so an 8-byte access (ldr/str x, a d
+ * register, each half of a q register) is two 4-byte accesses, as on
+ * Windows. */
+static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
+{
+    if (size == 8) {
+        uint64_t lo = mcpx_apu_mmio_read((MCPXAPUState *)dev, off, 4);
+        uint64_t hi = mcpx_apu_mmio_read((MCPXAPUState *)dev, off + 4, 4);
+        return lo | (hi << 32);
+    }
+    return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
+}
+
+static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
+{
+    if (size == 8) {
+        mcpx_apu_mmio_write((MCPXAPUState *)dev, off, (uint32_t)v, 4);
+        mcpx_apu_mmio_write((MCPXAPUState *)dev, off + 4, (uint32_t)(v >> 32), 4);
+        return;
+    }
+    mcpx_apu_mmio_write((MCPXAPUState *)dev, off, v, (unsigned)size);
+}
+
+/* Service one trapped APU access from a SIGBUS/SIGSEGV handler. ucv is the
+ * handler's ucontext; is_write is advisory (the decoder reads the opcode).
+ * Returns true when the access was emulated and pc advanced. */
+bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
+                                uint32_t fault_xbox_va, int is_write)
+{
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uint32_t off = fault_xbox_va - APU_MMIO_BASE;
+
+    (void)fault_addr; (void)is_write;
+    if (!g_apu_state || off >= APU_MMIO_SIZE)
+        return false;
+    if (mmio_emulate_a64(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr))
+        return true;
+    g_apu_mmio_decode_fail++;
+    /* stdio in a signal handler is not async-signal-safe; the process is
+     * about to die of this fault anyway and the line says why. Capped. */
+    if (g_apu_mmio_decode_fail <= 20)
+        fprintf(stderr, "[APU] MMIO decode fail at PC=%p insn=%08X offset=0x%X\n",
+                (void *)(uintptr_t)A64_CTX_PC(uc),
+                *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc), off);
+    return false;
+}
+#endif /* !_WIN32 && __aarch64__ */
