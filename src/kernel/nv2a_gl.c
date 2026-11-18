@@ -355,8 +355,7 @@ static void do_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color, uint32
  * decoder. NV2A's state values are GL's own enums (compare functions,
  * stencil ops, blend factors and equations), so they go to GL unchanged.
  *
- * Not yet: volume textures, CPU-written pixels under a surface,
- * anisotropy, render scale. */
+ * Not yet: volume textures, CPU-written pixels under a surface. */
 
 static const uint8_t *guest(void)
 {
@@ -1325,6 +1324,29 @@ static GLuint sampler_for(const Nv2aHwTexture *t, uint32_t levels)
             glSamplerParameteri(s, GL_TEXTURE_WRAP_S, wrap_mode(t->address & 0xFu));
             glSamplerParameteri(s, GL_TEXTURE_WRAP_T, wrap_mode((t->address >> 8) & 0xFu));
             glSamplerParameteri(s, GL_TEXTURE_WRAP_R, wrap_mode((t->address >> 16) & 0xFu));
+            /* RECOMP_GPU_ANISO=<2-16>, as nv2a_d3d11.c: anisotropic filtering
+             * for textures the title already filters linearly across mip
+             * levels (ground seen at a grazing angle), never for point-sampled
+             * or unmipped ones (UI, fonts, lookup tables). Core in GL 4.6,
+             * an extension nearly everywhere else (macOS included). */
+            {
+                static float aniso = -1.0f;
+                if (aniso < 0.0f) {
+                    const char *e = getenv("RECOMP_GPU_ANISO");
+                    aniso = e ? (float)atoi(e) : 0.0f;
+                    if (aniso > 1.0f && (epoxy_gl_version() >= 46
+                            || epoxy_has_gl_extension("GL_ARB_texture_filter_anisotropic")
+                            || epoxy_has_gl_extension("GL_EXT_texture_filter_anisotropic"))) {
+                        GLfloat most = 1.0f;
+                        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &most);
+                        if (aniso > most) aniso = most;
+                    } else {
+                        aniso = 0.0f;
+                    }
+                }
+                if (aniso > 1.0f && mips && lmin)
+                    glSamplerParameterf(s, GL_TEXTURE_MAX_ANISOTROPY_EXT, aniso);
+            }
             unpack_argb(t->border, border);
             glSamplerParameterfv(s, GL_TEXTURE_BORDER_COLOR, border);
             s_samplers[k].key = key;
