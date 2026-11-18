@@ -169,15 +169,33 @@ static void es_bgra_swizzle(GLenum target)
     }
 }
 
-static int init(void)
-{
-    const char *es;
+/* One window (RECOMP_GL_ONE_WINDOW=1; the default on Android, which has
+ * only one): the back end makes its context on the presenter's window
+ * (fb_present_sdl.c, g_xbox_host_window) instead of a hidden window of its
+ * own, and presents each flip itself -- the frame blitted to the window's
+ * framebuffer and swapped -- instead of reading it back for the
+ * presenter's SDL renderer. The movie overlay is not drawn in this mode
+ * yet. RECOMP_GL_SHOT still reads frames back, for tests. */
+extern SDL_Window *g_xbox_host_window;
+static int s_one_window, s_own_win;
 
-    if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
-        fprintf(stderr, "  [GL] no SDL video (%s); software rasteriser\n", SDL_GetError());
+int xbox_GlOneWindow(void)
+{
+    const char *g = getenv("RECOMP_GPU"), *e = getenv("RECOMP_GL_ONE_WINDOW");
+    if (!g || strcmp(g, "gl") != 0)
         return 0;
-    }
-    es = getenv("RECOMP_GL_ES");
+#if defined(__ANDROID__)
+    return !(e && *e == '0');
+#else
+    return e && *e && *e != '0';
+#endif
+}
+
+/* The context the back end asks for, set before a window is made: on EGL
+ * (Android) the window's surface is chosen for it. */
+void xbox_GlWindowAttributes(void)
+{
+    const char *es = getenv("RECOMP_GL_ES");
 #if defined(__ANDROID__)
     s_es = !(es && *es == '0');
 #else
@@ -194,17 +212,39 @@ static int init(void)
      * one call above 4.1 (glBufferStorage) is behind s_persistent. */
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
 #endif
-    /* Hidden: it only owns the context. Everything is drawn into
-     * framebuffer objects and reaches the screen through the window. */
-    s_win = SDL_CreateWindow("nv2a_gl", 0, 0, 16, 16, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+}
+
+static int init(void)
+{
+
+    if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "  [GL] no SDL video (%s); software rasteriser\n", SDL_GetError());
+        return 0;
+    }
+    xbox_GlWindowAttributes();
+    s_one_window = xbox_GlOneWindow() && g_xbox_host_window;
+    if (s_one_window) {
+        s_win = g_xbox_host_window;
+        s_own_win = 0;
+    } else {
+        /* Hidden: it only owns the context. Everything is drawn into
+         * framebuffer objects and reaches the screen through the window. */
+        s_win = SDL_CreateWindow("nv2a_gl", 0, 0, 16, 16, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+        s_own_win = 1;
+    }
     s_ctx = s_win ? SDL_GL_CreateContext(s_win) : NULL;
     if (!s_ctx || SDL_GL_MakeCurrent(s_win, s_ctx) != 0) {
-        fprintf(stderr, "  [GL] no OpenGL 3.3 core context (%s); software rasteriser\n",
-                SDL_GetError());
-        if (s_win)
+        fprintf(stderr, "  [GL] no OpenGL %s context (%s); software rasteriser\n",
+                s_es ? "ES 3.2" : "3.3 core", SDL_GetError());
+        if (s_win && s_own_win)
             SDL_DestroyWindow(s_win);
         s_win = NULL;
+        s_one_window = 0;
         return 0;
+    }
+    if (s_one_window) {
+        SDL_GL_SetSwapInterval(1);
+        fprintf(stderr, "  [GL] presenting on the window itself (one-window mode)\n");
     }
     glGenFramebuffers(1, &s_fbo);
     s_thread = pthread_self();
@@ -2108,6 +2148,72 @@ static void overlay_tick(void)
     present((const uint8_t *)s_base, s_base_w, s_base_h);
 }
 
+/* One-window mode: the finished frame onto the window, letterboxed to its
+ * shape and flipped (row 0 of a surface is the top, GL's window origin is
+ * the bottom), then swapped. Scissor and colour mask are the title's draw
+ * state, so they are put back. */
+static void one_window_present(const GlSurface *e)
+{
+    int ww = 0, wh = 0;
+    GLint sw = (GLint)(e->w * (uint32_t)gpu_scale()), sh = (GLint)(e->h * (uint32_t)gpu_scale());
+    GLint dw, dh, dx, dy;
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST), cm[4];
+
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0 || sw <= 0 || sh <= 0)
+        return;
+    if ((int64_t)ww * sh > (int64_t)wh * sw) {     /* window wider: pillarbox */
+        dh = wh;
+        dw = (GLint)((int64_t)wh * sw / sh);
+    } else {
+        dw = ww;
+        dh = (GLint)((int64_t)ww * sh / sw);
+    }
+    dx = (ww - dw) / 2;
+    dy = (wh - dh) / 2;
+    glGetBooleanv(GL_COLOR_WRITEMASK, cm);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, s_rfbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->obj, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glViewport(0, 0, ww, wh);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBlitFramebuffer(0, 0, sw, sh, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    {   /* RECOMP_GL_WINSHOT=<flip>: the window's own pixels at that flip, as
+         * gl_winshot.ppm (bottom row first, as GL reads them), to check
+         * this path without a screen grab. */
+        static long at = -2;
+        static unsigned long n;
+        if (at == -2) {
+            const char *v = getenv("RECOMP_GL_WINSHOT");
+            at = v ? atol(v) : -1;
+        }
+        if (at > 0 && ++n == (unsigned long)at) {
+            uint8_t *px = (uint8_t *)malloc((size_t)ww * wh * 4);
+            FILE *f = px ? fopen("gl_winshot.ppm", "wb") : NULL;
+            if (f) {
+                int y, x;
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                glReadPixels(0, 0, ww, wh, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                fprintf(f, "P6\n%d %d\n255\n", ww, wh);
+                for (y = wh - 1; y >= 0; y--)
+                    for (x = 0; x < ww; x++)
+                        fwrite(px + ((size_t)y * ww + x) * 4, 1, 3, f);
+                fclose(f);
+            }
+            free(px);
+        }
+    }
+    SDL_GL_SwapWindow(s_win);
+    glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
+    glColorMask(cm[0], cm[1], cm[2], cm[3]);
+    if (scissor)
+        glEnable(GL_SCISSOR_TEST);
+    s_vp_w = s_vp_h = 0;            /* bind_targets sets the viewport again */
+}
+
 static void flip_impl(uint32_t color_va)
 {
     GlSurface *e;
@@ -2124,6 +2230,16 @@ static void flip_impl(uint32_t color_va)
     if (!s_rfbo) {
         glGenFramebuffers(1, &s_rfbo);
         glGenBuffers(2, s_pbo);
+    }
+    if (s_one_window) {
+        static int shots = -1;
+        one_window_present(e);
+        if (shots < 0) {
+            const char *v = getenv("RECOMP_GL_SHOT");
+            shots = v && atoi(v) > 0;
+        }
+        if (!shots)
+            return;            /* else read back too, for RECOMP_GL_SHOT */
     }
 
     /* Start this frame's read. */
