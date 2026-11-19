@@ -174,8 +174,10 @@ static void es_bgra_swizzle(GLenum target)
  * (fb_present_sdl.c, g_xbox_host_window) instead of a hidden window of its
  * own, and presents each flip itself -- the frame blitted to the window's
  * framebuffer and swapped -- instead of reading it back for the
- * presenter's SDL renderer. The movie overlay is not drawn in this mode
- * yet. RECOMP_GL_SHOT still reads frames back, for tests. */
+ * presenter's SDL renderer. While the video overlay (movies) is on, flips
+ * are read back and composed on the CPU as in the two-window mode, and the
+ * result is uploaded and drawn to the window (one_window_present_px).
+ * RECOMP_GL_SHOT still reads frames back, for tests. */
 extern SDL_Window *g_xbox_host_window;
 static int s_one_window, s_own_win;
 
@@ -2109,6 +2111,18 @@ static int keep(uint32_t **buf, size_t *cap, size_t n)
     return 1;
 }
 
+static void one_window_present_px(const uint8_t *px, uint32_t w, uint32_t h);
+
+/* A finished BGRA frame to the screen: the presenter's window, or in
+ * one-window mode the GL window itself. */
+static void show_px(const uint8_t *px, uint32_t w, uint32_t h)
+{
+    if (s_one_window)
+        one_window_present_px(px, w, h);
+    else
+        xbox_FramebufferWindowPresentArgb(px, w, h, w * 4);
+}
+
 /* Present a frame, with the overlay over it if it is on. */
 static void present(const uint8_t *px, uint32_t w, uint32_t h)
 {
@@ -2116,7 +2130,7 @@ static void present(const uint8_t *px, uint32_t w, uint32_t h)
 
     s_last_present_ns = now_ns();
     if (!overlay_read(&o)) {
-        xbox_FramebufferWindowPresentArgb(px, w, h, w * 4);
+        show_px(px, w, h);
         shot(px, w, h);
         return;
     }
@@ -2129,7 +2143,7 @@ static void present(const uint8_t *px, uint32_t w, uint32_t h)
     s_base_h = h;
     memcpy(s_out, s_base, (size_t)w * h * 4);
     overlay_compose(&o, s_out, w, h);
-    xbox_FramebufferWindowPresentArgb(s_out, w, h, w * 4);
+    show_px((const uint8_t *)s_out, w, h);
     shot((const uint8_t *)s_out, w, h);
 }
 
@@ -2155,16 +2169,20 @@ static void overlay_tick(void)
     present((const uint8_t *)s_base, s_base_w, s_base_h);
 }
 
-/* One-window mode: the finished frame onto the window, letterboxed to its
- * shape and flipped (row 0 of a surface is the top, GL's window origin is
- * the bottom), then swapped. Scissor and colour mask are the title's draw
- * state, so they are put back. */
-static void one_window_present(const GlSurface *e)
+/* One-window mode: a finished frame (texture tex, sw x sh) onto the window,
+ * letterboxed to its shape and flipped (row 0 of a surface is the top, GL's
+ * window origin is the bottom), then swapped. Scissor and colour mask are the
+ * title's draw state, so they are put back. */
+static void one_window_blit(GLuint tex, GLint sw, GLint sh)
 {
     int ww = 0, wh = 0;
-    GLint sw = (GLint)(e->w * (uint32_t)gpu_scale()), sh = (GLint)(e->h * (uint32_t)gpu_scale());
     GLint dw, dh, dx, dy;
     GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST), cm[4];
+
+    if (!s_rfbo) {
+        glGenFramebuffers(1, &s_rfbo);
+        glGenBuffers(2, s_pbo);
+    }
 
     SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     if (ww <= 0 || wh <= 0 || sw <= 0 || sh <= 0)
@@ -2182,7 +2200,7 @@ static void one_window_present(const GlSurface *e)
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, s_rfbo);
-    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->obj, 0);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glViewport(0, 0, ww, wh);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -2221,6 +2239,65 @@ static void one_window_present(const GlSurface *e)
     s_vp_w = s_vp_h = 0;            /* bind_targets sets the viewport again */
 }
 
+static void one_window_present(const GlSurface *e)
+{
+    one_window_blit(e->obj, (GLint)(e->w * (uint32_t)gpu_scale()),
+                    (GLint)(e->h * (uint32_t)gpu_scale()));
+}
+
+/* One-window mode: a frame composed on the CPU (BGRA, the video overlay over
+ * the last flip) uploaded to a texture of its own and drawn like a flip.
+ * Plain RGBA upload with the bytes swapped here: ES has no BGRA upload
+ * without an extension, and a blit ignores texture swizzles. */
+static void one_window_present_px(const uint8_t *px, uint32_t w, uint32_t h)
+{
+    static GLuint tex;
+    static uint32_t tw, th;
+    static uint8_t *rgba;
+    static size_t cap;
+    size_t i, n = (size_t)w * h * 4;
+    GLint prev_tex = 0, prev_align = 4, prev_unpack = 0;
+
+    if (!w || !h)
+        return;
+    if (cap < n) {
+        uint8_t *b = (uint8_t *)realloc(rgba, n);
+        if (!b)
+            return;
+        rgba = b;
+        cap = n;
+    }
+    for (i = 0; i < n; i += 4) {
+        rgba[i] = px[i + 2];
+        rgba[i + 1] = px[i + 1];
+        rgba[i + 2] = px[i];
+        rgba[i + 3] = 0xFF;
+    }
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_align);
+    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prev_unpack);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    if (!tex)
+        glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    if (tw != w || th != h) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        tw = w;
+        th = h;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h,
+                        GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    }
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, prev_align);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)prev_unpack);
+    one_window_blit(tex, (GLint)w, (GLint)h);
+}
+
 static void flip_impl(uint32_t color_va)
 {
     GlSurface *e;
@@ -2240,13 +2317,19 @@ static void flip_impl(uint32_t color_va)
     }
     if (s_one_window) {
         static int shots = -1;
-        one_window_present(e);
-        if (shots < 0) {
-            const char *v = getenv("RECOMP_GL_SHOT");
-            shots = v && atoi(v) > 0;
+        GlOverlay o;
+        /* With the video overlay on, the frame goes the two-window way:
+         * read back, composed with the overlay, then uploaded and drawn
+         * (present -> show_px). */
+        if (!overlay_read(&o)) {
+            one_window_present(e);
+            if (shots < 0) {
+                const char *v = getenv("RECOMP_GL_SHOT");
+                shots = v && atoi(v) > 0;
+            }
+            if (!shots)
+                return;        /* else read back too, for RECOMP_GL_SHOT */
         }
-        if (!shots)
-            return;            /* else read back too, for RECOMP_GL_SHOT */
     }
 
     /* Start this frame's read. */
