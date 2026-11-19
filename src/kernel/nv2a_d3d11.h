@@ -93,4 +93,10 @@ int  nv2a_d3d11_frames_in_flight(void);
 
 void nv2a_d3d11_report(void);
 
+/* How long, in ms per presented frame, draws may wait for a shader that is
+ * still compiling before they are skipped (RECOMP_GPU_SHADER_WAIT_MS sets the
+ * start value, 250). 0 skips at once, as before. Any thread. No effect
+ * without Direct3D 11. */
+void nv2a_d3d11_set_shader_wait_ms(int ms);
+
 #endif

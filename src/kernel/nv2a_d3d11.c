@@ -351,7 +351,12 @@ static uint64_t vp_hash(const Nv2aVpState *vp)
  * level, so compiling on the render thread was a visible hitch each time.
  * The device is free-threaded for creation. The slot the result lands in is
  * never moved or reused (the caches only ever add), so the worker publishes
- * into it with one interlocked store; SHADER_PENDING marks it in flight. */
+ * into it with one interlocked store; SHADER_PENDING marks it in flight.
+ *
+ * Several workers (RECOMP_GPU_SHADER_THREADS, default up to 4, one CPU left
+ * free): new programs come in bursts -- the menu rider meets about eight at
+ * once -- and one worker took their sum, over a second, where a pool takes
+ * about the slowest one. D3DCompile is thread-safe. */
 #define SHADER_FAILED  ((void *)(uintptr_t)1)
 #define SHADER_PENDING ((void *)(uintptr_t)2)
 
@@ -364,7 +369,7 @@ typedef struct ShaderJob {
 } ShaderJob;
 
 static CRITICAL_SECTION s_job_lock;
-static HANDLE s_job_event;
+static HANDLE s_job_sem;      /* one count per queued job */
 static ShaderJob *s_job_head, *s_job_tail;
 static int s_async = -1;
 
@@ -374,8 +379,8 @@ static DWORD WINAPI shader_worker(LPVOID unused)
     for (;;) {
         ShaderJob *j;
 
-        WaitForSingleObject(s_job_event, INFINITE);
-        for (;;) {
+        WaitForSingleObject(s_job_sem, INFINITE);
+        {
             ID3DBlob *code;
             void *obj = NULL;
 
@@ -385,7 +390,7 @@ static DWORD WINAPI shader_worker(LPVOID unused)
                 s_job_tail = NULL;
             LeaveCriticalSection(&s_job_lock);
             if (!j)
-                break;
+                continue;
             code = compile(j->src, j->len, j->pixel ? "ps_5_0" : "vs_5_0",
                            j->pixel ? 0 : D3DCOMPILE_IEEE_STRICTNESS);
             if (code) {
@@ -397,9 +402,9 @@ static DWORD WINAPI shader_worker(LPVOID unused)
                 if (FAILED(hr))
                     obj = NULL;
                 else if (j->pixel)
-                    s_st.ps_compiled++;
+                    InterlockedIncrement((volatile LONG *)&s_st.ps_compiled);
                 else
-                    s_st.vs_compiled++;
+                    InterlockedIncrement((volatile LONG *)&s_st.vs_compiled);
                 ID3D10Blob_Release(code);
             }
             InterlockedExchangePointer(j->slot, obj ? obj : SHADER_FAILED);
@@ -419,16 +424,30 @@ static int shader_queue(void **slot, int pixel, const char *src, size_t len)
         const char *e = getenv("RECOMP_GPU_ASYNC_SHADERS");
         s_async = !(e && *e == '0');
         if (s_async) {
-            HANDLE th;
+            SYSTEM_INFO si;
+            int n, i, started = 0;
+            const char *t = getenv("RECOMP_GPU_SHADER_THREADS");
+
+            GetSystemInfo(&si);
+            n = (int)si.dwNumberOfProcessors - 1;
+            if (n > 4)
+                n = 4;
+            if (t && *t)
+                n = atoi(t);
+            if (n < 1)
+                n = 1;
             InitializeCriticalSection(&s_job_lock);
-            s_job_event = CreateEventA(NULL, FALSE, FALSE, NULL);
-            th = s_job_event ? CreateThread(NULL, 0, shader_worker, NULL, 0, NULL) : NULL;
-            if (th) {
-                SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL);
-                CloseHandle(th);
-            } else {
-                s_async = 0;
+            s_job_sem = CreateSemaphoreA(NULL, 0, 0x7FFFFFFF, NULL);
+            for (i = 0; s_job_sem && i < n; i++) {
+                HANDLE th = CreateThread(NULL, 0, shader_worker, NULL, 0, NULL);
+                if (th) {
+                    SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL);
+                    CloseHandle(th);
+                    started++;
+                }
             }
+            if (!started)
+                s_async = 0;
         }
     }
     if (!s_async || !slot || !(j = (ShaderJob *)malloc(sizeof *j + len)))
@@ -446,7 +465,68 @@ static int shader_queue(void **slot, int pixel, const char *src, size_t len)
         s_job_head = j;
     s_job_tail = j;
     LeaveCriticalSection(&s_job_lock);
-    SetEvent(s_job_event);
+    ReleaseSemaphore(s_job_sem, 1, NULL);
+    return 1;
+}
+
+/* Waiting for a shader in flight (RECOMP_GPU_SHADER_WAIT_MS, default 250).
+ *
+ * A draw skipped for a shader that is still compiling leaves a hole for as
+ * long as the compile takes. On a cold cache Amped 2's main menu showed its
+ * rider untextured, then without a head, then bald, for over a second. So a
+ * draw first waits for its shader, as long as the frame's budget lasts, and
+ * is skipped only after that. The budget is per presented frame (reset in
+ * do_flip), so a frame that meets many new programs stalls at most that
+ * long, and only once: later runs read them from the disk cache. Draws run
+ * on the render thread, so the wait delays the frame on screen, not the
+ * title's thread. nv2a_d3d11_set_shader_wait_ms() lets the host change the
+ * budget at run time, e.g. 0 during gameplay, where a hole for a frame or
+ * two is better than a hitch. */
+static volatile LONG s_wait_budget_ms = -1;     /* -1: not read yet */
+static LONGLONG s_wait_used;                    /* QPC ticks this frame */
+static uint32_t s_wait_waited, s_wait_gaveup;
+
+void nv2a_d3d11_set_shader_wait_ms(int ms)
+{
+    InterlockedExchange(&s_wait_budget_ms, ms < 0 ? 0 : ms);
+}
+
+/* 1 when *slot holds a finished result (a shader or SHADER_FAILED). */
+static int shader_wait(void **slot)
+{
+    void *volatile *s = (void *volatile *)slot;
+    LARGE_INTEGER f, a, b;
+    LONG budget = s_wait_budget_ms;
+    LONGLONG limit;
+
+    if (*s != SHADER_PENDING)
+        return 1;
+    if (budget < 0) {
+        const char *e = getenv("RECOMP_GPU_SHADER_WAIT_MS");
+        budget = e && *e ? atoi(e) : 250;
+        if (budget < 0)
+            budget = 0;
+        InterlockedCompareExchange(&s_wait_budget_ms, budget, -1);
+        budget = s_wait_budget_ms;
+    }
+    QueryPerformanceFrequency(&f);
+    limit = f.QuadPart * budget / 1000;
+    if (s_wait_used >= limit) {
+        s_wait_gaveup++;
+        return 0;
+    }
+    s_wait_waited++;
+    QueryPerformanceCounter(&a);
+    b = a;
+    while (*s == SHADER_PENDING && s_wait_used + (b.QuadPart - a.QuadPart) < limit) {
+        Sleep(1);
+        QueryPerformanceCounter(&b);
+    }
+    s_wait_used += b.QuadPart - a.QuadPart;
+    if (*s == SHADER_PENDING) {
+        s_wait_gaveup++;
+        return 0;
+    }
     return 1;
 }
 
@@ -469,14 +549,20 @@ static ID3D11VertexShader *vs_for(const Nv2aVpState *vp)
     slot = cache_find(s_vs_cache, VS_CACHE, key, &found);
     if (slot && found) {
         vs = (ID3D11VertexShader *)*slot;
+        if ((void *)vs == SHADER_PENDING && shader_wait(slot))
+            vs = (ID3D11VertexShader *)*slot;
     } else {
         len = nv2a_hlsl_vs(vp, s_src, sizeof s_src, &writes_consts);
         if (writes_consts)
             s_st.vs_const_writes++;
         code = len ? compile_cached_only(s_src, len, "vs_5_0", D3DCOMPILE_IEEE_STRICTNESS) : NULL;
         if (!code && len && shader_queue(slot, 0, s_src, len)) {
-            last_vp = NULL;                 /* ask again next draw */
-            return NULL;
+            if (!shader_wait(slot)) {
+                last_vp = NULL;             /* ask again next draw */
+                return NULL;
+            }
+            vs = (ID3D11VertexShader *)*slot;
+            goto have_vs;
         }
         if (!code && len)
             code = compile(s_src, len, "vs_5_0", D3DCOMPILE_IEEE_STRICTNESS);
@@ -503,6 +589,7 @@ static ID3D11VertexShader *vs_for(const Nv2aVpState *vp)
         if (!vs && slot)
             *slot = (void *)(uintptr_t)1;
     }
+have_vs:
     if ((void *)vs == SHADER_PENDING) {
         last_vp = NULL;
         return NULL;
@@ -534,12 +621,18 @@ static ID3D11PixelShader *ps_for(const Nv2aCombiner *c)
     slot = cache_find(s_ps_cache, PS_CACHE, h, &found);
     if (slot && found) {
         ps = (ID3D11PixelShader *)*slot;
+        if ((void *)ps == SHADER_PENDING && shader_wait(slot))
+            ps = (ID3D11PixelShader *)*slot;
     } else {
         size_t len = nv2a_hlsl_ps(&key, s_src, sizeof s_src);
         ID3DBlob *code = len ? compile_cached_only(s_src, len, "ps_5_0", 0) : NULL;
         if (!code && len && shader_queue(slot, 1, s_src, len)) {
-            last_c = NULL;
-            return NULL;
+            if (!shader_wait(slot)) {
+                last_c = NULL;
+                return NULL;
+            }
+            ps = (ID3D11PixelShader *)*slot;
+            goto have_ps;
         }
         if (!code && len)
             code = compile(s_src, len, "ps_5_0", 0);
@@ -565,6 +658,7 @@ static ID3D11PixelShader *ps_for(const Nv2aCombiner *c)
         if (!ps && slot)
             *slot = (void *)(uintptr_t)1;
     }
+have_ps:
     if ((void *)ps == SHADER_PENDING) {
         last_c = NULL;
         return NULL;
@@ -3890,6 +3984,7 @@ static void do_flip(uint32_t color_va)
     uint32_t i = s_stage_next % STAGES;
 
     s_frame++;
+    s_wait_used = 0;                    /* a new frame's shader wait budget */
     {   /* RECOMP_PVIDEO_TRACE: the overlay registers when they change. */
         static int trace = -1;
         static uint32_t last[12];
@@ -4689,6 +4784,10 @@ void nv2a_d3d11_report(void)
             s_st.vs_compiled, s_st.ps_compiled, s_st.compile_failed,
             s_st.tex_uploads, s_st.tex_bad, s_st.rt_created, s_st.ds_created,
             s_st.readbacks, s_st.cpu_frames, s_st.vs_const_writes, s_st.fallback_attrs);
+    if (s_wait_waited || s_wait_gaveup)
+        fprintf(stderr, "  [D3D11] draws that waited for a shader in flight: %u,"
+                " %u skipped with the frame's wait budget (%ld ms) used up\n",
+                s_wait_waited, s_wait_gaveup, (long)s_wait_budget_ms);
     if (s_pack_on > 0)
         fprintf(stderr, "  [D3D11] texture pack: %u replaced, %u not in the pack,"
                 " %u freed (first block overwritten) kept theirs\n",
@@ -4717,6 +4816,7 @@ void nv2a_d3d11_flip(uint32_t va) { nv2a_gl_flip(va); }
 int  nv2a_d3d11_frames_in_flight(void) { return nv2a_gl_frames_in_flight(); }
 void nv2a_d3d11_report(void) { nv2a_gl_report(); }
 void nv2a_d3d11_zpass(int enable) { nv2a_gl_zpass(enable); }
+void nv2a_d3d11_set_shader_wait_ms(int ms) { (void)ms; }
 void nv2a_d3d11_get_report(uint32_t va, uint32_t va_alt) { nv2a_gl_get_report(va, va_alt); }
 
 /* FSR 1 and sharpening are D3D11-only so far. */
