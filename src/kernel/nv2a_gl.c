@@ -1560,7 +1560,14 @@ static int draw_init(void)
     glGenVertexArrays(1, &s_vao);
     glBindVertexArray(s_vao);           /* first: the index ring binds into it */
     glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &s_ubo_align);
-    s_persistent = epoxy_gl_version() >= 44 || epoxy_has_gl_extension("GL_ARB_buffer_storage");
+    /* Persistent streaming rings. On ES that is GL_EXT_buffer_storage: without
+     * it every upload maps and unmaps a range, three rings a draw, and on a
+     * phone (Adreno 830) ML1 ran at 1-2 fps. */
+    s_persistent = s_es ? epoxy_has_gl_extension("GL_EXT_buffer_storage")
+                        : epoxy_gl_version() >= 44 || epoxy_has_gl_extension("GL_ARB_buffer_storage");
+    if (s_es)
+        fprintf(stderr, "  [GL] streaming rings: %s\n",
+                s_persistent ? "persistent (GL_EXT_buffer_storage)" : "mapped per upload");
     if (s_ubo_align < 16)
         s_ubo_align = 16;
     ring_init(&s_vring, GL_ARRAY_BUFFER, 32u << 20);

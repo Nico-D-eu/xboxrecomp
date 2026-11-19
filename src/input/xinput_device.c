@@ -14,6 +14,7 @@
 #include "keyboard.h"
 #include "input_map.h"
 #include "mkb_input.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -501,6 +502,39 @@ static void open_controllers(void)
             g_controller_connected[slot] = (g_pads[slot] != NULL);
         }
         slot++;
+    }
+}
+
+/* After SDL reports a pad added or removed (keyboard_sdl.c, on the thread
+ * that pumps SDL events): close the ones gone, open the new ones. */
+void xbox_InputRescanControllers(void)
+{
+    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (g_pads[i] && !SDL_GameControllerGetAttached(g_pads[i])) {
+            SDL_GameControllerClose(g_pads[i]);
+            g_pads[i] = NULL;
+            g_controller_connected[i] = FALSE;
+        }
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
+        int open = 0, slot;
+        if (!SDL_IsGameController(i))
+            continue;
+        for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
+            if (g_pads[slot] && SDL_JoystickInstanceID(
+                    SDL_GameControllerGetJoystick(g_pads[slot])) == id)
+                open = 1;
+        if (open)
+            continue;
+        for (slot = 0; slot < XBOX_MAX_CONTROLLERS && g_pads[slot]; slot++)
+            ;
+        if (slot == XBOX_MAX_CONTROLLERS)
+            break;
+        g_pads[slot] = SDL_GameControllerOpen(i);
+        g_controller_connected[slot] = (g_pads[slot] != NULL);
+        if (g_pads[slot])
+            fprintf(stderr, "  [INPUT] pad %d: %s\n", slot,
+                    SDL_GameControllerName(g_pads[slot]));
     }
 }
 

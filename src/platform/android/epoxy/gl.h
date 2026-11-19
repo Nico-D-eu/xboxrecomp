@@ -14,6 +14,7 @@
 
 #include <GLES3/gl32.h>
 #include <GLES2/gl2ext.h>
+#include <EGL/egl.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,12 +91,22 @@ static inline void glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64 *v)
     glGetQueryObjectuiv(id, pname, &r);
     *v = r;
 }
-/* Only used when the context reports GL 4.4 or ARB_buffer_storage, which
- * an ES context never does. */
+/* GL_EXT_buffer_storage, ES's form of persistent mapping (Adreno, Mali and
+ * PowerVR have it): fetched through EGL, since extension entry points are
+ * not guaranteed to be exported. Only used when the extension is there. */
+typedef void (*recomp_pfn_buffer_storage)(GLenum, GLsizeiptr, const void *, GLbitfield);
 static inline void glBufferStorage(GLenum t, GLsizeiptr n, const void *d, GLbitfield f)
 {
-    (void)f;
-    glBufferData(t, n, d, GL_DYNAMIC_DRAW);
+    static recomp_pfn_buffer_storage fn;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        fn = (recomp_pfn_buffer_storage)eglGetProcAddress("glBufferStorageEXT");
+    }
+    if (fn)
+        fn(t, n, d, f);
+    else
+        glBufferData(t, n, d, GL_DYNAMIC_DRAW);
 }
 
 /* libepoxy's two queries: the version as 10 * major + minor ("OpenGL ES
