@@ -807,6 +807,61 @@ static void irq_regs_restore(const IrqRegs *r)
     g_mm4 = r->mm[4]; g_mm5 = r->mm[5]; g_mm6 = r->mm[6]; g_mm7 = r->mm[7];
 }
 
+/* The APU interrupt taken by a thread that polls the clock at DISPATCH_LEVEL,
+ * without the one-CPU gate (which has its own safe points, above).
+ *
+ * The timer thread holds device interrupts off while any thread is raised
+ * (xbox_IrqlBlocksInterrupts). On the console the APU's ISR still preempts
+ * DISPATCH_LEVEL code, and DirectSound relies on that: called by XACT inside
+ * XACT's raise (Amped 2: XACT's DPC 0x00318663, or a title thread), it spins
+ * at DISPATCH for a voice to stop, and the flag it waits on is cleared by the
+ * APU's ISR. Held off, every such wait ran into DirectSound's timeout, and
+ * the raise held the dispatch lock all along: picture and sound stopped for
+ * half a second or more.
+ *
+ * A thread polling the clock is busy-waiting, so it has no half-edited state
+ * the ISR could see; the clock bridges call this. The routine runs on this
+ * thread below its esp, where an interrupt frame goes, and its registers
+ * come back afterwards (the bridge is in the middle of a kernel call). The
+ * DPC it queues runs when the timer thread next drains, as before.
+ * RECOMP_APU_ISR_ON_POLL=0 turns it off. */
+extern int xbox_KernelApuIsrHere(void);     /* kernel_bridge.c */
+extern volatile long g_xbox_apu_irq_line;   /* kernel_bridge.c */
+extern void (*volatile g_xbox_apu_irq_poll)(void);
+
+void xbox_IrqlPollPoint(void)
+{
+    static int on = -1;
+    IrqRegs saved;
+    int ran;
+
+    if (g_current_irql != DISPATCH_LEVEL || t_in_isr)
+        return;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_APU_ISR_ON_POLL");
+        on = !(v && v[0] == '0');
+    }
+    if (!on || xbox_DispatchGateOn())
+        return;
+    if (g_xbox_apu_irq_poll)
+        g_xbox_apu_irq_poll();
+    if (!g_xbox_apu_irq_line)
+        return;
+    irq_regs_save(&saved);
+    t_in_isr = 1;
+    ran = xbox_KernelApuIsrHere();
+    t_in_isr = 0;
+    irq_regs_restore(&saved);
+    if (ran) {
+        static volatile LONG n;
+        LONG k = InterlockedIncrement(&n);
+        if (k <= 3 || (k & (k - 1)) == 0) {
+            fprintf(stderr, "  [APU] interrupt taken on a raised thread (%ld)\n", (long)k);
+            fflush(stderr);
+        }
+    }
+}
+
 /* Queued DPCs, run on the guest thread that owns "the processor at
  * DISPATCH". On the console a DPC queued by an ISR runs when the processor
  * drops below DISPATCH, before the interrupted thread resumes. DirectSound
