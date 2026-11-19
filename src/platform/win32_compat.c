@@ -1870,6 +1870,44 @@ LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, 
     return MapViewOfFileEx(mapping, access, offHigh, offLow, count, NULL);
 }
 
+/* Map a view of `mapping` at addr over address space this process already
+ * holds (xbox_memory_layout's span, a PROT_NONE reservation), in one mmap.
+ * MAP_FIXED swaps the pages atomically. The old way, munmap the slice and then
+ * map with MAP_FIXED_NOREPLACE, left a gap that another thread's mmap could
+ * take: on Android (ART and SDL threads are up before the game starts) one
+ * of the 28 RAM mirror views failed in about one boot of three, at a
+ * different mirror each time. Only for ranges the caller owns: MAP_FIXED
+ * discards whatever is there. A registry entry starting at addr (the span
+ * itself, when the view takes its first slice) is dropped, as the
+ * VirtualFree this replaces did. */
+LPVOID xbox_PosixMapViewOver(HANDLE mapping, SIZE_T size, LPVOID addr)
+{
+    w32_object *o = (w32_object *)mapping;
+    if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
+    void *p = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, o->fd, 0);
+    if (p == MAP_FAILED || p != addr) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    view_take(addr);
+    view_register(p, size);
+    return p;
+}
+
+/* Same for zeroed read-write memory (layout_commit_at). */
+LPVOID xbox_PosixCommitOver(LPVOID addr, SIZE_T size)
+{
+    void *p = mmap(addr, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (p == MAP_FAILED || p != addr) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    view_take(addr);
+    view_register(p, size);
+    return p;
+}
+
 BOOL UnmapViewOfFile(LPCVOID baseAddr)
 {
     size_t len = view_take(baseAddr);
