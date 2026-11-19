@@ -144,26 +144,109 @@ static int gpu_scale(void)
 
 static int draw_init(void);
 
+/* OpenGL ES 3.2 instead of desktop GL 3.3 core (RECOMP_GL_ES=1; the
+ * default on Android). The same back end, with these differences:
+ * - shaders get a GLSL ES 3.20 header with precision statements;
+ * - 32-bit colour goes up and comes back as RGBA bytes (ES has no BGRA
+ *   8_8_8_8_REV): uploads are swizzled red/blue by the texture, and the
+ *   frame read back for presenting is swapped on the CPU;
+ * - occlusion queries can only say "any sample passed", so a visibility
+ *   test reports 0 or VIS_ES_ANY;
+ * - no depth clamp (an extension on ES);
+ * - glDrawBuffers and glClearDepthf in place of their desktop forms. */
+static int s_es;
+#define VIS_ES_ANY 0x10000u
+#define GL_RGBA8_FMT  (s_es ? GL_RGBA : GL_BGRA)
+#define GL_RGBA8_TYPE (s_es ? GL_UNSIGNED_BYTE : GL_UNSIGNED_INT_8_8_8_8_REV)
+
+/* Under ES, a texture filled with BGRA data uploaded as RGBA reads its red
+ * and blue swapped back by the sampler. */
+static void es_bgra_swizzle(GLenum target)
+{
+    if (s_es) {
+        glTexParameteri(target, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+        glTexParameteri(target, GL_TEXTURE_SWIZZLE_B, GL_RED);
+    }
+}
+
+/* One window (RECOMP_GL_ONE_WINDOW=1; the default on Android, which has
+ * only one): the back end makes its context on the presenter's window
+ * (fb_present_sdl.c, g_xbox_host_window) instead of a hidden window of its
+ * own, and presents each flip itself -- the frame blitted to the window's
+ * framebuffer and swapped -- instead of reading it back for the
+ * presenter's SDL renderer. While the video overlay (movies) is on, flips
+ * are read back and composed on the CPU as in the two-window mode, and the
+ * result is uploaded and drawn to the window (one_window_present_px).
+ * RECOMP_GL_SHOT still reads frames back, for tests. */
+extern SDL_Window *g_xbox_host_window;
+static int s_one_window, s_own_win;
+
+int xbox_GlOneWindow(void)
+{
+    const char *g = getenv("RECOMP_GPU"), *e = getenv("RECOMP_GL_ONE_WINDOW");
+    if (!g || strcmp(g, "gl") != 0)
+        return 0;
+#if defined(__ANDROID__)
+    return !(e && *e == '0');
+#else
+    return e && *e && *e != '0';
+#endif
+}
+
+/* The context the back end asks for, set before a window is made: on EGL
+ * (Android) the window's surface is chosen for it. */
+void xbox_GlWindowAttributes(void)
+{
+    const char *es = getenv("RECOMP_GL_ES");
+#if defined(__ANDROID__)
+    s_es = !(es && *es == '0');
+#else
+    s_es = es && *es && *es != '0';
+#endif
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, s_es ? 2 : 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                        s_es ? SDL_GL_CONTEXT_PROFILE_ES : SDL_GL_CONTEXT_PROFILE_CORE);
+#if defined(__APPLE__)
+    /* macOS hands out a core context (3.2 up to 4.1) only when it is also
+     * forward-compatible; without the flag it falls back to legacy 2.1 and
+     * the 3.3 request fails. Everything here is core-only already, and the
+     * one call above 4.1 (glBufferStorage) is behind s_persistent. */
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+#endif
+}
+
 static int init(void)
 {
+
     if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "  [GL] no SDL video (%s); software rasteriser\n", SDL_GetError());
         return 0;
     }
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    /* Hidden: it only owns the context. Everything is drawn into
-     * framebuffer objects and reaches the screen through the window. */
-    s_win = SDL_CreateWindow("nv2a_gl", 0, 0, 16, 16, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    xbox_GlWindowAttributes();
+    s_one_window = xbox_GlOneWindow() && g_xbox_host_window;
+    if (s_one_window) {
+        s_win = g_xbox_host_window;
+        s_own_win = 0;
+    } else {
+        /* Hidden: it only owns the context. Everything is drawn into
+         * framebuffer objects and reaches the screen through the window. */
+        s_win = SDL_CreateWindow("nv2a_gl", 0, 0, 16, 16, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+        s_own_win = 1;
+    }
     s_ctx = s_win ? SDL_GL_CreateContext(s_win) : NULL;
     if (!s_ctx || SDL_GL_MakeCurrent(s_win, s_ctx) != 0) {
-        fprintf(stderr, "  [GL] no OpenGL 3.3 core context (%s); software rasteriser\n",
-                SDL_GetError());
-        if (s_win)
+        fprintf(stderr, "  [GL] no OpenGL %s context (%s); software rasteriser\n",
+                s_es ? "ES 3.2" : "3.3 core", SDL_GetError());
+        if (s_win && s_own_win)
             SDL_DestroyWindow(s_win);
         s_win = NULL;
+        s_one_window = 0;
         return 0;
+    }
+    if (s_one_window) {
+        SDL_GL_SetSwapInterval(1);
+        fprintf(stderr, "  [GL] presenting on the window itself (one-window mode)\n");
     }
     glGenFramebuffers(1, &s_fbo);
     s_thread = pthread_self();
@@ -217,7 +300,7 @@ static GlSurface *surface(GlSurface *tab, uint32_t va, uint32_t w, uint32_t h, i
         glGenTextures(1, &e->obj);
         glBindTexture(GL_TEXTURE_2D, e->obj);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)(w * gpu_scale()),
-                     (GLsizei)(h * gpu_scale()), 0, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
+                     (GLsizei)(h * gpu_scale()), 0, GL_RGBA8_FMT, GL_RGBA8_TYPE, NULL);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         /* One level: complete under any sampler, mipmapped ones too. */
@@ -282,7 +365,10 @@ static int bind_targets(const Nv2aHwDraw *d, int want_color, int want_depth,
                                rt ? rt->obj : 0, 0);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D,
                                ds ? ds->obj : 0, 0);
-        glDrawBuffer(rt ? GL_COLOR_ATTACHMENT0 : GL_NONE);
+        {
+            GLenum db = rt ? GL_COLOR_ATTACHMENT0 : GL_NONE;
+            glDrawBuffers(1, &db);         /* ES has no glDrawBuffer */
+        }
         s_att_color = rt ? rt->obj : 0;
         s_att_depth = ds ? ds->obj : 0;
         s_att_complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
@@ -320,8 +406,12 @@ static void do_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color, uint32
     }
     if ((flags & 0x01u) && d->zeta_va) {
         glDepthMask(GL_TRUE);
-        glClearDepth(((d->format >> 4) & 0xFu) == 1u ? (double)(zclear & 0xFFFFu) / 65535.0
-                                                     : (double)(zclear >> 8) / 16777215.0);
+        double zc = ((d->format >> 4) & 0xFu) == 1u ? (double)(zclear & 0xFFFFu) / 65535.0
+                                                    : (double)(zclear >> 8) / 16777215.0;
+        if (s_es)
+            glClearDepthf((float)zc);       /* ES has only the float form */
+        else
+            glClearDepth(zc);
         bits |= GL_DEPTH_BUFFER_BIT;
     }
     if ((flags & 0x02u) && d->zeta_va) {
@@ -348,8 +438,7 @@ static void do_clear(const Nv2aHwDraw *d, uint32_t flags, uint32_t color, uint32
  * decoder. NV2A's state values are GL's own enums (compare functions,
  * stencil ops, blend factors and equations), so they go to GL unchanged.
  *
- * Not yet: volume textures, CPU-written pixels under a surface,
- * anisotropy, render scale. */
+ * Not yet: volume textures, CPU-written pixels under a surface. */
 
 static const uint8_t *guest(void)
 {
@@ -577,10 +666,28 @@ static uint64_t  s_skipped, s_compile_fail, s_tex_uploads;
 
 static GLuint compile(GLenum type, const char *src, size_t len)
 {
+    static const char k_desktop[] = "#version 330 core\n";
+    /* GLSL ES 3.20 for the same source: highp everywhere (the vertex
+     * decoding and the combiners need full precision), and samplers given
+     * a precision, which ES requires for sampler3D. */
+    static const char k_es[] =
+        "#version 320 es\n"
+        "precision highp float;\n"
+        "precision highp int;\n"
+        "precision highp sampler2D;\n"
+        "precision highp samplerCube;\n"
+        "precision highp sampler3D;\n";
     GLuint sh = glCreateShader(type);
     GLint ok = 0, n = (GLint)len;
 
-    glShaderSource(sh, 1, &src, &n);
+    if (s_es && len >= sizeof k_desktop - 1
+            && memcmp(src, k_desktop, sizeof k_desktop - 1) == 0) {
+        const char *parts[2] = { k_es, src + sizeof k_desktop - 1 };
+        GLint lens[2] = { (GLint)(sizeof k_es - 1), (GLint)(len - (sizeof k_desktop - 1)) };
+        glShaderSource(sh, 2, parts, lens);
+    } else {
+        glShaderSource(sh, 1, &src, &n);
+    }
     glCompileShader(sh);
     glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
     if (!ok) {
@@ -1117,10 +1224,15 @@ static GLuint pack_texture(PackEntry *pe)
     glGenTextures(1, &pe->obj);
     glBindTexture(GL_TEXTURE_2D, pe->obj);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, (GLint)im->levels - 1);
+    if (im->fmt == GL_BGRA)
+        es_bgra_swizzle(GL_TEXTURE_2D);
     for (i = 0; i < im->levels; i++) {
         GLsizei lw = (GLsizei)(im->w >> i ? im->w >> i : 1);
         GLsizei lh = (GLsizei)(im->h >> i ? im->h >> i : 1);
-        if (im->fmt)
+        if (im->fmt == GL_BGRA)
+            glTexImage2D(GL_TEXTURE_2D, (GLint)i, (GLint)im->ifmt, lw, lh, 0,
+                         GL_RGBA8_FMT, GL_RGBA8_TYPE, im->buf + im->off[i]);
+        else if (im->fmt)
             glTexImage2D(GL_TEXTURE_2D, (GLint)i, (GLint)im->ifmt, lw, lh, 0,
                          im->fmt, im->type, im->buf + im->off[i]);
         else
@@ -1151,6 +1263,7 @@ static int tex_upload(GlTexture *e, const Nv2aHwTexture *t)
     face_stride = (face_stride + 127u) & ~127u;
     glBindTexture(target, e->obj);
     glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, (GLint)e->levels - 1);
+    es_bgra_swizzle(target);                    /* the decoder writes BGRA bytes */
     for (face = 0; face < faces; face++) {
         GLenum ft = e->cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + face : GL_TEXTURE_2D;
         off = face * face_stride;
@@ -1166,7 +1279,7 @@ static int tex_upload(GlTexture *e, const Nv2aHwTexture *t)
             if (!nv2a_pb_decode_level(t->color, src + off, w, h, linear ? t->pitch : 0, scratch))
                 return 0;
             glTexImage2D(ft, (GLint)lv, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
-                         GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, scratch);
+                         GL_RGBA8_FMT, GL_RGBA8_TYPE, scratch);
             off += level_bytes(t->color, w, h, t->pitch, linear);
             if (w > 1) w >>= 1;
             if (h > 1) h >>= 1;
@@ -1318,6 +1431,29 @@ static GLuint sampler_for(const Nv2aHwTexture *t, uint32_t levels)
             glSamplerParameteri(s, GL_TEXTURE_WRAP_S, wrap_mode(t->address & 0xFu));
             glSamplerParameteri(s, GL_TEXTURE_WRAP_T, wrap_mode((t->address >> 8) & 0xFu));
             glSamplerParameteri(s, GL_TEXTURE_WRAP_R, wrap_mode((t->address >> 16) & 0xFu));
+            /* RECOMP_GPU_ANISO=<2-16>, as nv2a_d3d11.c: anisotropic filtering
+             * for textures the title already filters linearly across mip
+             * levels (ground seen at a grazing angle), never for point-sampled
+             * or unmipped ones (UI, fonts, lookup tables). Core in GL 4.6,
+             * an extension nearly everywhere else (macOS included). */
+            {
+                static float aniso = -1.0f;
+                if (aniso < 0.0f) {
+                    const char *e = getenv("RECOMP_GPU_ANISO");
+                    aniso = e ? (float)atoi(e) : 0.0f;
+                    if (aniso > 1.0f && (epoxy_gl_version() >= 46
+                            || epoxy_has_gl_extension("GL_ARB_texture_filter_anisotropic")
+                            || epoxy_has_gl_extension("GL_EXT_texture_filter_anisotropic"))) {
+                        GLfloat most = 1.0f;
+                        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &most);
+                        if (aniso > most) aniso = most;
+                    } else {
+                        aniso = 0.0f;
+                    }
+                }
+                if (aniso > 1.0f && mips && lmin)
+                    glSamplerParameterf(s, GL_TEXTURE_MAX_ANISOTROPY_EXT, aniso);
+            }
             unpack_argb(t->border, border);
             glSamplerParameterfv(s, GL_TEXTURE_BORDER_COLOR, border);
             s_samplers[k].key = key;
@@ -1426,14 +1562,22 @@ static int draw_init(void)
     glGenVertexArrays(1, &s_vao);
     glBindVertexArray(s_vao);           /* first: the index ring binds into it */
     glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &s_ubo_align);
-    s_persistent = epoxy_gl_version() >= 44 || epoxy_has_gl_extension("GL_ARB_buffer_storage");
+    /* Persistent streaming rings. On ES that is GL_EXT_buffer_storage: without
+     * it every upload maps and unmaps a range, three rings a draw, and on a
+     * phone (Adreno 830) ML1 ran at 1-2 fps. */
+    s_persistent = s_es ? epoxy_has_gl_extension("GL_EXT_buffer_storage")
+                        : epoxy_gl_version() >= 44 || epoxy_has_gl_extension("GL_ARB_buffer_storage");
+    if (s_es)
+        fprintf(stderr, "  [GL] streaming rings: %s\n",
+                s_persistent ? "persistent (GL_EXT_buffer_storage)" : "mapped per upload");
     if (s_ubo_align < 16)
         s_ubo_align = 16;
     ring_init(&s_vring, GL_ARRAY_BUFFER, 32u << 20);
     ring_init(&s_iring, GL_ELEMENT_ARRAY_BUFFER, 8u << 20);
     ring_init(&s_uring, GL_UNIFORM_BUFFER, 16u << 20);
     /* No depth clip, as the D3D11 path (and the software one) draw. */
-    glEnable(GL_DEPTH_CLAMP);
+    if (!s_es || epoxy_has_gl_extension("GL_EXT_depth_clamp"))
+        glEnable(GL_DEPTH_CLAMP);
     return 1;
 }
 
@@ -1967,6 +2111,18 @@ static int keep(uint32_t **buf, size_t *cap, size_t n)
     return 1;
 }
 
+static void one_window_present_px(const uint8_t *px, uint32_t w, uint32_t h);
+
+/* A finished BGRA frame to the screen: the presenter's window, or in
+ * one-window mode the GL window itself. */
+static void show_px(const uint8_t *px, uint32_t w, uint32_t h)
+{
+    if (s_one_window)
+        one_window_present_px(px, w, h);
+    else
+        xbox_FramebufferWindowPresentArgb(px, w, h, w * 4);
+}
+
 /* Present a frame, with the overlay over it if it is on. */
 static void present(const uint8_t *px, uint32_t w, uint32_t h)
 {
@@ -1974,7 +2130,7 @@ static void present(const uint8_t *px, uint32_t w, uint32_t h)
 
     s_last_present_ns = now_ns();
     if (!overlay_read(&o)) {
-        xbox_FramebufferWindowPresentArgb(px, w, h, w * 4);
+        show_px(px, w, h);
         shot(px, w, h);
         return;
     }
@@ -1987,7 +2143,7 @@ static void present(const uint8_t *px, uint32_t w, uint32_t h)
     s_base_h = h;
     memcpy(s_out, s_base, (size_t)w * h * 4);
     overlay_compose(&o, s_out, w, h);
-    xbox_FramebufferWindowPresentArgb(s_out, w, h, w * 4);
+    show_px((const uint8_t *)s_out, w, h);
     shot((const uint8_t *)s_out, w, h);
 }
 
@@ -2013,6 +2169,135 @@ static void overlay_tick(void)
     present((const uint8_t *)s_base, s_base_w, s_base_h);
 }
 
+/* One-window mode: a finished frame (texture tex, sw x sh) onto the window,
+ * letterboxed to its shape and flipped (row 0 of a surface is the top, GL's
+ * window origin is the bottom), then swapped. Scissor and colour mask are the
+ * title's draw state, so they are put back. */
+static void one_window_blit(GLuint tex, GLint sw, GLint sh)
+{
+    int ww = 0, wh = 0;
+    GLint dw, dh, dx, dy;
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST), cm[4];
+
+    if (!s_rfbo) {
+        glGenFramebuffers(1, &s_rfbo);
+        glGenBuffers(2, s_pbo);
+    }
+
+    SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    if (ww <= 0 || wh <= 0 || sw <= 0 || sh <= 0)
+        return;
+    if ((int64_t)ww * sh > (int64_t)wh * sw) {     /* window wider: pillarbox */
+        dh = wh;
+        dw = (GLint)((int64_t)wh * sw / sh);
+    } else {
+        dw = ww;
+        dh = (GLint)((int64_t)ww * sh / sw);
+    }
+    dx = (ww - dw) / 2;
+    dy = (wh - dh) / 2;
+    glGetBooleanv(GL_COLOR_WRITEMASK, cm);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, s_rfbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glViewport(0, 0, ww, wh);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBlitFramebuffer(0, 0, sw, sh, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    {   /* RECOMP_GL_WINSHOT=<flip>: the window's own pixels at that flip, as
+         * gl_winshot.ppm (bottom row first, as GL reads them), to check
+         * this path without a screen grab. */
+        static long at = -2;
+        static unsigned long n;
+        if (at == -2) {
+            const char *v = getenv("RECOMP_GL_WINSHOT");
+            at = v ? atol(v) : -1;
+        }
+        if (at > 0 && ++n == (unsigned long)at) {
+            uint8_t *px = (uint8_t *)malloc((size_t)ww * wh * 4);
+            FILE *f = px ? fopen("gl_winshot.ppm", "wb") : NULL;
+            if (f) {
+                int y, x;
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                glReadPixels(0, 0, ww, wh, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                fprintf(f, "P6\n%d %d\n255\n", ww, wh);
+                for (y = wh - 1; y >= 0; y--)
+                    for (x = 0; x < ww; x++)
+                        fwrite(px + ((size_t)y * ww + x) * 4, 1, 3, f);
+                fclose(f);
+            }
+            free(px);
+        }
+    }
+    SDL_GL_SwapWindow(s_win);
+    glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
+    glColorMask(cm[0], cm[1], cm[2], cm[3]);
+    if (scissor)
+        glEnable(GL_SCISSOR_TEST);
+    s_vp_w = s_vp_h = 0;            /* bind_targets sets the viewport again */
+}
+
+static void one_window_present(const GlSurface *e)
+{
+    one_window_blit(e->obj, (GLint)(e->w * (uint32_t)gpu_scale()),
+                    (GLint)(e->h * (uint32_t)gpu_scale()));
+}
+
+/* One-window mode: a frame composed on the CPU (BGRA, the video overlay over
+ * the last flip) uploaded to a texture of its own and drawn like a flip.
+ * Plain RGBA upload with the bytes swapped here: ES has no BGRA upload
+ * without an extension, and a blit ignores texture swizzles. */
+static void one_window_present_px(const uint8_t *px, uint32_t w, uint32_t h)
+{
+    static GLuint tex;
+    static uint32_t tw, th;
+    static uint8_t *rgba;
+    static size_t cap;
+    size_t i, n = (size_t)w * h * 4;
+    GLint prev_tex = 0, prev_align = 4, prev_unpack = 0;
+
+    if (!w || !h)
+        return;
+    if (cap < n) {
+        uint8_t *b = (uint8_t *)realloc(rgba, n);
+        if (!b)
+            return;
+        rgba = b;
+        cap = n;
+    }
+    for (i = 0; i < n; i += 4) {
+        rgba[i] = px[i + 2];
+        rgba[i + 1] = px[i + 1];
+        rgba[i + 2] = px[i];
+        rgba[i + 3] = 0xFF;
+    }
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &prev_align);
+    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prev_unpack);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    if (!tex)
+        glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    if (tw != w || th != h) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        tw = w;
+        th = h;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)w, (GLsizei)h,
+                        GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    }
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, prev_align);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)prev_unpack);
+    one_window_blit(tex, (GLint)w, (GLint)h);
+}
+
 static void flip_impl(uint32_t color_va)
 {
     GlSurface *e;
@@ -2030,6 +2315,22 @@ static void flip_impl(uint32_t color_va)
         glGenFramebuffers(1, &s_rfbo);
         glGenBuffers(2, s_pbo);
     }
+    if (s_one_window) {
+        static int shots = -1;
+        GlOverlay o;
+        /* With the video overlay on, the frame goes the two-window way:
+         * read back, composed with the overlay, then uploaded and drawn
+         * (present -> show_px). */
+        if (!overlay_read(&o)) {
+            one_window_present(e);
+            if (shots < 0) {
+                const char *v = getenv("RECOMP_GL_SHOT");
+                shots = v && atoi(v) > 0;
+            }
+            if (!shots)
+                return;        /* else read back too, for RECOMP_GL_SHOT */
+        }
+    }
 
     /* Start this frame's read. */
     k = s_pbo_next;
@@ -2046,7 +2347,7 @@ static void flip_impl(uint32_t color_va)
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->obj, 0);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, (GLsizei)sw, (GLsizei)sh, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
+    glReadPixels(0, 0, (GLsizei)sw, (GLsizei)sh, GL_RGBA8_FMT, GL_RGBA8_TYPE, NULL);
     if (s_pbo_fence[k])
         glDeleteSync(s_pbo_fence[k]);
     s_pbo_fence[k] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -2065,7 +2366,25 @@ static void flip_impl(uint32_t color_va)
         px = (const uint8_t *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
                                                (GLsizeiptr)s_pbo_w[j] * s_pbo_h[j] * 4,
                                                GL_MAP_READ_BIT);
-        if (px) {
+        if (px && s_es) {
+            /* ES read it back as RGBA bytes; the window takes BGRA. */
+            static uint8_t *bgra;
+            static size_t bgra_cap;
+            size_t i, n = (size_t)s_pbo_w[j] * s_pbo_h[j] * 4;
+            if (bgra_cap < n) {
+                free(bgra);
+                bgra = (uint8_t *)malloc(n);
+                bgra_cap = bgra ? n : 0;
+            }
+            if (bgra) {
+                for (i = 0; i < n; i += 4) {
+                    bgra[i] = px[i + 2]; bgra[i + 1] = px[i + 1];
+                    bgra[i + 2] = px[i]; bgra[i + 3] = px[i + 3];
+                }
+                present(bgra, s_pbo_w[j], s_pbo_h[j]);
+            }
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        } else if (px) {
             present(px, s_pbo_w[j], s_pbo_h[j]);
             glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
         }
@@ -2612,7 +2931,13 @@ static void vis_poll(void)
         glGetQueryObjectiv(v->q, GL_QUERY_RESULT_AVAILABLE, &ready);
         if (!ready)
             continue;
-        glGetQueryObjectui64v(v->q, GL_QUERY_RESULT, &n);
+        if (s_es) {                /* ES: any-samples queries, 32-bit results */
+            GLuint any = 0;
+            glGetQueryObjectuiv(v->q, GL_QUERY_RESULT, &any);
+            n = any ? VIS_ES_ANY : 0;
+        } else {
+            glGetQueryObjectui64v(v->q, GL_QUERY_RESULT, &n);
+        }
         if (v->state == 3)
             vis_write(v->va, n);
         v->state = 0;
@@ -2624,7 +2949,7 @@ static void do_zpass(int on)
 {
     int i;
     if (s_vis_open) {                              /* close a test left open */
-        glEndQuery(GL_SAMPLES_PASSED);
+        glEndQuery(s_es ? GL_ANY_SAMPLES_PASSED : GL_SAMPLES_PASSED);
         s_vis_open->state = 2;
         s_vis_pending++;
         s_vis_last = s_vis_open;
@@ -2643,7 +2968,7 @@ static void do_zpass(int on)
     }
     if (!s_vis[i].q)
         glGenQueries(1, &s_vis[i].q);
-    glBeginQuery(GL_SAMPLES_PASSED, s_vis[i].q);
+    glBeginQuery(s_es ? GL_ANY_SAMPLES_PASSED : GL_SAMPLES_PASSED, s_vis[i].q);
     s_vis[i].state = 1;
     s_vis_open = &s_vis[i];
     s_vis_last = NULL;

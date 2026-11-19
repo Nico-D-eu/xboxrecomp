@@ -138,6 +138,14 @@ void xbox_InputSdlEvent(const SDL_Event *ev)
     int vk;
 
     switch (ev->type) {
+    case SDL_CONTROLLERDEVICEADDED:
+    case SDL_CONTROLLERDEVICEREMOVED:
+        /* A pad that arrives after start-up. On Android every one does:
+         * SDL hears of them from the Java side a moment after it starts,
+         * so the scan at init found none, and only the keys a pad also
+         * sends as keys (A) got through, never its sticks or D-pad. */
+        xbox_InputRescanControllers();
+        return;
     case SDL_KEYDOWN:
         /* Auto-repeat would only re-set a held key; dropping it keeps the
          * trace to real edges. */

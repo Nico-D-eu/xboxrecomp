@@ -25,6 +25,8 @@ void xbox_InputSdlInit(void);
 /* Every event of the main loop: keys, mouse buttons, and the window events
  * that release them. Others are ignored. */
 void xbox_InputSdlEvent(const SDL_Event *ev);
+/* Open game controllers that arrived, close ones gone (xinput_device.c). */
+void xbox_InputRescanControllers(void);
 
 #ifdef __cplusplus
 }

@@ -29,6 +29,9 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#if defined(__ANDROID__)
+#include <sys/syscall.h>   /* __NR_memfd_create */
+#endif
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -738,13 +741,39 @@ static DWORD_PTR process_mask_capture(void)
     return mask;
 }
 
+/* A larger alternate signal stack for the calling thread (Android only).
+ * Android's runtime chains every signal handler through its own, which
+ * runs on bionic's per-thread alternate stack of 32 KB; the title's
+ * trapped-register emulation (fault handler -> MMIO decode -> device model)
+ * needs more, and on a phone it overflowed that stack, faulted on its own
+ * first push and looped there (some 470,000 faults a second, the game
+ * stalled before the front end). Elsewhere handlers run on the thread's
+ * own stack and nothing is changed. */
+void xbox_PosixBigSignalStack(void)
+{
+#if defined(__ANDROID__)
+    enum { SZ = 512 * 1024 };
+    stack_t ss;
+    void *p = mmap(NULL, SZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED)
+        return;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_sp = p;
+    ss.ss_size = SZ;
+    if (sigaltstack(&ss, NULL) != 0)
+        munmap(p, SZ);
+#endif
+}
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
 
-#if defined(__linux__)
+    xbox_PosixBigSignalStack();
+
+#if defined(__linux__) && !defined(__ANDROID__)   /* bionic: no pthread_setaffinity_np */
     /* The process mask, not the creator's: see process_mask_capture. */
     if (s_process_mask) {
         cpu_set_t set;
@@ -870,7 +899,9 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_THREAD) return FALSE;
-    pthread_cancel(o->thread);
+#if !defined(__ANDROID__)
+    pthread_cancel(o->thread);   /* bionic has no pthread_cancel: the thread is only marked */
+#endif
     pthread_mutex_lock(&o->lock);
     o->exit_code = exitCode;
     o->exited    = 1;
@@ -901,7 +932,7 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
     if (!mask)
         return 0;
     process_mask_capture();   /* before this thread's mask shrinks */
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)   /* bionic: no pthread_setaffinity_np */
     {
         DWORD_PTR prev = 0;
         cpu_set_t set;
@@ -1425,6 +1456,11 @@ VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
     memset_s(ptr, cnt, 0, cnt);
+#elif defined(__ANDROID__)
+    /* bionic has no explicit_bzero: a volatile store the compiler keeps. */
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (cnt--)
+        *p++ = 0;
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -1736,6 +1772,10 @@ static int anon_map_fd(const char *name)
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
+#elif defined(__ANDROID__)
+    /* bionic declares memfd_create only from API 30; the syscall is in
+     * every kernel Android ships (3.17+). */
+    return (int)syscall(__NR_memfd_create, name ? name : "xbox_map", 0);
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif
@@ -1828,6 +1868,44 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
 LPVOID MapViewOfFile(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow, SIZE_T count)
 {
     return MapViewOfFileEx(mapping, access, offHigh, offLow, count, NULL);
+}
+
+/* Map a view of `mapping` at addr over address space this process already
+ * holds (xbox_memory_layout's span, a PROT_NONE reservation), in one mmap.
+ * MAP_FIXED swaps the pages atomically. The old way, munmap the slice and then
+ * map with MAP_FIXED_NOREPLACE, left a gap that another thread's mmap could
+ * take: on Android (ART and SDL threads are up before the game starts) one
+ * of the 28 RAM mirror views failed in about one boot of three, at a
+ * different mirror each time. Only for ranges the caller owns: MAP_FIXED
+ * discards whatever is there. A registry entry starting at addr (the span
+ * itself, when the view takes its first slice) is dropped, as the
+ * VirtualFree this replaces did. */
+LPVOID xbox_PosixMapViewOver(HANDLE mapping, SIZE_T size, LPVOID addr)
+{
+    w32_object *o = (w32_object *)mapping;
+    if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
+    void *p = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, o->fd, 0);
+    if (p == MAP_FAILED || p != addr) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    view_take(addr);
+    view_register(p, size);
+    return p;
+}
+
+/* Same for zeroed read-write memory (layout_commit_at). */
+LPVOID xbox_PosixCommitOver(LPVOID addr, SIZE_T size)
+{
+    void *p = mmap(addr, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (p == MAP_FAILED || p != addr) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    view_take(addr);
+    view_register(p, size);
+    return p;
 }
 
 BOOL UnmapViewOfFile(LPCVOID baseAddr)

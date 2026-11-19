@@ -297,11 +297,14 @@ static void set_fullscreen(SDL_Window *win, int on)
         s_fullscreen = on;
 }
 
+extern void xbox_PosixBigSignalStack(void);   /* win32_compat.c */
+
 static void *guest_thread(void *arg)
 {
     SDL_Event ev;
 
     (void)arg;
+    xbox_PosixBigSignalStack();   /* Android: room for the MMIO trap */
     s_guest_rc = s_guest_main();
     memset(&ev, 0, sizeof ev);
     ev.type = s_guest_done_event;
@@ -352,10 +355,18 @@ static int env_on(const char *name)
     return e && *e && *e != '0';
 }
 
+/* The window, for the GL back end's one-window mode (nv2a_gl.c): there it
+ * makes its context on this window and presents itself, and this file
+ * only pumps events. */
+SDL_Window *g_xbox_host_window;
+extern int  xbox_GlOneWindow(void);
+extern void xbox_GlWindowAttributes(void);
+
 int xbox_HostWindowMain(int (*guest_main)(void))
 {
     SDL_Window *win;
     SDL_Renderer *ren;
+    int one_window;
     SDL_Texture *tex = NULL;
     uint32_t tex_bpp = 0, tex_w = 0, tex_h = 0, fw = FB_W, fh = FB_H;
     uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
@@ -382,13 +393,21 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 SDL_GetError());
         return guest_main();
     }
+    one_window = xbox_GlOneWindow();
+    if (one_window)
+        xbox_GlWindowAttributes();          /* the window's surface fits the context */
     win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                            (int)FB_W * scale, (int)FB_H * scale,
-                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    ren = win ? SDL_CreateRenderer(win, -1,
-                                   vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
-              : NULL;
-    if (!ren) {
+                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+                           | (one_window ? SDL_WINDOW_OPENGL : 0));
+    ren = win && !one_window ? SDL_CreateRenderer(win, -1,
+                                                  vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
+                             : NULL;
+    if (win && one_window) {
+        g_xbox_host_window = win;
+        fprintf(stderr, "  [FBWIN] window open for the GL back end to present on"
+                " (one-window mode); guest runs on a pthread\n");
+    } else if (!ren) {
         fprintf(stderr, "  [FBWIN] SDL window/renderer failed (%s); running headless\n",
                 SDL_GetError());
         if (win)
@@ -396,8 +415,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
         return guest_main();
     }
-    SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H);
-    {
+    if (ren)
+        SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H);
+    if (ren) {
         SDL_RendererInfo ri;
         if (SDL_GetRendererInfo(ren, &ri) == 0)
             fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, SDL %s renderer,"
@@ -408,7 +428,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     s_guest_done_event = SDL_RegisterEvents(3);
     if (s_guest_done_event == (Uint32)-1) {
         fprintf(stderr, "  [FBWIN] SDL_RegisterEvents failed; running headless\n");
-        SDL_DestroyRenderer(ren);
+        if (ren) SDL_DestroyRenderer(ren);
         SDL_DestroyWindow(win);
         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
         return guest_main();
@@ -428,7 +448,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         fprintf(stderr, "  [FBWIN] cannot start the guest thread; running headless\n");
         s_running = 0;
         xbox_InputSetMainPump(0);
-        SDL_DestroyRenderer(ren);
+        if (ren) SDL_DestroyRenderer(ren);
         SDL_DestroyWindow(win);
         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
         return guest_main();
@@ -493,7 +513,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             if (bpp == 2 || bpp == 4)
                 px = (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
         }
-        if (px) {
+        if (px && ren) {
             if (!tex || bpp != tex_bpp || fw != tex_w || fh != tex_h) {
                 if (tex)
                     SDL_DestroyTexture(tex);
@@ -512,7 +532,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 SDL_UpdateTexture(tex, NULL, px, (int)pitch);
             dirty = 1;
         }
-        if (dirty) {
+        if (dirty && ren) {
             dirty = 0;
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderClear(ren);
@@ -558,7 +578,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * start calling SDL_GameControllerUpdate while SDL goes down. */
     if (tex)
         SDL_DestroyTexture(tex);
-    SDL_DestroyRenderer(ren);
+    if (ren) SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     if (!xbox_InputAnyOpen())
         SDL_Quit();

@@ -116,22 +116,21 @@ static size_t g_span_size = 0;
  * layout_commit_at). See the span reservation in xbox_MemoryLayoutInit. */
 static int g_span_whole_window = 0;
 
-/* POSIX: hand back the part of our span reservation a fixed-address window is
- * about to take. Only when the span holds the whole window; the stock span
- * covers RAM and the mirrors alone, whose loop frees its own slices. Not
- * atomic: the slice is unmapped, then mapped again with MAP_FIXED_NOREPLACE,
- * and another thread's mmap could land in between. The window's map then fails
- * and says so, as it did before the span held it. */
-static void span_release_for(void *addr, size_t size)
-{
+/* POSIX: does our span reservation hold [addr, addr+size)? Then a window
+ * there is mapped over the reservation in one step (xbox_PosixMapViewOver,
+ * xbox_PosixCommitOver in win32_compat.c) instead of unmapping the slice and
+ * mapping it again, which left a gap another thread's mmap could take.
+ * Covers the stock span (RAM and its mirrors) and the whole-window span of
+ * RECOMP_EXT_VMA alike. */
 #if !defined(_WIN32)
+extern LPVOID xbox_PosixMapViewOver(HANDLE mapping, SIZE_T size, LPVOID addr);
+extern LPVOID xbox_PosixCommitOver(LPVOID addr, SIZE_T size);
+static int span_holds(void *addr, size_t size)
+{
     uintptr_t a = (uintptr_t)addr, lo = (uintptr_t)g_span_base;
-    if (g_span_whole_window && a >= lo && a + size <= lo + g_span_size)
-        VirtualFree(addr, size, MEM_RELEASE);
-#else
-    (void)addr; (void)size;
-#endif
+    return g_span_base && a >= lo && a + size <= lo + g_span_size;
 }
+#endif
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -313,8 +312,10 @@ static void *layout_map_view(HANDLE mapping, size_t size, void *addr)
                                 MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE,
                                 NULL, 0);
     }
+#else
+    if (span_holds(addr, size))
+        return xbox_PosixMapViewOver(mapping, size, addr);
 #endif
-    span_release_for(addr, size);
     return MapViewOfFileEx(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size, addr);
 }
 
@@ -333,8 +334,10 @@ static void *layout_commit_at(void *addr, size_t size)
             return NULL;
         return VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE);
     }
+#else
+    if (span_holds(addr, size))
+        return xbox_PosixCommitOver(addr, size);
 #endif
-    span_release_for(addr, size);
     return VirtualAlloc(addr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
@@ -3126,10 +3129,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
-            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
-            g_memory_base = MapViewOfFileEx(g_mapping_handle,
-                                            FILE_MAP_ALL_ACCESS, 0, 0,
-                                            g_memory_size, g_span_base);
+            g_memory_base = layout_map_view(g_mapping_handle, g_memory_size,
+                                            g_span_base);
             if (!g_memory_base) {
                 VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
                 g_span_base = NULL;
@@ -3979,14 +3980,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                         m + 1, (unsigned)XBOX_NV2A_BASE);
                 continue;
             }
-            /* Inside the reservation this hands back the slice we are about
-             * to use; outside it (no reservation) this is a no-op on an
-             * address we never held. When the span holds the whole window
-             * (RECOMP_EXT_VMA), layout_map_view releases the slice itself:
-             * freeing it here too would unmap it twice, and the second
-             * munmap could take out another thread's mapping in the gap. */
-            if (g_span_base && !g_span_whole_window)
-                VirtualFree((LPVOID)mirror_base, g_memory_size, MEM_RELEASE);
+            /* Inside the span, layout_map_view maps over the reservation
+             * in one step; outside it (no span) it is the plain fixed map. */
             g_mirror_views[m] = layout_map_view(g_mapping_handle,
                                                 g_memory_size,
                                                 (LPVOID)mirror_base);

@@ -14,6 +14,7 @@
 #include "keyboard.h"
 #include "input_map.h"
 #include "mkb_input.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -504,6 +505,83 @@ static void open_controllers(void)
     }
 }
 
+/* Rumble through SDL's haptic API, where the joystick driver has none: SDL
+ * 2's Android joystick rumble is unsupported, but its haptic devices are
+ * the input devices' Android vibrators, which drive an Xbox controller's
+ * motors (Android 12 and later). One intensity, the stronger motor; the
+ * same few calls a second the joystick path makes, each for 1 s. */
+static SDL_Haptic *g_haptic[XBOX_MAX_CONTROLLERS];
+static int g_haptic_tried[XBOX_MAX_CONTROLLERS];
+static float g_haptic_last[XBOX_MAX_CONTROLLERS];
+
+static void haptic_rumble(DWORD port, SDL_GameController *c, WORD left, WORD right)
+{
+    float strength = (float)(left > right ? left : right) / 65535.0f;
+
+    if (!g_haptic[port] && !g_haptic_tried[port]) {
+        SDL_Joystick *j = SDL_GameControllerGetJoystick(c);
+        g_haptic_tried[port] = 1;
+        if (!SDL_WasInit(SDL_INIT_HAPTIC))
+            SDL_InitSubSystem(SDL_INIT_HAPTIC);
+        if (j && SDL_JoystickIsHaptic(j) == SDL_TRUE)
+            g_haptic[port] = SDL_HapticOpenFromJoystick(j);
+        if (g_haptic[port] && SDL_HapticRumbleInit(g_haptic[port]) != 0) {
+            SDL_HapticClose(g_haptic[port]);
+            g_haptic[port] = NULL;
+        }
+        fprintf(stderr, "  [INPUT] pad %u rumble: %s\n", (unsigned)port,
+                g_haptic[port] ? "through the device's vibrator (SDL haptic)"
+                               : "none (no joystick rumble, no haptic device)");
+    }
+    if (!g_haptic[port])
+        return;
+    if (strength <= 0.0f) {
+        if (g_haptic_last[port] > 0.0f)
+            SDL_HapticRumbleStop(g_haptic[port]);
+    } else {
+        SDL_HapticRumblePlay(g_haptic[port], strength, 1000);
+    }
+    g_haptic_last[port] = strength;
+}
+
+/* After SDL reports a pad added or removed (keyboard_sdl.c, on the thread
+ * that pumps SDL events): close the ones gone, open the new ones. */
+void xbox_InputRescanControllers(void)
+{
+    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (g_pads[i] && !SDL_GameControllerGetAttached(g_pads[i])) {
+            if (g_haptic[i]) {
+                SDL_HapticClose(g_haptic[i]);
+                g_haptic[i] = NULL;
+            }
+            g_haptic_tried[i] = 0;
+            SDL_GameControllerClose(g_pads[i]);
+            g_pads[i] = NULL;
+            g_controller_connected[i] = FALSE;
+        }
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(i);
+        int open = 0, slot;
+        if (!SDL_IsGameController(i))
+            continue;
+        for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
+            if (g_pads[slot] && SDL_JoystickInstanceID(
+                    SDL_GameControllerGetJoystick(g_pads[slot])) == id)
+                open = 1;
+        if (open)
+            continue;
+        for (slot = 0; slot < XBOX_MAX_CONTROLLERS && g_pads[slot]; slot++)
+            ;
+        if (slot == XBOX_MAX_CONTROLLERS)
+            break;
+        g_pads[slot] = SDL_GameControllerOpen(i);
+        g_controller_connected[slot] = (g_pads[slot] != NULL);
+        if (g_pads[slot])
+            fprintf(stderr, "  [INPUT] pad %d: %s\n", slot,
+                    SDL_GameControllerName(g_pads[slot]));
+    }
+}
+
 void xbox_InputInit(void)
 {
     /* Keep the default SIGINT/SIGTERM: SDL would turn them into an SDL_QUIT
@@ -588,8 +666,10 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 
     /* SDL rumble needs a duration; refresh for ~1s on each call (the game
      * polls vibration continuously). */
-    SDL_GameControllerRumble(c, pVibration->wLeftMotorSpeed,
-                             pVibration->wRightMotorSpeed, 1000);
+    if (SDL_GameControllerRumble(c, pVibration->wLeftMotorSpeed,
+                                 pVibration->wRightMotorSpeed, 1000) == 0)
+        return ERROR_SUCCESS;
+    haptic_rumble(dwPort, c, pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
     return ERROR_SUCCESS;
 }
 
